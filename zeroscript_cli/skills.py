@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fnmatch
 import re
 from pathlib import Path
 from typing import Iterable
@@ -218,26 +219,91 @@ class SkillCatalog:
         needle = name.strip().lstrip("/").casefold()
         return next((item for item in self.agents() if item.name.casefold() == needle), None)
 
-    def instructions(self) -> list[tuple[str, str]]:
-        """Load repository guidance files, bounded by a combined character budget."""
-        if not self.project_root or not self.project_root.is_dir():
-            return []
-        names = ("CLAUDE.md", "AGENTS.md", "ZEROSCRIPT.md", ".zeroscript/rules.md")
+    def instructions(self, task_text: str = "") -> list[tuple[str, str]]:
+        """Load user/project instructions and matching path-scoped rules within a size budget."""
         output: list[tuple[str, str]] = []
         total = 0
-        for name in names:
-            path = self.project_root / name
-            if not _inside(path, self.project_root):
+        base_files: list[tuple[Path, Path, str]] = [
+            (self.home / ".claude" / "CLAUDE.md", self.home, "~/.claude/CLAUDE.md"),
+            (self.home / ".zeroscript-win" / "CLAUDE.md", self.home, "~/.zeroscript-win/CLAUDE.md"),
+            (self.home / ".zeroscript-win" / "rules.md", self.home, "~/.zeroscript-win/rules.md"),
+        ]
+        if self.project_root:
+            base_files.extend([
+                (self.project_root / "CLAUDE.md", self.project_root, "CLAUDE.md"),
+                (self.project_root / "AGENTS.md", self.project_root, "AGENTS.md"),
+                (self.project_root / "ZEROSCRIPT.md", self.project_root, "ZEROSCRIPT.md"),
+                (self.project_root / ".zeroscript" / "rules.md", self.project_root, ".zeroscript/rules.md"),
+            ])
+        for file, root, label in base_files:
+            if total >= _MAX_INSTRUCTIONS_BYTES:
+                break
+            if not _inside(file, root):
                 continue
-            raw = _safe_read(path, limit=_MAX_INSTRUCTIONS_BYTES)
+            raw = _safe_read(file, limit=_MAX_INSTRUCTIONS_BYTES)
             if not raw or not raw.strip():
                 continue
             remaining = _MAX_INSTRUCTIONS_BYTES - total
-            if remaining <= 0:
-                break
             body = raw.strip()[:remaining]
-            output.append((name, body))
+            output.append((label, body))
             total += len(body)
+
+        task_paths = {
+            token.replace("\\", "/").strip("'\".,:;()")
+            for token in re.findall(
+                r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_@.*?-]+[/\\\\])*[A-Za-z0-9_@.*?-]+\\.[A-Za-z0-9_-]+",
+                task_text,
+            )
+        }
+        rule_roots: list[tuple[Path, str]] = [
+            (self.home / ".claude" / "rules", "user:.claude/rules"),
+            (self.home / ".zeroscript-win" / "rules", "user:.zeroscript-win/rules"),
+        ]
+        if self.project_root:
+            rule_roots.extend([
+                (self.project_root / ".claude" / "rules", "project:.claude/rules"),
+                (self.project_root / ".zeroscript" / "rules", "project:.zeroscript/rules"),
+            ])
+        seen = 0
+        for folder, source in rule_roots:
+            if total >= _MAX_INSTRUCTIONS_BYTES:
+                break
+            if not folder.is_dir() or folder.is_symlink():
+                continue
+            try:
+                candidates = sorted(folder.rglob("*.md"))
+            except OSError:
+                continue
+            for file in candidates:
+                seen += 1
+                if seen > _MAX_ITEMS or total >= _MAX_INSTRUCTIONS_BYTES:
+                    break
+                if not _inside(file, folder):
+                    continue
+                raw = _safe_read(file, limit=16 * 1024)
+                if raw is None:
+                    continue
+                metadata, body = _parse_frontmatter(raw)
+                if not body:
+                    continue
+                patterns = _metadata_list(metadata.get("paths"))
+                if patterns:
+                    normalized_paths = {value.lstrip("./") for value in task_paths if value}
+                    matching = any(
+                        fnmatch.fnmatchcase(target, pattern.replace("\\", "/").lstrip("./"))
+                        or fnmatch.fnmatchcase(target.rsplit("/", 1)[-1], pattern.replace("\\", "/").lstrip("./"))
+                        for target in normalized_paths
+                        for pattern in patterns
+                    )
+                    if not matching:
+                        continue
+                remaining = _MAX_INSTRUCTIONS_BYTES - total
+                label = source + "/" + file.relative_to(folder).as_posix()
+                block = body[:remaining]
+                if patterns:
+                    block = "Applies to paths: " + ", ".join(patterns) + "\n\n" + block
+                output.append((label, block))
+                total += len(block)
         return output
 
     def catalog_prompt(self, *, limit_chars: int = 8000) -> str:
