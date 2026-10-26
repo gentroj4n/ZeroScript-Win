@@ -242,3 +242,67 @@ class SkillCatalog:
         if len(result) > limit_chars:
             result = result[:limit_chars].rsplit("\n", 1)[0] + "\n- (catalog truncated)"
         return result
+def model_tool(self) -> dict[str, object] | None:
+        """Return a synthetic function tool that lets the model explicitly load a skill."""
+        skills = [item for item in self.skills() if not item.disable_model_invocation]
+        if not skills:
+            return None
+        skills = skills[:_MAX_ITEMS]
+        catalog = "\n".join(
+            "- " + item.name + ": " + (item.description or "(no description)")
+            for item in skills
+        )
+        return {
+            "name": "zeroscript_load_skill",
+            "server": "zeroscript-runtime",
+            "description": (
+                "Load the full instructions for one relevant project/user skill before doing its task. "
+                "This is a local runtime tool; it does not call the bridge. Available skills:\n" + catalog
+            )[:8000],
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": [item.name for item in skills],
+                        "description": "Exact skill name from the available skill list.",
+                    },
+                    "arguments": {
+                        "type": "string",
+                        "maxLength": 4000,
+                        "description": "Optional task-specific arguments to substitute into the skill instructions.",
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        }
+
+    def load_for_model(self, name: str, arguments: str = "") -> str:
+        """Load one model-invocable skill and identify its bounded supporting files."""
+        item = self.find_skill(name)
+        if item is None or item.disable_model_invocation:
+            raise ValueError("Skill is missing or disabled for model invocation: " + str(name))
+        result = item.render(arguments)
+        folder = item.path.parent
+        supporting: list[str] = []
+        try:
+            candidates = sorted(folder.rglob("*"))
+        except OSError:
+            candidates = []
+        for path in candidates:
+            if len(supporting) >= 30:
+                break
+            if path == item.path or not path.is_file() or not _inside(path, folder):
+                continue
+            if any(part in {".git", "node_modules", "__pycache__", ".venv"} for part in path.parts):
+                continue
+            relative = path.relative_to(folder).as_posix()
+            supporting.append(relative[:300])
+        if supporting:
+            result += (
+                "\n\nSupporting files available beside this skill (read them only when relevant):\n"
+                + "\n".join("- " + value for value in supporting)
+            )
+        return result
+
