@@ -1519,9 +1519,6 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--vision", action="store_true", help="Enable image input for a vision-capable OpenAI-compatible model")
     parser.add_argument("--context-tokens", type=int, default=None, help="Approximate model context window; overrides profile context_tokens")
     parser.add_argument("--api-key", default=None, help="API key (prefer ZS_MODEL_API_KEY environment variable)")
-    parser.add_argument("--yes", action="store_true", help="Bypass ordinary confirmation prompts; hard-denied operations remain blocked")
-    parser.add_argument("--mode", choices=("default", "plan", "auto"), default="default",
-                        help="Permission mode: default asks before consequential operations; plan is read-only; auto bypasses ordinary prompts but cannot override hard-denied actions")
     parser.add_argument("--all-tools", action="store_true",
                         help="Expose the entire bridge tool catalogue instead of the task-scoped selection")
     parser.add_argument("--max-turns", type=int, default=MAX_TURNS, help="Maximum model/tool cycles (default: 40)")
@@ -1541,12 +1538,6 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     if command in {"doctor", "index", "gallery", "worktrees", "snapshot", "profiles", "events", "visual-diff", "verify"}:
         return _remaster_command(command, extra)
     provider = OpenAICompatibleProvider(args.base_url, args.api_key, args.model, vision=args.vision or getattr(args, "vision", False), context_tokens=args.context_tokens)
-    permission_mode = "auto" if args.yes else args.mode
-    if permission_mode == "auto":
-        UI.warning("AUTO MODE: CLI confirmation prompts are bypassed for consequential operations.")
-    # Permission mode is the source of truth for interactive sessions, allowing
-    # a user who started with --yes to explicitly switch back to default later.
-    auto_approve = False
     command = args.command_or_goal
     extra = args.extra or []
     bridge = BridgeClient(args.bridge_url)
@@ -1573,8 +1564,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 raise RuntimeError("Unknown or non-invocable skill: " + extra[0] + ". Use `zeroscript skills` to list skills.")
             goal = definition.render(" ".join(extra[1:]))
             return await _direct_run(
-                bridge, provider, goal, auto_approve, args.max_turns,
-                permission_mode=permission_mode, all_tools=args.all_tools,
+                bridge, provider, goal, args.max_turns,
+                all_tools=args.all_tools,
             )
         if command == "status":
             return await _status_command(bridge)
@@ -1584,15 +1575,15 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             return await _simple_control(bridge, command)
         if command == "takeover":
             return await _takeover_command(
-                bridge, provider, auto_approve, args.max_turns, extra[0] if extra else None,
-                permission_mode=permission_mode, all_tools=args.all_tools,
+                bridge, provider, args.max_turns, extra[0] if extra else None,
+                all_tools=args.all_tools,
             )
         if command == "resume":
             if not extra:
                 raise RuntimeError("Usage: zeroscript resume <run-id>")
             return await _resume_command(
-                bridge, provider, auto_approve, args.max_turns, extra[0],
-                permission_mode=permission_mode, all_tools=args.all_tools,
+                bridge, provider, args.max_turns, extra[0],
+                all_tools=args.all_tools,
             )
         # Direct invocation of a discovered skill/custom command: zeroscript review src/
         if command:
@@ -1602,8 +1593,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             if definition and definition.user_invocable:
                 goal = definition.render(" ".join(extra))
                 return await _direct_run(
-                    bridge, provider, goal, auto_approve, args.max_turns,
-                    permission_mode=permission_mode, all_tools=args.all_tools,
+                    bridge, provider, goal, args.max_turns,
+                    all_tools=args.all_tools,
                 )
         if command:
             goal = " ".join([command] + extra).strip()
@@ -1615,7 +1606,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             )
 
         workspace = bridge.initial_status.get("workspace") or {}
-        UI.banner(provider.model, provider.base_url, bridge.url, permission_mode)
+        UI.banner(provider.model, provider.base_url, bridge.url)
         UI.project_card(
             str(workspace.get("root") or ""),
             workspace.get("configured") is True,
@@ -1685,8 +1676,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                         UI.error("Usage: /resume RUN_ID")
                         continue
                     await _resume_command(
-                        bridge, provider, auto_approve, args.max_turns, argument,
-                        permission_mode=permission_mode, all_tools=args.all_tools,
+                        bridge, provider, args.max_turns, argument,
+                        all_tools=args.all_tools,
                     )
                     try:
                         saved = _read_session(argument)
@@ -1700,16 +1691,16 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     follow_up = argument or (await UI.prompt("follow-up"))
                     if follow_up:
                         await _direct_run(
-                            bridge, provider, follow_up, auto_approve, args.max_turns,
-                            permission_mode=permission_mode, all_tools=args.all_tools,
+                            bridge, provider, follow_up, args.max_turns,
+                            all_tools=args.all_tools,
                             conversation_state=conversation_state,
                         )
                 elif slash == "/compact":
                     await _compact_conversation(provider, conversation_state)
                 elif slash == "/context":
-                    _show_context(conversation_state, provider, bridge, permission_mode)
+                    _show_context(conversation_state, provider, bridge)
                 elif slash == "/workspace":
-                    await _workspace_command(bridge, argument, permission_mode)
+                    await _workspace_command(bridge, argument)
                     workspace = bridge.initial_status.get("workspace") or {}
                     conversation_state["workspace"] = str(workspace.get("root") or "")
                     workspace_root = str(workspace.get("root") or "").strip()
@@ -1747,7 +1738,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 elif slash == "/tools":
                     await _show_tools(
                         bridge, str(conversation_state.get("goal") or ""),
-                        permission_mode, query=argument,
+                        query=argument,
                     )
                 elif slash == "/skills":
                     _show_definitions(skill_catalog, "skill", argument)
@@ -1764,8 +1755,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                         continue
                     goal = definition.render(skill_args)
                     await _direct_run(
-                        bridge, provider, goal, auto_approve, args.max_turns,
-                        permission_mode=permission_mode, all_tools=args.all_tools,
+                        bridge, provider, goal, args.max_turns,
+                        all_tools=args.all_tools,
                         conversation_state=conversation_state,
                     )
                 elif slash == "/init":
