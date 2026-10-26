@@ -109,5 +109,42 @@ class SkillCatalogTests(unittest.TestCase):
                 catalog.load_for_model("private")
 
 
+    def test_discovers_agent_profiles_with_tool_hints_and_turn_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            self.write(base, "repo/.claude/agents/reviewer.md",
+                       "---\nname: reviewer\ndescription: Review code independently\ntools: [Read, Grep, Bash]\nmodel: inherit\nmax-turns: 12\n---\nReview the task and return evidence.")
+            catalog = SkillCatalog(base / "repo", base / "home")
+            profile = catalog.find_agent("reviewer")
+            self.assertIsNotNone(profile)
+            self.assertEqual(profile.kind, "agent profile")
+            self.assertEqual(profile.allowed_tools, ("Read", "Grep", "Bash"))
+            self.assertEqual(profile.max_turns, 12)
+            tool = catalog.agent_tool()
+            self.assertEqual(tool["name"], "zeroscript_run_subagent")
+            self.assertEqual(tool["inputSchema"]["properties"]["name"]["enum"], ["reviewer"])
+
+    def test_loads_path_scoped_rules_only_for_matching_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            self.write(root, ".claude/rules/typescript.md",
+                       "---\npaths: [\"**/*.ts\", \"**/*.tsx\"]\n---\nUse TypeScript strict mode.")
+            self.write(root, ".claude/rules/python.md",
+                       "---\npaths: [\"**/*.py\"]\n---\nUse type hints.")
+            self.write(root, ".claude/rules/global.md",
+                       "---\ndescription: General repo rule\n---\nPrefer small focused changes.")
+            loaded = dict(SkillCatalog(root, Path(temp) / "home").instructions("Update src/App.tsx"))
+            self.assertIn("Use TypeScript strict mode.", loaded["project:.claude/rules/typescript.md"])
+            self.assertNotIn("project:.claude/rules/python.md", loaded)
+            self.assertIn("Prefer small focused changes.", loaded["project:.claude/rules/global.md"])
+
+    def test_loads_user_global_claude_instructions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            self.write(base, ".claude/CLAUDE.md", "Prefer compact diffs.")
+            loaded = dict(SkillCatalog(base / "repo", base).instructions())
+            self.assertEqual(loaded["~/.claude/CLAUDE.md"], "Prefer compact diffs.")
+
+
 if __name__ == "__main__":
     unittest.main()
