@@ -25,7 +25,7 @@ From the repository root, start `start.bat` for the bridge, then configure the m
 
 Use `/help` inside the prompt. Session commands include `/sessions`, `/load RUN_ID`, `/resume RUN_ID`, `/new`, and `/compact`. Bundled skills work immediately: `/code-review`, `/debugging`, `/test-and-verify`, `/exploration`, `/refactor`, and `/docs`; use `/skills` to list them and `/reload` after changing definitions. Project/user skills live at `.claude/skills/<name>/SKILL.md` (or compatible `.zeroscript/skills` and user-level folders). Custom Markdown commands live in `.claude/commands/`. Bundled agent profiles include `explorer`, `reviewer`, `test-runner`, `implementer`, `documenter`, and `planner`; custom profiles live in `.claude/agents/`. List profiles with `/agents`, run one with `/agent NAME TASK`, or let the model delegate bounded subtasks. Project instructions load from `CLAUDE.md`, `AGENTS.md`, `ZEROSCRIPT.md`, and path-scoped `.claude/rules/*.md`. The browser and CLI remain separate runtimes: `/takeover` arms the CLI and waits for the browser agent to call `zeroscript_handoff_to_cli`.
 
-See [docs/CLI_AGENT.md](docs/CLI_AGENT.md) for setup, skills, agent profiles, privacy, and runtime limitations.
+The CLI also supports opt-in Claude-style command hooks via user/project `settings.json` files for session start, prompt submit, before/after tool use, and stop events. Hooks run as your current user, with bounded execution time; only configure commands you trust.\n\nSee [docs/CLI_AGENT.md](docs/CLI_AGENT.md) for setup, skills, agent profiles, privacy, and runtime limitations.
 
 ## Autopilot
 
