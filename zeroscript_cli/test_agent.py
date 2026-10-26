@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import asyncio
 import inspect
+import json
 import unittest
 
 from zeroscript_cli.ui import TerminalUI, _PROMPT_TOOLKIT
@@ -11,6 +12,7 @@ from zeroscript_cli.agent import (
     fit_messages_to_context,
     _estimated_tokens,
     _parse_vision_option,
+    _decode_chat_completion_stream,
     IndependentAgent,
 )
 
@@ -188,6 +190,50 @@ class CLIAgentUnitTests(unittest.TestCase):
         self.assertEqual(provider.context_tokens, 8192)
         with self.assertRaisesRegex(ValueError, "at least 256"):
             OpenAICompatibleProvider(base_url="http://127.0.0.1:11434/v1", model="local", context_tokens=0)
+
+    def test_stream_decoder_emits_text_and_assembles_tool_call_fragments(self):
+        emitted = []
+
+        def event(payload):
+            return ("data: " + json.dumps(payload) + "\n").encode("utf-8")
+
+        lines = [
+            event({"id": "chatcmpl-test", "choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": "Hel"}, "finish_reason": None}
+            ]}),
+            b"\n",
+            event({"choices": [
+                {"index": 0, "delta": {"content": "lo"}, "finish_reason": None}
+            ]}),
+            b"\n",
+            event({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "type": "function",
+                     "function": {"name": "workspace_", "arguments": '{"path":"READ'}}
+                ]}, "finish_reason": None}
+            ]}),
+            b"\n",
+            event({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"name": "read_file", "arguments": 'ME.md"}'}}
+                ]}, "finish_reason": "tool_calls"}
+            ]}),
+            b"\n",
+            b"data: [DONE]\n",
+            b"\n",
+        ]
+        result = _decode_chat_completion_stream(lines, emitted.append)
+        message = result["choices"][0]["message"]
+        self.assertEqual("".join(emitted), "Hello")
+        self.assertEqual(message["content"], "Hello")
+        self.assertEqual(message["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "workspace_read_file")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"path":"README.md"}')
+        self.assertEqual(result["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_stream_decoder_rejects_malformed_events(self):
+        with self.assertRaisesRegex(RuntimeError, "malformed streaming JSON"):
+            _decode_chat_completion_stream([b"data: {not-json}\n", b"\n"])
 
     def test_provider_endpoint_normalization(self):
         self.assertEqual(
