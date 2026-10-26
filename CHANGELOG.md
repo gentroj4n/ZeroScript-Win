@@ -8,6 +8,7 @@
 - Added profile-driven vision image input for MCP image results and approximate context-window budgeting that drops old complete turns or fails clearly when the newest turn cannot fit.
 - Added model-invocable bundled and user/project skills, custom slash command discovery and reload, global and path-scoped instructions, Markdown agent profiles, bounded subagent tool loops, role-scoped tool lists, and CLI regression coverage.
 - Added Claude-style opt-in command hooks for session, prompt, pre-tool, post-tool, and stop events with bounded execution, matcher support, and regression tests.
+- Added a `/hooks` inspection command, hook output context handling tests, and independent CLI validation workflow.
 
 All notable changes to ArcScript are documented here.
 
