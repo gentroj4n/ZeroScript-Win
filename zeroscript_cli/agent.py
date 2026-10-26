@@ -848,6 +848,19 @@ class IndependentAgent:
             self.recorder.record("skill.loaded", skill=skill_name, argument_chars=len(skill_arguments))
             UI.tool_result(_clip(output, 4000), ok=True)
             return _clip(output)
+        if name == "zeroscript_run_subagent":
+            try:
+                agent_name = str(arguments.get("name") or "")
+                task = str(arguments.get("task") or "")
+                output = await self._run_subagent(agent_name, task)
+            except Exception as exc:
+                output = "Subagent failed: " + str(exc)
+                self.recorder.record("subagent.failed", agent=arguments.get("name"), error=str(exc))
+                UI.tool_result(_clip(output, 1800), ok=False)
+                return _clip(output)
+            self.recorder.record("subagent.completed", agent=agent_name, output_chars=len(output))
+            UI.tool_result(_clip(output, 4000), ok=True)
+            return _clip(output)
         try:
             with UI.status("[bold bright_cyan]Running tool[/bold bright_cyan] · " + name):
                 response = await self.bridge.call_tool(name, arguments)
