@@ -1,9 +1,16 @@
 name: Validate workspace agent
 
 on:
+  workflow_dispatch:
   push:
-    branches: ["master", "agent/workspace-foundation"]
+    branches:
+      - master
+      - agent/workspace-foundation
+      - agent/full-remaster-workspace-first
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   python-tests:
@@ -13,12 +20,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install bridge dependency
-        run: python -m pip install websockets
-      - name: Test workspace tools
-        run: python -m unittest workspace_agent.test_tools -v
+      - name: Install bridge and CLI dependencies
+        run: python -m pip install websockets rich prompt_toolkit
+      - name: Test workspace tools and bridge
+        shell: pwsh
+        run: |
+          python -m unittest workspace_agent.test_tools workspace_agent.test_bridge workspace_agent.test_agent_control workspace_agent.test_unity_recovery workspace_agent.test_code_intelligence workspace_agent.test_browser_qa workspace_agent.test_browser_server workspace_agent.test_assetripper_jobs workspace_agent.test_unity_asset_inspector workspace_agent.test_reconstruction_tracker zeroscript_cli.test_agent zeroscript_cli.test_remaster_services -v 2>&1 | Tee-Object -FilePath workspace-test-results.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile Python
-        run: python -m compileall -q bridge.py workspace_agent
+        shell: pwsh
+        run: |
+          python -m compileall -q bridge.py workspace_agent zeroscript_cli 2>&1 | Tee-Object -FilePath python-compile-results.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Python diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-validation-logs-${{ github.run_id }}
+          path: |
+            workspace-test-results.txt
+            python-compile-results.txt
+          if-no-files-found: ignore
+
   extension-syntax:
     runs-on: ubuntu-latest
     steps:
@@ -26,13 +49,32 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Check extension JavaScript syntax
+      - name: Check extension JavaScript syntax and prompt behavior
+        shell: bash
         run: |
-          node --check zeroscript-extension/core/config.js
-          node zeroscript-extension/core/config.test.cjs
-          node --check zeroscript-extension/core/parser.js
-          node --check zeroscript-extension/core/main.js
-          node --check zeroscript-extension/background.js
-          node --check zeroscript-extension/popup.js
+          set -o pipefail
+          node --check zeroscript-extension/core/config.js 2>&1 | tee -a extension-test-results.txt
+          node --check zeroscript-extension/core/autopilot-ledger.js 2>&1 | tee -a extension-test-results.txt
+          node zeroscript-extension/core/autopilot-ledger.test.cjs 2>&1 | tee -a extension-test-results.txt
+          node --check zeroscript-extension/core/autopilot-policy.js 2>&1 | tee -a extension-test-results.txt
+          node zeroscript-extension/core/autopilot-policy.test.cjs 2>&1 | tee -a extension-test-results.txt
+          node zeroscript-extension/core/config.test.cjs 2>&1 | tee -a extension-test-results.txt
+          node --check zeroscript-extension/providers/chatgpt.js 2>&1 | tee -a extension-test-results.txt
+          for provider in zeroscript-extension/providers/*.js; do node --check "$provider" 2>&1 | tee -a extension-test-results.txt; done
+          node zeroscript-extension/test-chatgpt.js 2>&1 | tee -a extension-test-results.txt
+          node --check zeroscript-extension/core/parser.js 2>&1 | tee -a extension-test-results.txt
+          node zeroscript-extension/test-parser.js 2>&1 | tee -a extension-test-results.txt
+          node --check zeroscript-extension/core/main.js 2>&1 | tee -a extension-test-results.txt
+          node --check zeroscript-extension/background.js 2>&1 | tee -a extension-test-results.txt
+          node --check zeroscript-extension/popup.js 2>&1 | tee -a extension-test-results.txt
       - name: Validate extension manifest
-        run: node -e "JSON.parse(require('fs').readFileSync('zeroscript-extension/manifest.json','utf8'))"
+        shell: bash
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('zeroscript-extension/manifest.json','utf8'))" 2>&1 | tee -a extension-test-results.txt
+      - name: Upload extension diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-validation-logs-${{ github.run_id }}
+          path: extension-test-results.txt
+          if-no-files-found: ignore

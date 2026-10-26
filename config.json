@@ -1,3 +1,27 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "roblox": {
+      "command": "py",
+      "args": [
+        "-3",
+        "launch_studio_mcp.py"
+      ]
+    },
+    "bpy": {
+      "command": ".venv-bpy\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "zeroscript_blender.mcp_server"
+      ]
+    },
+    "dominus": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "-p",
+        "dominus-cli@latest",
+        "dominus-mcp"
+      ]
+    }
+  }
 }

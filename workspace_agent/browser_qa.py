@@ -16,6 +16,56 @@ from workspace_agent.unity_recovery import UnityRecoveryError, _directory, _safe
 
 MAX_HTML_BYTES = 2_000_000
 MAX_REFERENCES = 500
+MAX_SCENARIO_STEPS = 40
+SCENARIO_ACTIONS = {"click", "fill", "press", "expect_visible", "expect_text", "wait_ms", "screenshot"}
+ALLOWED_KEYS = {"Enter", "Escape", "Tab", "Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Backspace", "Delete", "Home", "End"} | set("abcdefghijklmnopqrstuvwxyz0123456789")
+
+
+def _validate_scenarios(scenarios: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if scenarios is None:
+        return []
+    if not isinstance(scenarios, list) or len(scenarios) > MAX_SCENARIO_STEPS:
+        raise UnityRecoveryError(f"scenarios must be an array with at most {MAX_SCENARIO_STEPS} steps.")
+    validated = []
+    for index, step in enumerate(scenarios):
+        if not isinstance(step, dict):
+            raise UnityRecoveryError(f"Scenario step {index + 1} must be an object.")
+        action = step.get("action")
+        if action not in SCENARIO_ACTIONS:
+            raise UnityRecoveryError(f"Scenario step {index + 1} has an unsupported action.")
+        record = {"action": action, "timeout_ms": max(100, min(int(step.get("timeout_ms", 3000)), 10000))}
+        selector = step.get("selector", "")
+        if action in {"click", "fill", "press", "expect_visible", "expect_text"}:
+            if not isinstance(selector, str) or not selector.strip() or len(selector) > 500:
+                raise UnityRecoveryError(f"Scenario step {index + 1} requires a selector of 1-500 characters.")
+            record["selector"] = selector
+        if action == "fill":
+            value = step.get("value")
+            if not isinstance(value, str) or len(value) > 5000:
+                raise UnityRecoveryError(f"Scenario step {index + 1} fill value must be text up to 5000 characters.")
+            record["value"] = value
+        if action == "press":
+            key = step.get("key")
+            if not isinstance(key, str) or key not in ALLOWED_KEYS:
+                raise UnityRecoveryError(f"Scenario step {index + 1} key is not allowlisted.")
+            record["key"] = key
+        if action == "expect_text":
+            value = step.get("value")
+            if not isinstance(value, str) or not value or len(value) > 1000:
+                raise UnityRecoveryError(f"Scenario step {index + 1} expected text must contain 1-1000 characters.")
+            record["value"] = value
+        if action == "wait_ms":
+            try:
+                record["wait_ms"] = max(0, min(int(step.get("value", 250)), 5000))
+            except (TypeError, ValueError) as exc:
+                raise UnityRecoveryError(f"Scenario step {index + 1} wait_ms value must be an integer.") from exc
+        if action == "screenshot":
+            label = step.get("label", f"step-{index + 1}")
+            if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", label):
+                raise UnityRecoveryError(f"Scenario step {index + 1} screenshot label must use only letters, digits, underscore, or hyphen.")
+            record["label"] = label
+        validated.append(record)
+    return validated
 
 
 class _ReferenceParser(HTMLParser):
@@ -34,7 +84,7 @@ class _ReferenceParser(HTMLParser):
 
 
 def inspect_browser_port(workspace_root: str, port_path: str = "browser-port") -> dict[str, Any]:
-    """Inspect a browser-port's entry point and relative script/style references."""
+    """Audit the entry point and referenced local scripts/styles without execution."""
     root = _directory(workspace_root, "workspace")
     port = _safe_workspace_path(root, port_path)
     if not port.is_dir():

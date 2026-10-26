@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// core/parser.js - ZeroScript command parsing. PURE string logic, zero DOM:
+// core/parser.js - ArcScript command parsing. PURE string logic, zero DOM:
 // the provider extracts a turn's text from the site's DOM; everything here
 // operates on that text. The command formats (###LUA### blocks, {"command":…}
 // JSON) are defined by OUR system prompt, so they are the same on every AI site
@@ -57,9 +57,12 @@ const ZSParse = (() => {
   // `"tool":"…"` shape instead - a string-valued key, which prose almost never
   // contains - so paramless calls are detected without false-positiving on text.
   const CMD_KEY_RE = /"(?:command|tool)"\s*:\s*"/;
+  // Alternate JSON function envelope used by some model UIs:
+  // {"function":{"name":"tool_name","arguments":{...}}}
+  const FUNCTION_ENVELOPE_RE = /"function"\s*:\s*\{\s*"name"\s*:\s*"/;
 
   // DeepSeek's OWN agentic tool-call markup ("DSML"), which it sometimes emits
-  // instead of a ZeroScript command - seen live in user reports, DeepSeek only:
+  // instead of a ArcScript command - seen live in user reports, DeepSeek only:
   //   <|DSML|>tool_calls>
   //   <|DSML|>invoke name="script_read">
   //   <|DSML|>parameter name="target_file" string="true">…</|DSML|>parameter>
@@ -83,7 +86,8 @@ const ZSParse = (() => {
       r.includes(START_M) ||
       r.includes("MCP_TOOL") ||
       LUA_START_RE.test(r) ||
-      CMD_KEY_RE.test(r)
+      CMD_KEY_RE.test(r) ||
+      FUNCTION_ENVELOPE_RE.test(r)
     );
   }
 
@@ -109,11 +113,16 @@ const ZSParse = (() => {
       const open = r.lastIndexOf("{", k);
       if (open !== -1 && matchBrace(r, open) === -1) return true;
     }
+    // A function-call envelope is also an active tool block while incomplete.
+    if (FUNCTION_ENVELOPE_RE.test(r)) {
+      const start = r.indexOf("{");
+      if (start !== -1 && matchBrace(r, start) === -1) return true;
+    }
     return false;
   }
 
   // Normalise a parsed JSON object into { tool, arguments }, accepting both the
-  // new ZeroScript schema ("command"/"params") and the legacy/function-calling
+  // new ArcScript schema ("command"/"params") and the legacy/function-calling
   // schema ("tool"/"arguments"/"name"/"args"). Returns null if not a valid call.
   function normalizeCall(o) {
     if (!o || typeof o !== "object") return null;
@@ -189,20 +198,34 @@ const ZSParse = (() => {
   }
 
   function extractToolAnywhere(text) {
-    for (const key of ['"command"', '"tool"']) {
+    // Some frontends return JSON inside prose/fences, while others wrap the
+    // call as {"function":{"name":"...","arguments":{...}}}. Try balanced
+    // objects containing known call keys, smallest-first, without mistaking
+    // braces inside JSON string parameters for structural braces.
+    for (const key of ['"command"', '"tool"', '"name"']) {
       let pos = 0;
       while (true) {
         const s = text.indexOf(key, pos);
         if (s === -1) break;
-        const start = text.lastIndexOf("{", s);
-        if (start === -1) { pos = s + 1; continue; }
-        const end = matchBrace(text, start); // string-aware brace matching
-        if (end === -1) { pos = s + 1; continue; }
-        try {
-          const call = normalizeCall(parseLoose(text.slice(start, end + 1)));
-          if (call) return call;
-        } catch {}
-        pos = s + 1;
+        pos = s + key.length;
+        const candidates = [];
+        for (let start = text.lastIndexOf("{", s); start !== -1; start = text.lastIndexOf("{", start - 1)) {
+          const end = matchBrace(text, start);
+          if (end !== -1 && end >= s) candidates.push({ start, end });
+        }
+        candidates.sort((a, b) => (a.end - a.start) - (b.end - b.start));
+        for (const candidate of candidates) {
+          try {
+            const parsed = parseLoose(text.slice(candidate.start, candidate.end + 1));
+            const call = normalizeCall(parsed);
+            if (call) return call;
+            const fn = parsed && typeof parsed === "object" ? parsed.function : null;
+            if (fn && typeof fn === "object") {
+              const wrapped = normalizeCall(fn);
+              if (wrapped) return wrapped;
+            }
+          } catch {}
+        }
       }
     }
     return null;
@@ -344,6 +367,8 @@ const ZSParse = (() => {
     // through to the placeholder below instead.
     const m = txt.match(/"(?:command|tool)"\s*:\s*"([^"]*)/);
     if (m && m[1].trim()) return m[1].trim();
+    const fn = txt.match(/"function"\s*:\s*\{\s*"name"\s*:\s*"([^"]*)/);
+    if (fn && fn[1].trim()) return fn[1].trim();
     if (txt.includes("execute_luau") || LUA_START_RE.test(txt)) return "execute_luau";
     return "command";
   }
@@ -358,7 +383,7 @@ const ZSParse = (() => {
            /^\s*\(System note:/.test(txt);
   }
 
-  // The assistant emitted a ZeroScript command (JSON or a ###LUA### block), or a
+  // The assistant emitted a ArcScript command (JSON or a ###LUA### block), or a
   // command-turn ATTEMPT the camouflage sweep should still mask. DSML counts:
   // the turn IS the model calling a tool, just in the wrong dialect, so it gets a
   // chip like any other command turn instead of dumping raw markup at the user
@@ -371,11 +396,12 @@ const ZSParse = (() => {
     return txt.includes(START_M) ||
            LUA_START_RE.test(txt) ||
            DSML_RE.test(txt) ||
-           CMD_KEY_RE.test(txt); // command/tool with OR without params (e.g. list_commands)
+           CMD_KEY_RE.test(txt) ||
+           FUNCTION_ENVELOPE_RE.test(txt); // wrapped function/name/arguments envelope
   }
 
   return {
-    START_M, END_M, LUA_START_RE, LUA_END_RE, CMD_KEY_RE, DSML_RE,
+    START_M, END_M, LUA_START_RE, LUA_END_RE, CMD_KEY_RE, FUNCTION_ENVELOPE_RE, DSML_RE,
     findLuaStart, findLuaEnd, matchBrace, extractJson, normalizeCall,
     hasToolSignature, hasOpenToolBlock, parseToolCalls, salvageCutOff, toolNameFromText,
     isInjectedFeedback, hasCommandShape,

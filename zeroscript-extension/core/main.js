@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // core/main.js - the provider-agnostic agentic loop, UI and session state.
 // Drives any AI chat site through the ZSProvider interface (providers/*.js):
-// waits for the model's reply, parses ZeroScript commands (ZSParse), asks the
+// waits for the model's reply, parses ArcScript commands (ZSParse), asks the
 // background worker to execute them on the Roblox MCP bridge, and feeds the
 // result back. Camouflages the system prompt ("Starting Up") and tool JSON
 // behind animated chips, masks injected input, and exposes a Stop button.
@@ -13,10 +13,14 @@
 
 (() => {
   "use strict";
+  // Resolve the shared config export explicitly. Avoid relying on a global-object
+  // property being visible as an unqualified identifier in every content-script context.
+  const ZS = globalThis.ZS;
+  if (!ZS) throw new Error("ArcScript config failed to load before core/main.js");
   const P = ZSProvider;
   const T = P.timings;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const log = (...a) => console.log("[zeroscript]", ...a);
+  const log = (...a) => console.log("[arcscript]", ...a);
 
   // ── Anti-bot mitigation (EXPERIMENTAL) ──────────────────────────────────
   // Suspected contributor to Arena's captcha: the agentic loop sends turns
@@ -78,28 +82,15 @@
     }, EXPECT);
   }
 
-  // Ko-fi tip link.
-  const KOFI_URL = "https://ko-fi.com/sebattfg";
-  // GitHub releases page - where users download the Bridge + start.bat.
-  const GITHUB_URL = "https://github.com/sebattfg/ZeroScript-Free";
+  // ArcScript repository and release downloads.
+  const GITHUB_URL = "https://github.com/robby-gridpoint/ZeroScript-Win/releases";
   // Shown in the panel instead of a static "Free" label, so a user's screenshot
   // alone tells us which build they're on for debugging. Pulled from
   // manifest.json (single source of truth) rather than duplicated here.
   const EXT_VERSION = chrome.runtime.getManifest().version;
   // YouTube tutorial - how to set up the Bridge.
   const VIDEO_URL = "https://youtu.be/kPKiZLZ9_Ps";
-  // Work.ink locked link - free "watch an ad" support option. Set once the
-  // locker is created at https://work.ink; the button is hidden until then.
-  const WORKINK_URL = "https://work.ink/2JXi/zeroscript-free-roblox-ai-coding-tool";
-  // Roblox "tip" Game Passes - the native currency for the audience.
-  const ROBUX_PASSES = [
-    { robux: 30, id: 1865342947 },
-    { robux: 100, id: 1866782815 },
-    { robux: 300, id: 1869176990 },
-    { robux: 1000, id: 1865192973 },
-  ];
-  const passUrl = (id) => `https://www.roblox.com/game-pass/${id}`;
-  // AI chat sites ZeroScript works on. Keep in sync with manifest.json
+  // AI chat sites ArcScript works on. Keep in sync with manifest.json
   // content_scripts and background.js PROVIDER_URLS when adding a provider.
   const AI_SITES = [
     { name: "DeepSeek", url: "https://chat.deepseek.com/" },
@@ -112,8 +103,14 @@
     { name: "Meta AI", url: "https://www.meta.ai/" },
   ];
 
+  // Conversation-level opt-out. Keys include provider id to avoid cross-site ID collisions.
+  const disabledSessions = new Set();
+
   const A = {
     running: false,
+    autopilotEnabled: false,
+    workerTask: null,
+    workerEvidence: [],
     stop: false,
     // stopping: the user clicked Stop and we are winding the loop down. Set the
     // instant the button is clicked so the bar can show immediate "Stopping…"
@@ -125,6 +122,9 @@
     // button OR the site's native stop. While set, the auto-resume watchdog
     // must NOT relaunch or re-run a tool from the halted turn.
     userStopped: false,
+    // True while the local CLI holds the shared agent-control lease.
+    externalControl: false,
+    externalControlState: "idle",
     // lastGenAt: timestamp of the last moment the site was actively generating.
     // The auto-resume watchdog only acts on a tool call from a RECENT live
     // generation - never on a historical turn rendered by opening/scrolling.
@@ -141,6 +141,10 @@
     // chat via the site's own button, syncSessionState abandons the loop so the
     // fresh chat shows "Start", not a stale "Agent active".
     loopKey: null,
+    // Latched when navigation abandons a running loop. Without this, the next
+    // sync sweep can pin the old loop to the DESTINATION GPT chat after clearing
+    // loopKey, making the abandoned loop look valid again.
+    loopAbandoned: false,
     // Identity of the assistant turn ALREADY present when the current session
     // started. A page reload can RESTORE an in-progress generation (e.g. an
     // execute_luau that was mid-stream in an A/B turn); that restored turn looks
@@ -172,6 +176,10 @@
     // upcoming submitAndGetBase/typeAndSend call to attach as the LAST step
     // before sending (see the comment in runTool's r.images branch).
     pendingImages: null,
+    // False until the provider confirms that an injected tool result landed in
+    // conversation history. The loop must not wait on a model reply to a message
+    // that was never delivered.
+    lastSendConfirmed: true,
     // BARE names of tools observed to return images at least once this session.
     // For the KNOWN Roblox vision tool (screen_capture) toolCategory already
     // gives the "screen" chip optimistically at run time; a custom MCP tool's
@@ -208,7 +216,7 @@
   // long after they returned. visibilitychange fires immediately on unhide, so we
   // race it against a slow stop-poll (the stop path is not latency-critical).
   async function waitVisible() {
-    if (!document.hidden || A.stop) return !A.stop;
+    if (!document.hidden || A.stop || A.workerTask) return !A.stop;
     A.parked = true;
     try { ui.setStarting(); } catch {}
     try {
@@ -238,7 +246,7 @@
   // Studio for 5 minutes" into "No response from <site>, the loop has stopped"
   // and left the pending command showing a grey "not run".
   async function parkHidden() {
-    if (!document.hidden || A.stop) return 0;
+    if (!document.hidden || A.stop || A.workerTask) return 0;
     const t0 = Date.now();
     await waitVisible();
     const parked = Date.now() - t0;
@@ -261,7 +269,57 @@
     A.sendToken = P.lastAssistantId ? P.lastAssistantId() : undefined;
   }
 
+  async function rasterizeSvgAttachments(images) {
+    if (!images || !images.some((img) => (img.mimeType || "").toLowerCase() === "image/svg+xml")) return images;
+    const converted = [];
+    for (const img of images) {
+      if ((img.mimeType || "").toLowerCase() !== "image/svg+xml") {
+        converted.push(img);
+        continue;
+      }
+      // Show SVG directly in the ArcScript preview panel, but rasterize it
+      // before upload because provider attachment controls generally require PNG/JPEG.
+      const dataUrl = `data:image/svg+xml;base64,${img.data}`;
+      const raster = await new Promise((resolve, reject) => {
+        const source = new Image();
+        source.onload = () => {
+          try {
+            const width = Math.max(1, Math.min(source.naturalWidth || 1024, 4096));
+            const height = Math.max(1, Math.min(source.naturalHeight || 1024, 4096));
+            const canvas = document.createElement("canvas");
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+            if (!ctx) throw new Error("Canvas 2D context unavailable");
+            ctx.drawImage(source, 0, 0, width, height);
+            canvas.toBlob((blob) => {
+              if (!blob) return reject(new Error("SVG-to-PNG conversion failed"));
+              const reader = new FileReader();
+              reader.onload = () => resolve({ data: String(reader.result).split(",")[1], mimeType: "image/png" });
+              reader.onerror = () => reject(new Error("Could not read converted PNG"));
+              reader.readAsDataURL(blob);
+            }, "image/png");
+          } catch (error) { reject(error); }
+        };
+        source.onerror = () => reject(new Error("SVG could not be rendered for attachment"));
+        source.src = dataUrl;
+      });
+      converted.push(raster);
+    }
+    return converted;
+  }
+
   async function submitAndGetBase(text, images) {
+    if (images && images.length) {
+      try {
+        images = await rasterizeSvgAttachments(images);
+      } catch (error) {
+        diag("images.svgRasterize.failed", { message: String(error && error.message || error) });
+        images = images.filter((img) => (img.mimeType || "").toLowerCase() !== "image/svg+xml");
+        if (!images.length) text += "\n\n[ArcScript displayed the SVG preview locally but could not convert it for chat attachment.]";
+      }
+    }
+    A.lastSendConfirmed = false;
     captureSendToken();
     diag("send", { text: String(text).slice(0, 60), busy: P.isBusyNow() });
     A.injecting = true;
@@ -280,6 +338,35 @@
       }
       const base = P.assistantCount();
       const preUser = P.userCount();
+      // Keep a snapshot of rendered turn identities. On long ChatGPT conversations,
+      // virtualisation can remove an old turn as a new one is added, leaving userCount
+      // unchanged. Counts alone then falsely report that a successfully sent result
+      // was never delivered. Identity + payload matching is the stronger receipt.
+      const priorItems = P.allItems();
+      const priorItemRefs = new Set(priorItems);
+      const priorItemKeys = new Set(priorItems
+        .map((it) => P.itemKey ? P.itemKey(it) : undefined)
+        .filter((key) => key !== undefined && key !== null && key !== "")
+        .map(String));
+      const normalizedPayload = String(text || "").replace(/\s+/g, " ").trim();
+      const deliveryNeedle = normalizedPayload.slice(0, Math.min(96, normalizedPayload.length));
+      const matchingNewPayload = () => {
+        if (!deliveryNeedle) return false;
+        const items = P.allItems();
+        for (let i = items.length - 1; i >= 0; i--) {
+          const item = items[i];
+          let itemText = "";
+          try {
+            itemText = P.itemText ? P.itemText(item) : P.classifyText(item, ".zs-chip");
+          } catch {}
+          const normalizedItem = String(itemText || "").replace(/\s+/g, " ").trim();
+          if (!normalizedItem.includes(deliveryNeedle)) continue;
+          const key = P.itemKey ? P.itemKey(item) : undefined;
+          const isNewKey = key !== undefined && key !== null && key !== "" && !priorItemKeys.has(String(key));
+          if (!priorItemRefs.has(item) || isNewKey) return true;
+        }
+        return false;
+      };
       // Arm the optimistic pre-hide for the result turn we're about to inject:
       // the very next NEW user turn is ours, so preHideWholeItems can mask it on
       // creation instead of waiting for its "Output of '…'" caption to render
@@ -288,17 +375,18 @@
       // nudge catches it). See preHideWholeItems.
       A.injectPreUser = preUser;
       A.injectHideUntil = Date.now() + 2500;
-      // "Landed" = a new turn appeared in the DOM. In long chats, list
-      // virtualisation can keep counts flat even when our message landed - the
-      // textarea-cleared signal below is the primary fast gate.
-      const landed = () => P.userCount() > preUser || P.assistantCount() > base;
+      // Prefer proof that this exact payload is present in a newly rendered turn.
+      // Fall back to counts for providers whose DOM does not expose readable turn
+      // text. Counts alone are insufficient on virtualised ChatGPT histories.
+      const landedByCount = () => P.userCount() > preUser || P.assistantCount() > base;
+      const landed = () => matchingNewPayload() || landedByCount();
       // CRITICAL: never type/send while the tab is HIDDEN. Background tabs throttle
       // rendering, which made the landed-check unreliable and caused the SAME
       // feedback to be sent several times. Send ONLY while visible.
       let tries = 0;
       let messageSent = false;
       while (!messageSent && !landed() && tries < 4 && !A.stop) {
-        if (document.hidden) {
+        if (document.hidden && !A.workerTask) {
           diag("send.waitVisible", { tries });
           if (!(await waitVisible()) || A.stop) break; // park (no cap) until foreground; break only on user stop
         }
@@ -323,18 +411,44 @@
         tries++;
       }
       if (messageSent) diag("send.cleared", { tries });
-      // All retries exhausted with NO evidence the message landed (textarea never
-      // cleared, no new turn). Silently returning here left the loop waiting for
-      // a reply that will never come (~60s "empty" timeout) with zero explanation
-      // - the reported "the tool result just never gets injected" symptom. Tell
-      // the user what actually happened so they can nudge the conversation
-      // themselves instead of watching a stuck bar.
-      if (!messageSent && !landed() && !A.stop) {
-        diag("send.failed", { tries });
-        ui.banner("warn", "Message could not be sent",
-          `${P.displayName} did not accept the injected message after ${tries} attempts. ` +
-          `Send a short message yourself (e.g. "continue") to resume the agent.`);
+      // A cleared editor is a useful fast signal, but it is NOT proof that the
+      // result turn reached conversation history. Some providers clear/rebuild
+      // their composer before the submitted turn is actually committed. Confirm
+      // that the user turn landed before allowing the agent loop to wait for an
+      // assistant response; otherwise a function result can disappear between
+      // execution and the next model turn.
+      const resultLanded = landed();
+      if (!resultLanded && messageSent && !A.stop) {
+        diag("send.clearWithoutLanding", { tries });
+        // Give the provider's DOM/network-backed render a short grace period.
+        // Do not re-send immediately: that risks duplicating a result when the
+        // provider is merely slow to commit it.
+        await waitFor(() => landed() || A.stop, 5000);
       }
+      const confirmedLanded = landed();
+      if (!confirmedLanded && !A.stop) {
+        diag("send.failed", {
+          tries,
+          editorCleared: messageSent,
+          landed: false,
+          itemCount: P.allItems().length,
+          userCount: P.userCount(),
+          assistantCount: P.assistantCount(),
+          expectedPrefix: deliveryNeedle.slice(0, 48),
+        });
+        ui.banner("warn", "Function result was not delivered",
+          `${P.displayName} did not confirm the injected tool result in conversation history after ${tries} attempts. ` +
+          `The tool may have executed, but its result was not delivered to the model. Send "continue" to resume, and check the conversation before retrying the action.`);
+      } else if (confirmedLanded) {
+        A.lastSendConfirmed = true;
+        diag("send.confirmed", {
+          tries,
+          editorCleared: messageSent,
+          byContent: matchingNewPayload(),
+          byCount: landedByCount(),
+        });
+      }
+      if (!confirmedLanded && !A.stop) A.lastSendConfirmed = false;
       return base;
     } finally {
       // During Starting Up / the agent loop, the bootstrap or loop owns the cover
@@ -425,7 +539,7 @@
       // fix for "I switched to Studio, came back and the command says 'not run'":
       // the loop used to burn its 5-minute inactivity budget off-screen, end with
       // "No response from <site>", and orphan the pending command.
-      if (document.hidden && !A.stop) {
+      if (document.hidden && !A.stop && !A.workerTask) {
         const parked = await parkHidden();
         if (A.stop) return { kind: "stopped" };
         if (parked) {
@@ -692,12 +806,12 @@
         // placeholder like "command_name") is NOT misread as a broken command and
         // looped on - only a real tool name means a genuine failed call.
         const nm = ZSParse.toolNameFromText(r);
-        if (nm && nm !== "command" && (A.toolNames.has(nm) || A.toolNames.has(bareToolName(nm)))) {
+        if (nm && nm !== "command" && knownTool(nm)) {
           return { kind: "parse_error", reason: "malformed", raw: r, item: d.item };
         }
       }
       // The model answered in its OWN native tool-call markup instead of a
-      // ZeroScript command - DeepSeek's DSML invoke/parameter tags (reported by
+      // ArcScript command - DeepSeek's DSML invoke/parameter tags (reported by
       // users, 2026-08; DeepSeek is the only provider seen doing it). It carries
       // no "command"/"tool" key and no ###...### markers, so hasToolSignature is
       // false and every guard below misses it too: the turn finalized as a
@@ -775,7 +889,7 @@
   // problems with opposite fixes: a bridge outage is fixed by start.bat and
   // resolves itself, while this one can ONLY be fixed by reloading the page and
   // never recovers on its own. Lumping them together (the old behaviour) told
-  // the model "the local ZeroScript bridge is unreachable", which sent the user
+  // the model "the local ArcScript bridge is unreachable", which sent the user
   // to check a bridge that was perfectly healthy. Diagnosed 2026-08-14 by the
   // giveaway timing: a genuine outage takes 8s (background.js `send` waits via
   // waitForConnection first), an invalidated context comes back in ~1ms.
@@ -821,12 +935,16 @@
   // plain `A.toolNames.has(bare)` misses, and so does bareToolName(bare), which
   // cannot re-add a prefix it never had. Compare bare-to-bare in BOTH directions.
   const bareKey = (n) => String(n || "").split("/").pop().split(".").pop();
+  function resolveKnownTool(name) {
+    if (!name || !A.toolNames.size) return null;
+    if (A.toolNames.has(name)) return name;
+    const target = bareKey(name);
+    const matches = [...A.toolNames].filter((candidate) => bareKey(candidate) === target);
+    // Never choose arbitrarily if two MCP servers expose the same bare name.
+    return matches.length === 1 ? matches[0] : null;
+  }
   function knownTool(name) {
-    if (!name || !A.toolNames.size) return false;
-    if (A.toolNames.has(name) || A.toolNames.has(bareToolName(name))) return true;
-    const b = bareKey(name);
-    for (const t of A.toolNames) if (bareKey(t) === b) return true;
-    return false;
+    return resolveKnownTool(name) !== null;
   }
   const isBlockedTool = (name) => {
     const bare = bareToolName(name);
@@ -891,9 +1009,47 @@
   }
 
   async function runTool(call) {
-    const name = call.tool;
+    if (isConversationDisabled()) {
+      diag("tool.blockedConversationDisabled");
+      return "ERROR: ZeroScript is disabled for this conversation; no further tool actions will be dispatched.";
+    }
+    const suppliedName = call.tool;
+    // Models sometimes use the bare tool name while the MCP catalogue prefixes
+    // it with a server id (or vice versa). Resolve only a unique catalogue match
+    // so the bridge receives its exact registered tool name.
+    const name = resolveKnownTool(suppliedName) || suppliedName;
     const args = call.arguments || {};
+    if (name !== suppliedName) diag("tool.nameResolved", { supplied: suppliedName, resolved: name });
     if (!name) return ZS.FEEDBACK.parseError("malformed");
+    // Independent Autopilot workers are capability-gated at the single tool
+    // dispatch choke point. Prompt instructions alone are not an authorization
+    // boundary: read-only reviewers cannot call edit/command tools.
+    if (A.workerTask) {
+      const policy = globalThis.ZSAutopilotPolicy;
+      if (!policy || typeof policy.decide !== "function") {
+        diag("autopilot.policyUnavailable", { role: A.workerTask.task && A.workerTask.task.role, tool: name });
+        return "ERROR: Autopilot capability policy is unavailable; worker tool execution was denied closed.";
+      }
+      const decision = policy.decide({
+        role: A.workerTask.task && A.workerTask.task.role,
+        tool: name,
+        args,
+        category: ZS.toolCategory(name),
+      });
+      if (!decision.allowed) {
+        diag("autopilot.capabilityDenied", {
+          role: A.workerTask.task && A.workerTask.task.role,
+          tool: name,
+          reason: decision.reason,
+        });
+        return "ERROR: Autopilot capability policy denied '" + name + "': " + decision.reason;
+      }
+      diag("autopilot.capabilityGranted", {
+        role: A.workerTask.task && A.workerTask.task.role,
+        tool: name,
+        capability: decision.capability,
+      });
+    }
     // NEVER execute while the AI tab is backgrounded/minimized. This is the single
     // choke point for ALL execution (agentLoop's tool dispatch AND the bootstrap's
     // tool calls), so it closes the hole the loop-entry gate alone left open:
@@ -902,7 +1058,7 @@
     // tool call that fired into Studio off-screen (observed live: GLM minimized
     // still ran execute_luau). Parking here (no time cap) means the call runs the
     // moment the tab is foreground again, instead of being lost or run blind.
-    if (document.hidden && !A.stop) {
+    if (document.hidden && !A.stop && !A.workerTask) {
       diag("tool.waitVisible", { name });
       // Only reachable via a user Stop while parked; agentLoop's post-runTool
       // A.stop check breaks the loop and discards this, so it just needs to be
@@ -918,7 +1074,7 @@
       }
       return `ERROR: the '${bareName}' command timed out and is unavailable in this environment. Do NOT call it again - complete the task yourself using the other commands (execute_luau, multi_edit, etc.).`;
     }
-    // Virtual command: list the MCP server(s) ZeroScript is currently connected
+    // Virtual command: list the MCP server(s) ArcScript is currently connected
     // to, with each one's REAL per-server health (from the bridge, never the
     // merged tool count - a dead server must not borrow another's numbers).
     if (name === "list_mcp_servers") {
@@ -1068,18 +1224,13 @@
       r = { ok: false, error: r.text.replace(/^(?:\S*(?:ExecuteLuauTool|CommandExecution):\d+:\s*)+/, "").trim() || r.text };
     }
     if (r.ok) {
-      if (r.images && r.images.length && !P.supportsVision) {
-        // Any tool from ANY connected server can turn out to return images -
-        // we don't try to predict this from its name in advance. This is the
-        // generic catch: whatever just ran, if it handed back images and this
-        // provider's model can't see them, refuse cleanly instead of silently
-        // attaching a file it will never actually process.
-        return `ERROR: '${bareName}' returned an image, but this assistant cannot see images. Do NOT call it again. Use a different command to get the information as text instead.`;
-      }
       if (r.images && r.images.length) {
-        // Show the capture in a left-hand ZeroScript popup (from the in-memory
-        // base64 - simple and reliable on every site; no DOM-embedded preview).
+        // Always show returned images in ArcScript's own preview panel, even
+        // when the active provider/model cannot accept image attachments.
         ui.showImages(r.images, name);
+        if (!P.supportsVision) {
+          return `Output of '${name}': ${r.images.length} image(s) displayed in the ArcScript preview panel, but the active provider (${P.displayName || P.id || "current provider"}) cannot analyze image attachments. Visual QA is NOT complete. Switch to a provider/model with vision enabled (for example, a vision-capable Gemini or DeepSeek Vision session), then call workspace_preview_image again in that session. Do not infer visual details from the preview metadata alone.`;
+        }
         // Do NOT attach the image here: submitAndGetBase/typeAndSend types the
         // feedback text into the editor LATER, and on providers whose editor is
         // rebuilt via select-all + insertText (e.g. Gemini's setEditorText),
@@ -1103,7 +1254,7 @@
     // that instead of blaming the bridge (see bg / isContextInvalidated).
     if (r.kind === "stale-extension") {
       ui.banner("warn", "Reload this page",
-        "ZeroScript was updated or reloaded while this tab was open, so this page is running an " +
+        "ArcScript was updated or reloaded while this tab was open, so this page is running an " +
         "old copy of it and commands can no longer run. Reload the page (F5) to reconnect - your " +
         "bridge and Roblox Studio are unaffected.");
       diag("bridge.staleExtension", { name, error: r.error });
@@ -1230,6 +1381,14 @@
   //  AGENTIC LOOP
   // ════════════════════════════════════════════════════════════════════════
   async function agentLoop(base) {
+    if (isConversationDisabled()) {
+      diag("loop.blockedConversationDisabled");
+      return;
+    }
+    if (A.externalControl) {
+      ui.toast("The independent CLI agent owns this task. Browser execution is paused.");
+      return;
+    }
     if (A.running) return;
     A.running = true;
     A.resumeArmed = false; // loop now owns the turn; drop the regenerate grace
@@ -1237,13 +1396,60 @@
     A.stopping = false; // clean slate: never inherit a stale "Stopping…" from a
                         // Stop click that landed before this loop actually started
     A.loopKey = null; // pinned by syncSessionState once this chat has an id + content
+    A.loopAbandoned = false;
     let truncCount = 0;
+    let autopilotPasses = 0;
+    let autopilotCloseoutRetries = 0;
+    const MAX_AUTOPILOT_CLOSEOUT_RETRIES = 1;
+    // Record evidence from actual tool responses in this run. This is not a
+    // substitute for task-specific acceptance criteria, but it prevents a
+    // formatted model report with zero inspected/tested outputs from closing
+    // Autopilot as successful.
+    const autopilotEvidence = {
+      toolCalls: 0,
+      successfulToolCalls: 0,
+      failedToolCalls: 0,
+      verificationCalls: 0,
+      records: [],
+    };
+    const VERIFICATION_TOOL_NAME = /(?:test|build|lint|type.?check|verify|inspect|read_file|git_diff|git_status|project_info|list_files|search|run_task|validate|check)/i;
+    const AUTOPILOT_PHASES = [
+      {
+        role: "Project manager",
+        prompt: "PROJECT MANAGER PASS: Reconstruct the user's original goal from this conversation. Compare work completed against explicit acceptance criteria. Identify concrete gaps, dependencies, and blockers. If a gap is actionable with available tools, create a short prioritized plan and complete the most important missing work now. Do not re-do verified work. If no useful action remains, say AUTOPILOT_NO_ACTION_NEEDED."
+      },
+      {
+        role: "QA engineer",
+        prompt: "QA ENGINEER PASS: Treat previous claims as unverified. Inspect the changed files and actual tool outputs. Run relevant safe tests/checks available in this environment; inspect results. Fix straightforward, in-scope defects and rerun the affected checks. Do not claim a test passed unless its result is visible. If no useful action remains, say AUTOPILOT_NO_ACTION_NEEDED."
+      },
+      {
+        role: "Code reviewer",
+        prompt: "CODE REVIEW PASS: Review the implementation and diffs as a skeptical reviewer. Look for regressions, edge cases, stale assumptions, duplicated work, compatibility problems, and error paths. Make targeted fixes only when evidence supports them; verify each fix with available checks. If no actionable issue remains, say AUTOPILOT_NO_ACTION_NEEDED."
+      },
+      {
+        role: "Security reviewer",
+        prompt: "SECURITY PASS: Inspect changes and tool usage for permission escalation, unsafe command execution, secret exposure, untrusted input, destructive side effects, and approval bypasses. Fix concrete in-scope problems. Never publish, deploy, spend money, send external communications, delete user data, change credentials/security settings, or perform irreversible/high-impact actions without explicit user approval. If no useful action remains, say AUTOPILOT_NO_ACTION_NEEDED."
+      },
+      {
+        role: "Documentation owner",
+        prompt: "DOCUMENTATION PASS: Compare docs and UI claims against behavior actually implemented and verified. Correct stale or misleading instructions, add essential setup/usage notes, and document known limits. Do not describe planned functionality as shipped or unverified checks as passing. If no useful action remains, say AUTOPILOT_NO_ACTION_NEEDED."
+      },
+      {
+        role: "Ideas & insights agent",
+        prompt: "IDEAS & INSIGHTS PASS: Think beyond the immediate implementation without losing sight of the user's actual goal. Inspect the current project/context and identify up to three genuinely useful opportunities, design improvements, simplifications, missing capabilities, or risks the team may have overlooked. Avoid generic brainstorming, speculative feature creep, and repeating existing plans. For each idea, state the user value, evidence/context, estimated effort (S/M/L), risk (low/medium/high), and a concrete next step. Rank by impact-to-effort and relevance. Recommend at most one idea for immediate implementation, and only if it is clearly in scope, low-risk, reversible, and verifiable with available tools; otherwise record it as a proposal for the lead to accept or defer. Do not perform destructive, external, costly, security-sensitive, or scope-expanding actions. Summarize the ranked ideas and explicitly state whether you made a verified improvement or only proposed work. Do not use AUTOPILOT_NO_ACTION_NEEDED merely because no implementation change is appropriate; insight itself is useful output."
+      },
+      {
+        role: "Lead developer",
+        prompt: "LEAD DEVELOPER CLOSEOUT: Re-check the original request, acceptance criteria, work performed, and available verification evidence. Address one final concrete gap if it can be safely completed and verified. Otherwise conclude with a concise report separating delivered work, checks actually run, unresolved risks, and approval-gated actions. End the report with AUTOPILOT_COMPLETE. Do not restart completed work."
+      }
+    ];
+    const MAX_AUTOPILOT_PASSES = AUTOPILOT_PHASES.length;
     const MAX_TRUNC = 6;
     // Re-send the command list after this many successful tool calls. Kept high
     // so the reminder does not bloat the context too often.
     const REMIND_TOOLS_EVERY = 20;
     ui.showStop(true);
-    P.setInputLock(true); // prevent user from typing while the agent is active
+    // Keep the native composer editable while the agent runs. Locking the\n    // contenteditable surface also disables Space/Delete and makes ChatGPT\n    // appear broken to the user. Injection locks only during its own operation.
     ui.inputCover(true);  // keep the "Agent is working" cover up for the WHOLE loop
     diag("loop.start", { base });
     try {
@@ -1261,7 +1467,7 @@
         //    duplicate sends - see the send-side guard in submitAndGetBase).
         // Parking here means we never START a parse/exec cycle off-screen; the
         // send step re-checks too, so a switch-away mid-generation is covered.
-        if (document.hidden && !A.stop) {
+        if (document.hidden && !A.stop && !A.workerTask) {
           diag("loop.waitVisible");
           ui.inputCover(true); // keep the "Agent is working" cover up while parked
           if (!(await waitVisible()) || A.stop) break; // park (no cap) until foreground; break only on user stop
@@ -1348,7 +1554,114 @@
           base = await submitAndGetBase(ZS.FEEDBACK.parseError(res.reason, failName));
           continue;
         }
-        if (res.kind === "text") break; // final answer
+        if (res.kind === "text") {
+          // Completion is accepted only from the final lead-developer pass,
+          // with a minimally complete evidence report. A specialist cannot end
+          // the run by emitting the marker, and contradictory terminal markers
+          // are never treated as success.
+          if (A.autopilotEnabled && !A.workerTask && /AUTOPILOT_COMPLETE/.test(res.text || "")) {
+            const text = String(res.text || "");
+            const isLeadPass = autopilotPasses === MAX_AUTOPILOT_PASSES;
+            const hasReport = /delivered work/i.test(text) &&
+              /verification evidence|checks actually run/i.test(text) &&
+              /unresolved risks/i.test(text);
+            const contradictory = /AUTOPILOT_NO_ACTION_NEEDED/.test(text);
+            const hasObservedEvidence = autopilotEvidence.successfulToolCalls > 0 &&
+              autopilotEvidence.verificationCalls > 0;
+            if (isLeadPass && hasReport && !contradictory && hasObservedEvidence) {
+              const ledgerKey = "zsAutopilotRun:" + String(P.conversationKey() || "unknown");
+              const ledger = {
+                conversationKey: String(P.conversationKey() || "unknown"),
+                phase: "complete",
+                pass: autopilotPasses,
+                maxPasses: MAX_AUTOPILOT_PASSES,
+                state: "completed",
+                completionGate: "lead_report_and_observed_tool_evidence",
+                evidence: {
+                  toolCalls: autopilotEvidence.toolCalls,
+                  successfulToolCalls: autopilotEvidence.successfulToolCalls,
+                  failedToolCalls: autopilotEvidence.failedToolCalls,
+                  verificationCalls: autopilotEvidence.verificationCalls,
+                  records: autopilotEvidence.records.slice(),
+                },
+                updatedAt: new Date().toISOString()
+              };
+              try { chrome.storage.local.set({ [ledgerKey]: ledger }); } catch {}
+              diag("autopilot.earlyClose", { pass: autopilotPasses, marker: "complete", gate: "lead_report_and_observed_tool_evidence" });
+              ui.toast("Autopilot closeout accepted · tool evidence recorded.");
+              break;
+            }
+            diag("autopilot.completionRejected", {
+              pass: autopilotPasses, max: MAX_AUTOPILOT_PASSES,
+              isLeadPass, hasReport, contradictory, hasObservedEvidence,
+              successfulToolCalls: autopilotEvidence.successfulToolCalls,
+              verificationCalls: autopilotEvidence.verificationCalls
+            });
+            if (autopilotCloseoutRetries < MAX_AUTOPILOT_CLOSEOUT_RETRIES && !A.stop) {
+              autopilotCloseoutRetries++;
+              base = await submitAndGetBase(
+                "AUTOPILOT CLOSEOUT REJECTED BY THE ORCHESTRATOR. Do not claim completion yet. " +
+                "You are at pass " + autopilotPasses + " of " + MAX_AUTOPILOT_PASSES + ". " +
+                "Only the final Lead developer pass may emit AUTOPILOT_COMPLETE. " +
+                "Return a concise report with headings Delivered work, Verification evidence, and Unresolved risks. " +
+                "List only checks whose actual tool output is visible; explicitly label unavailable or unrun checks NOT VERIFIED. " +
+                "The orchestrator observed " + autopilotEvidence.successfulToolCalls + " successful tool call(s), " +
+                autopilotEvidence.verificationCalls + " successful verification/read/inspection call(s). Do not claim checks beyond these records. " +
+                "Do not include AUTOPILOT_NO_ACTION_NEEDED in a completion report. " +
+                "If the evidence does not justify success, state BLOCKED or NOT VERIFIED and omit AUTOPILOT_COMPLETE."
+              );
+              continue;
+            }
+          }
+          if (A.autopilotEnabled && !A.workerTask && /AUTOPILOT_NO_ACTION_NEEDED/.test(res.text || "")) {
+            diag("autopilot.phaseNoAction", { pass: autopilotPasses });
+          }
+          if (A.autopilotEnabled && !A.workerTask && autopilotPasses < MAX_AUTOPILOT_PASSES && !A.stop) {
+            const phase = AUTOPILOT_PHASES[autopilotPasses];
+            autopilotPasses++;
+            const ledgerKey = "zsAutopilotRun:" + String(P.conversationKey() || "unknown");
+            const ledger = {
+              conversationKey: String(P.conversationKey() || "unknown"),
+              phase: phase.role,
+              pass: autopilotPasses,
+              maxPasses: MAX_AUTOPILOT_PASSES,
+              state: "running",
+              updatedAt: new Date().toISOString()
+            };
+            try { chrome.storage.local.set({ [ledgerKey]: ledger }); } catch {}
+            diag("autopilot.phase", { role: phase.role, pass: autopilotPasses, max: MAX_AUTOPILOT_PASSES });
+            ui.toast("Autopilot · " + phase.role + " (" + autopilotPasses + "/" + MAX_AUTOPILOT_PASSES + ")");
+            base = await submitAndGetBase(
+              "AUTOPILOT MULTI-ROLE WORKFLOW — " + phase.role.toUpperCase() + "\n" +
+              phase.prompt + "\n\n" +
+              "Operating contract: this extension currently runs role-separated passes in the same provider conversation; you are not an independent model or concurrent worker. Use only tools actually available here. Keep changes scoped to the selected project/session. Respect the normal Stop control. Do not repeat completed work, fabricate tool/test results, or bypass approval gates. If a concrete next action remains, perform it with tools before responding. If none remains, include AUTOPILOT_NO_ACTION_NEEDED. The lead closeout should include delivered work, actual verification evidence, unresolved risks, and any approval needed."
+            );
+            continue;
+          }
+          if (A.autopilotEnabled && !A.workerTask && autopilotPasses >= MAX_AUTOPILOT_PASSES) {
+            const ledgerKey = "zsAutopilotRun:" + String(P.conversationKey() || "unknown");
+            const ledger = {
+              conversationKey: String(P.conversationKey() || "unknown"),
+              phase: "blocked",
+              pass: autopilotPasses,
+              maxPasses: MAX_AUTOPILOT_PASSES,
+              state: "blocked_unverified",
+              reason: "phase_limit_without_valid_lead_closeout",
+              evidence: {
+                toolCalls: autopilotEvidence.toolCalls,
+                successfulToolCalls: autopilotEvidence.successfulToolCalls,
+                failedToolCalls: autopilotEvidence.failedToolCalls,
+                verificationCalls: autopilotEvidence.verificationCalls,
+                records: autopilotEvidence.records.slice(),
+              },
+              updatedAt: new Date().toISOString()
+            };
+            try { chrome.storage.local.set({ [ledgerKey]: ledger }); } catch {}
+            diag("autopilot.limit", { max: MAX_AUTOPILOT_PASSES, state: "blocked_unverified" });
+            ui.toast("Autopilot stopped: no valid verified closeout.");
+          }
+          break;
+        }
 
         if (res.kind === "tool") {
           const calls = res.calls;
@@ -1377,7 +1690,7 @@
           //     the auto-resume watchdog refuses to re-fire an "executed" turn.
           // Parking first keeps all of that truthful: we only commit once we are
           // foreground and about to really dispatch.
-          if (document.hidden && !A.stop) {
+          if (document.hidden && !A.stop && !A.workerTask) {
             diag("tool.parkBeforeDispatch", { name: call.tool });
             if (!(await waitVisible()) || A.stop) break;
           }
@@ -1408,6 +1721,30 @@
           }
           const isErr = feedbackIsError(feedback);
           const outBody = stripOutputPrefix(feedback);
+          if (A.workerTask && !isErr) {
+            A.workerEvidence.push({
+              tool: String(call.tool || "unknown"),
+              summary: outSummary(feedback).slice(0, 240),
+              output: stripOutputPrefix(feedback).slice(0, 5000),
+              source: "tool:" + String(call.tool || "unknown"),
+            });
+            if (A.workerEvidence.length > 30) A.workerEvidence.shift();
+          }
+          if (A.autopilotEnabled) {
+            autopilotEvidence.toolCalls++;
+            if (isErr) autopilotEvidence.failedToolCalls++;
+            else autopilotEvidence.successfulToolCalls++;
+            if (!isErr && VERIFICATION_TOOL_NAME.test(String(call.tool || ""))) {
+              autopilotEvidence.verificationCalls++;
+              autopilotEvidence.records.push({
+                tool: String(call.tool || "unknown"),
+                outcome: "success",
+                summary: outSummary(feedback).slice(0, 240),
+                at: new Date().toISOString(),
+              });
+              if (autopilotEvidence.records.length > 20) autopilotEvidence.records.shift();
+            }
+          }
           // Trace the chip's DERIVED phase vs summary. Blender (and any MCP whose
           // output leads with a warning/diagnostic line) resolves ✓ done - the
           // payload starts "Output of…", not "ERROR" - yet outSummary shows its
@@ -1477,6 +1814,10 @@
           A.pendingImages = null;
           diag("images.consumed", { count: images ? images.length : 0 });
           base = await submitAndGetBase(toSend, images);
+          if (!A.lastSendConfirmed && !A.stop) {
+            diag("loop.resultUndelivered", { name: call.tool });
+            break; // do not wait for a model response to feedback that never landed
+          }
         }
       }
     } catch (e) {
@@ -1784,10 +2125,10 @@
     const rider =
       "\n\n────────────────────────────────\n" +
       ZS.RESEND_MARKER + "\n" +
-      "(System note from ZeroScript - an automatic re-statement of your operating " +
+      "(System note from ArcScript - an automatic re-statement of your operating " +
       "instructions, NOT a new request and NOT something to reply to. This conversation " +
       "may have been summarised, which drops the part explaining how you actually run " +
-      "commands. To be explicit: the ZeroScript extension IS running in this page right " +
+      "commands. To be explicit: the ArcScript extension IS running in this page right " +
       "now, it DOES read your replies, and the commands below DO execute for real - the " +
       "results you have been receiving are proof of it. Keep using them exactly as " +
       "described. Just carry on with the task; do not acknowledge this note.)\n" +
@@ -1808,12 +2149,20 @@
   // ════════════════════════════════════════════════════════════════════════
   //  SESSION BOOTSTRAP  ("Starting Up" animated chip, shown in the conversation)
   // ════════════════════════════════════════════════════════════════════════
-  async function startSession() {
+  async function startSession(attachToExisting = false) {
+    if (isConversationDisabled()) {
+      ui.toast("ZeroScript is disabled in this conversation. Use Enable ZeroScript to turn it back on.");
+      return;
+    }
+    if (A.externalControl) {
+      ui.toast("The independent CLI agent owns this task. Use the terminal to control or stop it.");
+      return;
+    }
     if (A.running || A.starting) return;
-    // "Start session" is allowed ONLY on a blank conversation. Opening an
-    // EXISTING conversation must never trigger the bootstrap.
-    if (!P.chatIsEmpty() && !A.started) {
-      ui.toast("Open a new, empty conversation to start a session.");
+    // Existing conversations require an explicit user action ("Start agent in
+    // this chat"). Never attach automatically during page load or navigation.
+    if (!P.chatIsEmpty() && !A.started && !attachToExisting) {
+      ui.toast("Choose Start agent in this chat to attach ArcScript here.");
       return;
     }
     A.userStopped = false;
@@ -1824,13 +2173,15 @@
     // restored execute_luau can't leak into the freshly started conversation.
     A.bootBaselineId = P.lastAssistantId ? P.lastAssistantId() : null;
     A.starting = true;
+    const initialConversationKey = P.conversationKey();
+    if (initialConversationKey) recordConversation(initialConversationKey, "starting");
     const myGen = ++A.startGen;   // identity of THIS bootstrap
-    A.startingKey = null;          // unknown until the conversation gets an id
+    A.startingKey = initialConversationKey || null; // pin an existing chat immediately
     const alive = () => A.startGen === myGen; // false once superseded/aborted
     A.toolCallsSinceReminder = 0; // fresh reminder cadence for the new session
     ui.setStarting(true);
     ui.updateStartGate(); // refresh the bar into its "starting" state
-    P.setInputLock(true); // block user input during bootstrap
+    // Do not lock the native composer during bootstrap; users must retain normal\n    // editing keys (including Space and Delete) while ArcScript initializes.
     ui.inputCover(true);  // cover the composer ("Working…") for the WHOLE Starting Up
     try {
       await ensureTools(true); // boot: always take a fresh catalogue (the TTL then
@@ -1852,6 +2203,16 @@
       const prompt = systemPrompt();
       const base = await submitAndGetBase(prompt);
       if (!alive()) return;
+      // Never classify a stale previous assistant turn as the bootstrap reply.
+      // If the provider did not confirm that the bootstrap prompt reached the
+      // conversation, abort startup so the user can retry instead of leaving a
+      // misleading "Starting Up" state with raw JSON or no tool dispatch.
+      if (!A.lastSendConfirmed) {
+        diag("start.promptUndelivered");
+        ui.banner("warn", "Startup prompt was not delivered",
+          "ArcScript could not confirm the bootstrap prompt in conversation history. Retry Start after refreshing the chat.");
+        return;
+      }
       // (syncSessionState pins A.startingKey to the conversation id once the chat
       // has content, and aborts this bootstrap if the user opens a new empty chat.)
       decorate.sweep(); // show the animated "Starting Up" chip immediately
@@ -1890,10 +2251,11 @@
         if (A.stop || readyRes.kind === "stopped") { diag("start.aborted", { kind: readyRes.kind }); return; }
       }
       A.started = true;
-      rememberSession(P.conversationKey()); // survives virtualization AND reloads
+      rememberSession(A.startingKey || P.conversationKey()); // survives virtualization AND reloads
       ui.setStarted(true);
       ui.toast(`Agent ready. Ask ${P.displayName} to work on your project.`);
     } catch (e) {
+      console.error("[arcscript] Startup failed", e && e.stack ? e.stack : e);
       if (alive()) ui.banner("warn", "Startup failed", String((e && e.message) || e));
     } finally {
       // Only tear down our OWN starting state. If we were superseded (the user
@@ -1905,6 +2267,7 @@
         ui.inputCover(false); // lift the Starting Up composer cover
         P.setInputLock(false); // always unlock after bootstrap
         decorate.sweep();
+        decorateConversationIndicators();
       }
     }
   }
@@ -2206,7 +2569,7 @@
       }
 
       // 3. Assistant command turns → live loading while streaming, ✓ when done.
-      // ONLY in a real ZeroScript session (started or bootstrapping). Without
+      // ONLY in a real ArcScript session (started or bootstrapping). Without
       // this gate, a plain never-started chat where the model merely EXPLAINS
       // the command format (a {"command":...} example in its answer) got the
       // example MASKED behind a tool chip - hiding genuine content the user
@@ -2524,7 +2887,7 @@
   //  UI  (control panel, onboarding, stop button, banners, toast, input cover)
   // ════════════════════════════════════════════════════════════════════════
   const ui = (() => {
-    let root, bar, dot, brandEl, stateEl, actionBtn, stopBtn, switchBtn, supportBtn, discordEl, menuEl, unstableEl;
+    let root, bar, dot, brandEl, stateEl, actionBtn, stopBtn, switchBtn, menuEl, unstableEl;
     let cover, coverRaf, barRaf;
     let openMenuFn = null; // set by build(); lets the popup force the panel open via runtime message
     let bridgeOk = false, studioDown = false, placeDown = false, appDown = false, addonOk = false, studioProcUp = false;
@@ -2536,18 +2899,16 @@
       // One consolidated status bar, anchored just above the site's composer
       // (positioned every frame by placeBar). It carries everything: live status,
       // the primary action (Start / Stop) and a "more"
-      // menu (other AI sites, custom prompt, support, Discord). No floating panel,
+      // menu (AI sites, custom prompt, and integration settings). No floating panel,
       // no overlay on the input - the composer stays fully usable for plain chat.
       root.innerHTML = `
         <div id="zs-bar">
           <span id="zs-dot" class="off" title=""></span>
-          <span id="zs-brand">ZeroScript <span class="zs-free">v${EXT_VERSION}</span></span>
+          <span id="zs-brand">ArcScript <span class="zs-free">v${EXT_VERSION}</span></span>
           <span id="zs-state"></span>
           <button id="zs-action"></button>
           <button id="zs-stop" hidden>■ Stop</button>
-          <a id="zs-discord" href="https://discord.gg/D5G2HAzX8z" target="_blank" rel="noopener" title="Need help? Join our Discord"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg></a>
-          <button id="zs-switch" aria-label="Switch AI and options" title="Switch AI, custom prompt, support"><span id="zs-switch-name"></span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button>
-          <button id="zs-support" aria-label="Support ZeroScript" title="Support ZeroScript"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg></button>
+          <button id="zs-switch" aria-label="Switch AI and options" title="Switch AI and options"><span id="zs-switch-name"></span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button>
         </div>
         <div id="zs-menu" hidden></div>
         ${P.unstableWarning ? `<button id="zs-unstable" aria-label="Provider may be unstable" hidden>⚠ unstable</button>` : ""}
@@ -2560,8 +2921,6 @@
       actionBtn = root.querySelector("#zs-action");
       stopBtn = root.querySelector("#zs-stop");
       switchBtn = root.querySelector("#zs-switch");
-      supportBtn = root.querySelector("#zs-support");
-      discordEl = root.querySelector("#zs-discord");
       const swName = root.querySelector("#zs-switch-name");
       if (swName) swName.textContent = P.displayName || P.id;
       menuEl = root.querySelector("#zs-menu");
@@ -2582,9 +2941,8 @@
         unstableEl.addEventListener("click", (e) => { e.stopPropagation(); toast(P.unstableWarning); });
       }
       buildMenu();
-      // Both bar controls open the same panel; the heart lands on the Support
-      // section (last), the model button opens at the top with Switch AI.
-      const toggleMenu = (toSupport) => {
+      // The model button opens the options menu.
+      const toggleMenu = () => {
         menuEl.hidden = !menuEl.hidden;
         if (!menuEl.hidden) {
           // Rebuild on every open, not just once at page load: the initial
@@ -2593,25 +2951,17 @@
           // MCP servers section otherwise - nothing ever refreshed it after.
           buildMenu();
           syncMenuPrompt();
-          // On a FRESH open, menuEl has no max-height yet - that's only applied by
-          // placeBar()'s positioning pass, which runs on the next rAF tick (it's a
-          // separate loop, not synchronous with this click). Without it the panel
-          // has no overflow yet, so scrollHeight === clientHeight and setting
-          // scrollTop here is a no-op - the "jump to Support" silently failed on
-          // the very first open (reported live on Arena). Deferring one frame lets
-          // placeBar's already-queued tick clip the box first, so there's real
-          // scroll room by the time we set scrollTop.
+          // Let placeBar establish the panel bounds before setting its initial scroll position.
           requestAnimationFrame(() => {
-            if (!menuEl.hidden) menuEl.scrollTop = toSupport ? menuEl.scrollHeight : 0;
+            if (!menuEl.hidden) menuEl.scrollTop = 0;
           });
         }
       };
-      switchBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleMenu(false); });
-      supportBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleMenu(true); });
-      openMenuFn = (toSupport) => { if (menuEl.hidden) toggleMenu(toSupport); };
+      switchBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleMenu(); });
+      openMenuFn = () => { if (menuEl.hidden) toggleMenu(); };
       document.addEventListener("click", (e) => {
         if (menuEl.hidden) return;
-        if (!menuEl.contains(e.target) && !switchBtn.contains(e.target) && !supportBtn.contains(e.target))
+        if (!menuEl.contains(e.target) && !switchBtn.contains(e.target))
           menuEl.hidden = true;
       }, true);
 
@@ -2626,6 +2976,8 @@
     function onActionClick() {
       const kind = actionBtn.dataset.kind;
       if (kind === "start" || kind === "start-degraded") startSession();
+      else if (kind === "attach") startSession(true);
+      else if (kind === "enable") enableCurrentConversation();
     }
 
     // ── Custom prompt (persisted) ───────────────────────────────────────────
@@ -2732,7 +3084,7 @@
 
     // ── The "more" menu (⋯) ─────────────────────────────────────────────────
     // One popover holding every secondary control: other AI sites, the custom
-    // prompt, and support (Ko-fi + Robux). Opens above the bar.
+    // prompt and integration settings. Opens above the bar.
     function buildMenu() {
       const here = (P.displayName || "").toLowerCase();
       const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } };
@@ -2744,14 +3096,10 @@
           ? `<div class="zs-site-opt zs-site-here">${label}<span class="zs-site-badge">active</span></div>`
           : `<button class="zs-site-opt" data-u="${s.url}">${label}<span class="zs-site-go">&rarr;</span></button>`;
       }
-      let passes = "";
-      for (const p of ROBUX_PASSES) {
-        passes += `<button class="zs-tip-opt zs-tip-rbx" data-u="${passUrl(p.id)}"><span class="zs-rbx-cur">R$</span>${p.robux}</button>`;
-      }
       const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
       const mergedServers = mergedMcpServers();
       // Roblox always heads the list - greyed out, no health dot (its own status
-      // is already the main ZeroScript dot elsewhere) and no remove button (it's
+      // is already the main ArcScript dot elsewhere) and no remove button (it's
       // the primary server, protected bridge-side too).
       let mcpList =
         `<div class="zs-mcp-item zs-mcp-item-primary"><div class="zs-mcp-info"><span class="zs-mcp-name">Roblox Studio</span><span class="zs-mcp-url">primary - always connected</span></div></div>`;
@@ -2762,22 +3110,17 @@
         const healthTitle = s.alive === true ? `${s.tools || 0} tools available` : s.alive === false ? "offline" : "status unknown";
         mcpList += `<div class="zs-mcp-item"><span class="zs-mcp-health zs-mcp-health-${healthClass}" title="${healthTitle}"></span><div class="zs-mcp-info"><span class="zs-mcp-name">${esc(s.name)}</span><span class="zs-mcp-url">${esc(s.command || s.id)}</span></div><button class="zs-mcp-remove" data-id="${esc(s.id)}" title="Remove">✕</button></div>`;
       });
+      const conversationControl = isConversationDisabled()
+        ? `<section class="zs-menu-sec"><div class="zs-sec-label"><span>This conversation</span></div><div class="zs-menu-note">ZeroScript is off for this chat. Normal messages pass through without agent tools.</div><button id="zs-enable-chat" class="zs-chat-control zs-chat-control-enable" type="button">Enable ZeroScript in this chat</button></section>`
+        : (A.started || A.starting || A.running)
+          ? `<section class="zs-menu-sec"><div class="zs-sec-label"><span>This conversation</span></div><div class="zs-menu-note">Stop the current agent and keep ZeroScript off in this chat. Other conversations are unaffected.</div><button id="zs-disable-chat" class="zs-chat-control" type="button">■ Turn off ZeroScript in this chat</button></section>`
+          : "";
       menuEl.innerHTML =
-        `<div class="zs-menu-head"><span class="zs-menu-logo">ZeroScript</span><span class="zs-menu-tag">v${EXT_VERSION}</span></div>
+        `<div class="zs-menu-head"><span class="zs-menu-logo">ArcScript</span><span class="zs-menu-tag">v${EXT_VERSION}</span></div>
+         ${conversationControl}
          <section class="zs-menu-sec">
            <div class="zs-sec-label"><span>Switch AI</span></div>
            ${sites}
-         </section>
-         <section class="zs-menu-sec">
-           <div class="zs-sec-label"><span>Free Support</span></div>
-           <button class="zs-tip-opt zs-tip-star" data-u="${GITHUB_URL}"><span>Star on GitHub</span><span class="zs-tip-sub">free, helps a lot</span></button>
-           ${WORKINK_URL ? `<button class="zs-tip-opt zs-tip-ad" data-u="${WORKINK_URL}"><span>Watch an ad to support</span><span class="zs-tip-sub">free, takes a minute</span></button>` : ""}
-         </section>
-         <section class="zs-menu-sec">
-           <div class="zs-sec-label"><span>Support with Robux / Ko-fi</span></div>
-           <button class="zs-tip-opt zs-tip-kofi" data-u="${KOFI_URL}"><span>Tip on Ko-fi</span><span class="zs-tip-sub">any amount</span></button>
-           <div class="zs-tip-sep">or tip in Robux</div>
-           <div class="zs-rbx-grid">${passes}</div>
          </section>
          <section class="zs-menu-sec">
            <div class="zs-sec-label"><span>Custom prompt</span></div>
@@ -2795,7 +3138,17 @@
            <div class="zs-set-row"><button id="zs-mcp-add">Add server</button><span id="zs-mcp-status"></span></div>
          </section>`;
       const open = (url) => { try { window.open(url, "_blank", "noopener"); } catch {} menuEl.hidden = true; };
-      menuEl.querySelectorAll("button.zs-site-opt, .zs-tip-opt").forEach((b) =>
+      const disableChatBtn = menuEl.querySelector("#zs-disable-chat");
+      if (disableChatBtn) disableChatBtn.addEventListener("click", () => {
+        menuEl.hidden = true;
+        disableCurrentConversation();
+      });
+      const enableChatBtn = menuEl.querySelector("#zs-enable-chat");
+      if (enableChatBtn) enableChatBtn.addEventListener("click", () => {
+        menuEl.hidden = true;
+        enableCurrentConversation();
+      });
+      menuEl.querySelectorAll("button.zs-site-opt").forEach((b) =>
         b.addEventListener("click", () => open(b.dataset.u)));
       const ta = menuEl.querySelector("#zs-set-text");
       const saveBtn = menuEl.querySelector("#zs-set-save");
@@ -2885,7 +3238,7 @@
         ? `<a id="zs-setup-video" href="${VIDEO_URL}" target="_blank" rel="noopener">▶︎ Watch tutorial</a>`
         : "";
       setupCard.innerHTML =
-        `<div id="zs-setup-head"><span id="zs-setup-logo">ZeroScript</span><span id="zs-setup-tag">Setup</span></div>` +
+        `<div id="zs-setup-head"><span id="zs-setup-logo">ArcScript</span><span id="zs-setup-tag">Setup</span></div>` +
         `<div id="zs-setup-sub">The <b>Bridge</b> is what connects this chat to Roblox Studio. Three steps and you're running.</div>` +
         `<ol id="zs-setup-steps">` +
           `<li>Download the Bridge from GitHub</li>` +
@@ -2938,7 +3291,7 @@
     function refreshSetup(bridgeConnected) {
       if (setupSeen || bridgeConnected) { hideSetup(); return; }
       // Bridge is down, but if the user is just READING an existing
-      // conversation with no ZeroScript session (the "No agent here" state),
+      // conversation with no ArcScript session (the "No agent here" state),
       // a "bridge down" onboarding popup is pure noise - they may not want an
       // agent here at all (user request). Keep it for the states where the
       // bridge actually matters: a fresh/empty chat (the Start affordance is
@@ -2978,6 +3331,10 @@
         indicator = `<span class="zs-spin"></span>`;
         msg = `Starting the Roblox agent…`;
         label = "Starting…"; kind = "starting"; disabled = true;
+      } else if (isConversationDisabled()) {
+        toneClass = "standby";
+        msg = `<b>ZeroScript off</b> · disabled in this conversation`;
+        label = "▶ Enable ZeroScript"; kind = "enable";
       } else if (A.started) {
         // Prefer the ADVERTISED list length (A.toolList - the AGGREGATE catalogue
         // across every connected MCP server, already filtered by the vision/blocked
@@ -3066,8 +3423,18 @@
         }
         disabled = !bridgeOk && !addonOk;
       } else {
-        toneClass = "noagent";
-        msg = `No agent here. Open a new chat to start one.`;
+        // A populated chat can still host a session, but only after an explicit
+        // click. This is especially useful when the user opens ArcScript from
+        // an existing ChatGPT conversation. Bootstrap instructions are appended
+        // as a new turn; existing conversation history is left intact.
+        toneClass = bridgeOk || addonOk ? "standby" : "warn";
+        warn = !bridgeOk && !addonOk;
+        msg = bridgeOk || addonOk
+          ? "Existing chat. Start the agent here, or continue chatting normally."
+          : "Run start.bat and connect an MCP server to start the agent here.";
+        label = "▶︎ Start agent in this chat";
+        kind = "attach";
+        disabled = !bridgeOk && !addonOk;
       }
       // Parked on visibility: the loop is alive but deliberately frozen because
       // this tab is not the foreground tab of its window. Say so explicitly -
@@ -3084,24 +3451,20 @@
       // Skipped once a session is started/starting (the mode is fixed for the
       // conversation by then). Reactive: renderBar runs on every sweep, so the
       // warning appears/clears the instant the user changes the mode dropdown.
-      if (!A.started && !A.starting && P.modeWarning) {
+      if (!A.started && !A.starting && !isConversationDisabled() && P.modeWarning) {
         const modeWarn = P.modeWarning();
         if (modeWarn) {
           toneClass = "warn"; warn = true; msg = modeWarn;
-          if (kind === "start" || kind === "start-degraded") disabled = true;
+          if (kind === "start" || kind === "start-degraded" || kind === "attach") disabled = true;
         }
       }
       // Only touch the DOM when something actually changed. renderBar runs on
       // every sweep; rewriting stateEl.innerHTML each time recreated the spinner
       // <span> and RESTARTED its CSS animation, so "Starting…" appeared to stutter.
       const busy = !stopBtn.hidden;
-      // Before a session is started, the bar stays minimal: only the Start action
-      // + Discord (help). The AI selector and the tips/support menu appear once the
-      // agent is actually running - so the pre-start bar isn't cluttered with
-      // options that only matter mid-session. (A.started is ambiguous with `warn`
-      // tone - which occurs both started-with-bridge-down and standby-with-bridge-
-      // down - so it's tracked explicitly in the signature.)
-      const showExtras = !!A.started;
+      // Before a session is started, the bar stays minimal. The AI selector
+      // appears once the agent is running so the pre-start bar remains uncluttered.
+      const showExtras = !!A.started || !!A.starting;
       const sig = [toneClass, indicator, msg, label, kind, disabled, warn, busy, showExtras].join("|");
       if (sig === lastBarSig) return;
       lastBarSig = sig;
@@ -3119,10 +3482,8 @@
       // With no kind (e.g. agent active, or an existing chat) there's no primary
       // action to offer, so the button is hidden entirely.
       actionBtn.style.display = (busy || !kind) ? "none" : "";
-      // AI selector + tips/support: only once a session is live. Discord stays
-      // visible in every state (it's the help link).
+      // The AI selector is available once a session is live.
       if (switchBtn) switchBtn.style.display = showExtras ? "" : "none";
-      if (supportBtn) supportBtn.style.display = showExtras ? "" : "none";
     }
     let lastBarSig = "";
 
@@ -3134,7 +3495,7 @@
       A.bridge = s;
       if (!dot) return;
       const servers = s.servers || [];
-      // ZeroScript status tracks ONLY the primary Roblox MCP server. Every other
+      // ArcScript status tracks ONLY the primary Roblox MCP server. Every other
       // server is an addon and must NEVER make the dot/gate look connected while
       // Roblox itself is down. Old bridges don't send per-server health, so fall
       // back to the aggregate signals they do send (mcpAlive / total tools).
@@ -3220,8 +3581,8 @@
       if (root.querySelector(".zs-banner.zs-stale")) return;
       const b = document.createElement("div");
       b.className = "zs-banner limit zs-stale";
-      b.innerHTML = `<div class="zs-banner-t">⚠ Reload this page to reconnect ZeroScript</div>
-        <div class="zs-banner-m">ZeroScript was updated or reloaded while this tab was open, so this page is still running the old copy and commands can no longer run. Your bridge and Roblox Studio are fine - only this page needs refreshing.</div>
+      b.innerHTML = `<div class="zs-banner-t">⚠ Reload this page to reconnect ArcScript</div>
+        <div class="zs-banner-m">ArcScript was updated or reloaded while this tab was open, so this page is still running the old copy and commands can no longer run. Your bridge and Roblox Studio are fine - only this page needs refreshing.</div>
         <div class="zs-banner-acts"><button class="zs-banner-reload">Reload page</button></div>`;
       b.querySelector(".zs-banner-reload").addEventListener("click", () => location.reload());
       root.appendChild(b);
@@ -3242,8 +3603,8 @@
       const videoLink = VIDEO_URL
         ? `<a class="zs-banner-video" href="${VIDEO_URL}" target="_blank" rel="noopener">▶︎ Watch setup tutorial</a>`
         : "";
-      b.innerHTML = `<div class="zs-banner-t">⚠ Lost connection to ZeroScript</div>
-        <div class="zs-banner-m">The ZeroScript bridge stopped on your PC. Restart it (run start.bat and keep Roblox Studio open): the agent will reconnect automatically as soon as it is detected again.</div>
+      b.innerHTML = `<div class="zs-banner-t">⚠ Lost connection to ArcScript</div>
+        <div class="zs-banner-m">The ArcScript bridge stopped on your PC. Restart it (run start.bat and keep Roblox Studio open): the agent will reconnect automatically as soon as it is detected again.</div>
         <div class="zs-banner-acts">${videoLink}<button class="zs-banner-x">Close</button></div>`;
       b.querySelector(".zs-banner-x").addEventListener("click", () => { b.remove(); if (bridgeBannerEl === b) bridgeBannerEl = null; });
       root.appendChild(b);
@@ -3737,7 +4098,7 @@
       root.appendChild(b);
     }
 
-    // Left-hand ZeroScript popup showing the latest screen_capture. Fed from the
+    // Left-hand ArcScript popup showing the latest screen_capture. Fed from the
     // in-memory base64 (a data: URL always renders), so it works identically on
     // every provider and never touches the site's DOM. Only the most recent
     // capture is kept - a new one replaces the old.
@@ -3770,7 +4131,7 @@
     }
 
     build();
-    return { setStatus, staleExtensionAlert, setStarted, setStarting, showStop, markStopping, inputCover, toast, banner, showImages, nudgeStart, updateStartGate, refreshSetup, getCustomPrompt, getCustomMcpServers, openMenu: (toSupport) => openMenuFn && openMenuFn(toSupport) };
+    return { setStatus, staleExtensionAlert, setStarted, setStarting, showStop, markStopping, inputCover, toast, banner, showImages, nudgeStart, updateStartGate, refreshSetup, getCustomPrompt, getCustomMcpServers, openMenu: () => openMenuFn && openMenuFn() };
   })();
 
   // ── Live token + timer, shown ONLY on a tool call's chip detail. The
@@ -3815,7 +4176,7 @@
   }
 
   // Timestamp of the user's last REAL click on the site (trusted event, outside
-  // ZeroScript's own UI). A genuine "regenerate ↻" is always such a click;
+  // ArcScript's own UI). A genuine "regenerate ↻" is always such a click;
   // DeepSeek's post-stop phantom generations and stop-button re-mount flickers
   // never are - this is what tells them apart (seen live: two false regenResume
   // fired 8s/2s after a Stop with no user action, un-stopping the halted turn).
@@ -3946,7 +4307,7 @@
     // - stopLoop both halts our loop AND clicks the site's native stop - and the
     // site's native stop likewise halts our loop via onNativeStop, so either one
     // fully stops everything. Two stop buttons at once is fine.
-    // The bare isHardGenerating() term is gated on a live ZeroScript session: on
+    // The bare isHardGenerating() term is gated on a live ArcScript session: on
     // a plain chat with no session, a user's own message makes the site generate,
     // and we must NOT briefly flash our Stop button over that.
     // Self-heal a stuck "Stopping…": if we flagged stopping but nothing is
@@ -4020,12 +4381,225 @@
   //  WIRING
   // ════════════════════════════════════════════════════════════════════════
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  try {
+    chrome.storage.local.get({ autopilotEnabled: false }, (value) => {
+      A.autopilotEnabled = value.autopilotEnabled === true;
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      if (changes.autopilotEnabled) A.autopilotEnabled = changes.autopilotEnabled.newValue === true;
+      const changedSessions = changes.zsDisabledConversations;
+      if (!changedSessions) return;
+      const beforeDisabled = isConversationDisabled();
+      const oldKeys = new Set(Array.isArray(changedSessions.oldValue) ? changedSessions.oldValue : []);
+      const newKeys = new Set(Array.isArray(changedSessions.newValue) ? changedSessions.newValue : []);
+      // Apply the storage delta rather than replacing the whole local cache, so
+      // another open conversation's locally-known opt-out is not lost here.
+      for (const key of oldKeys) if (!newKeys.has(key)) disabledSessions.delete(key);
+      for (const key of newKeys) if (!oldKeys.has(key)) disabledSessions.add(key);
+      const nowDisabled = isConversationDisabled();
+      if (!beforeDisabled && nowDisabled) {
+        // A duplicate tab is running this same conversation: stop it as well.
+        disableCurrentConversation();
+      } else if (beforeDisabled && !nowDisabled) {
+        // Another tab re-enabled it. Do not auto-start; leave it ready for an
+        // explicit Start click and clear the old disabled session record.
+        const currentPath = P.conversationKey();
+        if (currentPath) recordConversation(currentPath, "failed");
+        A.started = false;
+        ui.setStarted(false);
+        ui.updateStartGate();
+      }
+    });
+  } catch {}
+  function syncExternalControl(control) {
+    if (!control || typeof control !== "object") return;
+    const queued = control.state === "queued";
+    const cliOwns = control.owner === "cli" && ["active", "stop_requested"].includes(control.state);
+    const held = queued || cliOwns;
+    const nextState = queued ? "queued" : cliOwns ? control.state : "idle";
+    if (held && !A.externalControl) {
+      A.externalControl = true;
+      A.externalControlState = nextState;
+      A.stop = true;
+      A.userStopped = true;
+      A.resumeArmed = false;
+      A.loopAbandoned = true;
+      A.loopKey = null;
+      try { P.stopGeneration(); } catch {}
+      ui.banner("warn", queued ? "CLI handoff queued" : "CLI takeover active",
+        queued
+          ? "The task is queued for the independent terminal agent. Browser tool execution is paused while the CLI claims it."
+          : "The independent terminal agent owns this task. Browser tool execution is paused until the CLI completes or returns control.");
+      ui.toast(queued ? "Handoff queued. Browser execution paused pending terminal claim." : "CLI agent has taken over. Browser execution paused.");
+    } else if (held && A.externalControl && A.externalControlState === "queued" && cliOwns) {
+      A.externalControlState = nextState;
+      ui.banner("warn", "CLI takeover active", "The independent terminal agent now owns this task. Browser tool execution is paused until the CLI completes or returns control.");
+      ui.toast("Terminal claimed the handoff. CLI agent now owns the task.");
+    } else if (!held && A.externalControl) {
+      A.externalControl = false;
+      A.externalControlState = "idle";
+      ui.toast("CLI released control. Review its results before continuing in the browser.");
+    }
+  }
+
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg && msg.type === "zs-autopilot-setting") A.autopilotEnabled = msg.enabled === true;
+    if (msg && msg.type === "zs-agent-control") {
+      syncExternalControl(msg);
+      return true;
+    }
     if (msg && msg.type === "zs-status") {
+      if (msg.agentControl) syncExternalControl(msg.agentControl);
       ui.setStatus({ connected: msg.connected, mcpAlive: msg.mcpAlive, studio: msg.studio, studioApp: msg.studioApp, studioProc: msg.studioProc, tools: msg.tools, servers: msg.servers });
     }
     if (msg && msg.type === "zs-open-menu") {
       ui.openMenu(false); // from the popup's Settings button — opens at the top (Switch AI / custom prompt)
+    }
+    if (msg && msg.type === "zs-autopilot-worker-probe") {
+      sendResponse({
+        available: A.started && !isConversationDisabled() && !A.running && !A.starting && !A.injecting && !A.workerTask && !A.userStopped && !P.isGenerating(),
+        workerId: P.id + ":" + String(P.conversationKey() || "unassigned"),
+        provider: P.id,
+        roles: ["project_manager", "implementation", "qa", "code_review", "security", "documentation", "ideas_insights", "lead"],
+      });
+      return true;
+    }
+    if (msg && msg.type === "zs-autopilot-worker-cancel") {
+      if (A.workerTask && A.workerTask.runId === msg.runId) {
+        A.stop = true;
+        A.userStopped = true;
+        A.resumeArmed = false;
+        try { P.stopGeneration(); } catch {}
+        diag("autopilot.workerCancelled", { runId: msg.runId, taskId: A.workerTask.taskId });
+      }
+      return true;
+    }
+    if (msg && msg.type === "zs-autopilot-worker-dispatch") {
+      if (!A.started || isConversationDisabled() || A.running || A.starting || A.injecting || A.workerTask || A.userStopped || P.isGenerating()) {
+        sendResponse({ ok: false, error: "Worker session is not idle and ready." });
+        return true;
+      }
+      if (!msg.task || !msg.lease || !msg.runId || !msg.taskId) {
+        sendResponse({ ok: false, error: "Worker task or lease is missing." });
+        return true;
+      }
+      A.workerTask = { runId: msg.runId, taskId: msg.taskId, task: msg.task, lease: msg.lease };
+      A.workerEvidence = [];
+      sendResponse({ ok: true, accepted: true, provider: P.id });
+      (async () => {
+        const worker = A.workerTask;
+        let leaseHeartbeat = null;
+        try {
+          const running = await bg({
+            type: "autopilot_transition_task", runId: worker.runId, taskId: worker.taskId,
+            nextState: "running", payload: { leaseToken: worker.lease.token, workerId: worker.lease.workerId },
+          });
+          if (!running.ok) throw new Error(running.error || "Could not start leased task.");
+          leaseHeartbeat = setInterval(() => {
+            bg({
+              type: "autopilot_heartbeat_task", runId: worker.runId,
+              taskId: worker.taskId, leaseToken: worker.lease.token, leaseMs: 600000,
+            }).then((heartbeat) => {
+              if (!heartbeat.ok) diag("autopilot.leaseHeartbeatFailed", { taskId: worker.taskId, error: heartbeat.error });
+            });
+          }, 45000);
+          const got = await bg({ type: "autopilot_get_run", runId: worker.runId });
+          if (!got.ok || !got.run) throw new Error("Autopilot run record is unavailable.");
+          const task = worker.task;
+          const dependencies = task.dependencies.map((id) => got.run.tasks.find((t) => t.id === id)).filter(Boolean);
+          const dependencyNotes = dependencies.map((t) =>
+            t.role + " (" + t.status + "):\nEvidence: " + (t.evidence || []).map((e) => e.summary).join("; ") +
+            "\nFindings/report: " + (t.findings || []).join("\n")
+          ).join("\n\n");
+          const prompt = [
+            "ARCSCRIPT AUTOPILOT WORKER TASK. You are an independent worker session assigned exactly one bounded task. Do not perform other roles' work.",
+            "Run ID: " + worker.runId,
+            "Task ID: " + worker.taskId,
+            "Role: " + task.role,
+            "Task: " + task.title,
+            "Original user goal: " + got.run.goal,
+            "Acceptance criteria for the overall run:\n- " + got.run.acceptanceCriteria.join("\n- "),
+            "This task's acceptance criteria:\n- " + task.acceptanceCriteria.join("\n- "),
+            "Completed dependency evidence:\n" + (dependencyNotes || "(none)"),
+            "Use available tools to inspect and make scoped changes. Verify with actual tool output. Never claim a check passed unless its output is available. Do not publish, deploy, spend money, communicate externally, delete user data, change credentials/security settings, or perform irreversible actions.",
+            "Role-specific write policy: project_manager, qa, code_review, security, and ideas_insights are read-only; do not edit files in those roles. implementation owns implementation edits. documentation may edit only documentation after its dependencies are complete. lead integrates findings and may make a final narrow fix only after the review dependencies complete.",
+            "Final response must include: Task outcome, Files changed, Verification evidence, Findings/blockers. For QA, emit exactly one structured line for EACH overall acceptance criterion: CRITERION: <criterion copied verbatim> | STATUS: VERIFIED or NOT VERIFIED | TOOL: <exact tool name observed in this worker session> | EVIDENCE: <at least 8 consecutive characters copied verbatim from that tool's successful output>. Do not mark a criterion VERIFIED unless the cited excerpt appears in the recorded output of that exact tool. Never invent a tool name or evidence excerpt. Do not emit AUTOPILOT_COMPLETE.",
+          ].join("\n\n");
+          const base = await submitAndGetBase(ZS.SYS_MARKER + "\n" + prompt);
+          await agentLoop(base);
+          const item = P.lastAssistant();
+          const report = item ? String(P.itemText(item) || "") : "";
+          const evidence = A.workerEvidence.slice();
+          const isQA = task.role === "qa";
+          const criteriaEvidence = [];
+          if (isQA) {
+            for (const line of report.split("\n")) {
+              const match = line.match(/^CRITERION:\s*(.*?)\s*\|\s*STATUS:\s*(VERIFIED|NOT VERIFIED)\s*\|\s*TOOL:\s*([^|]+)\s*\|\s*EVIDENCE:\s*(.+)$/i);
+              if (!match || match[2].toUpperCase() !== "VERIFIED") continue;
+              const criterion = match[1].trim();
+              const tool = match[3].trim();
+              const excerpt = match[4].trim();
+              const observed = evidence.find((entry) => entry.tool === tool &&
+                excerpt.length >= 8 && entry.output.toLowerCase().includes(excerpt.toLowerCase()));
+              if (got.run.acceptanceCriteria.includes(criterion) && observed) {
+                criteriaEvidence.push({ criterion, status: "VERIFIED", tool, excerpt });
+              }
+            }
+          }
+          const criteriaVerified = criteriaEvidence.map((entry) => entry.criterion);
+          const allQACriteria = !isQA || got.run.acceptanceCriteria.every((criterion) =>
+            criteriaEvidence.some((entry) => entry.criterion === criterion)
+          );
+          if (evidence.length && allQACriteria && report.trim()) {
+            await bg({
+              type: "autopilot_transition_task", runId: worker.runId, taskId: worker.taskId,
+              nextState: "completed",
+              payload: {
+                evidence: evidence.map((e) => ({
+                  summary: e.tool + ": " + e.summary,
+                  source: e.source,
+                  tool: e.tool,
+                  output: e.output,
+                })),
+                findings: report.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 30),
+                criteriaVerified,
+                criteriaEvidence,
+              },
+            });
+          } else {
+            const canRetry = Number(task.attempts) <= Number(task.maxAttempts);
+            await bg({
+              type: "autopilot_transition_task", runId: worker.runId, taskId: worker.taskId,
+              nextState: canRetry ? "ready" : "blocked",
+              payload: { reason: !evidence.length ? "Worker produced no successful tool evidence." : !allQACriteria ? "QA did not explicitly verify every acceptance criterion with evidence." : "Worker produced no final report." },
+            });
+          }
+        } catch (error) {
+          try {
+            const state = await bg({ type: "autopilot_get_run", runId: worker.runId });
+            const current = state.ok && state.run && state.run.tasks.find((t) => t.id === worker.taskId);
+            if (current && ["leased", "running"].includes(current.status)) {
+              const canRetry = Number(current.attempts) <= Number(current.maxAttempts);
+              await bg({
+                type: "autopilot_transition_task", runId: worker.runId, taskId: worker.taskId,
+                nextState: canRetry ? "ready" : "blocked",
+                payload: { reason: String(error && error.message || error) },
+              });
+            }
+          } catch {}
+          diag("autopilot.workerFailed", { taskId: worker.taskId, error: String(error && error.message || error) });
+        } finally {
+          if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+          A.workerTask = null;
+          A.workerEvidence = [];
+          try {
+            await bg({ type: "autopilot_finalize_run", runId: worker.runId });
+            await bg({ type: "autopilot_dispatch_ready", runId: worker.runId });
+          } catch {}
+        }
+      })();
+      return true;
     }
   });
 
@@ -4059,49 +4633,212 @@
   // (P.conversationKey()): once we have seen the marker for a key, we remember
   // it (persisted so it survives reloads). We never flip while busy.
   const startedSessions = new Set();
+  const sessionRecords = new Map();
   let lastSyncPath = null;
-  function rememberSession(path) {
-    // A falsy key = a TRANSIENT conversation URL (e.g. Gemini's /app before an
-    // id is assigned). Remembering it would mark every future fresh chat as
-    // "already started" and kill the Start gate. The real key is remembered by
-    // the next sync once the site assigns the conversation its id.
-    if (!path) return;
-    if (startedSessions.has(path)) return;
-    startedSessions.add(path);
-    try { chrome.storage.local.set({ zsStartedSessions: [...startedSessions].slice(-300) }); } catch {}
+
+  function disabledConversationKey(path) {
+    return path ? `${P.id}:${path}` : "";
   }
-  // Load the persisted set once, then re-sync.
-  try {
-    chrome.storage.local.get("zsStartedSessions", (r) => {
-      if (r && Array.isArray(r.zsStartedSessions)) {
-        for (const p of r.zsStartedSessions) startedSessions.add(p);
-        syncSessionState();
-      }
-    });
-  } catch {}
-  // A conversation IS a ZeroScript session if any rendered turn carries a
-  // telltale artefact: the system-prompt marker, an injected tool-result /
-  // system-note turn, or a ZeroScript command an assistant wrote. Works even
-  // after a full cold start and regardless of scroll position.
-  function domHasZsSignal() {
-    for (const it of P.allItems()) {
-      const txt = it.textContent || "";
-      if (txt.includes(ZS.SYS_MARKER)) return true;
-      if (/(^|\n)\s*Output of '[^']+':/.test(txt) || txt.includes("(System note:")) return true;
-      // Deliberately NO bare command-shape test here. An assistant turn that
-      // merely CONTAINS {"command":...} / ###LUA### is NOT proof of a session:
-      // in a plain, never-started chat the model can simply EXPLAIN the format
-      // (docs, examples, the user pasting our README) - that false positive
-      // flipped A.started on, which armed the auto-resume watchdog, EXECUTED
-      // the quoted JSON as a real command and injected its result into a chat
-      // that had no agent at all (user-reported). A command only counts as a
-      // session signal once it was actually RUN - and an executed command is
-      // always followed by our injected "Output of '...'" feedback turn, which
-      // the test above already catches. Virtualization (the marker turns
-      // scrolling out of the DOM) is covered by the persisted per-conversation
-      // key set (startedSessions / zsStartedSessions in rememberSession), not
-      // by this heuristic.
+
+  function isConversationDisabled(path = P.conversationKey()) {
+    const key = disabledConversationKey(path);
+    return !!key && disabledSessions.has(key);
+  }
+
+  function persistSessionRecords() {
+    try {
+      chrome.storage.local.set({
+        zsStartedSessions: [...startedSessions].slice(-300),
+        zsDisabledConversations: [...disabledSessions].slice(-300),
+        zsConversationSessions: [...sessionRecords.entries()].slice(-300).map(([conversationId, record]) => ({
+          conversationId, provider: P.id, state: record.state, updatedAt: record.updatedAt
+        }))
+      });
+    } catch (e) {
+      diag("session.persistenceFailed", { message: String((e && e.message) || e) });
     }
+  }
+
+  // Record identity separately from readiness. A saved ID is never proof that
+  // the bridge is online, and a "starting" record never auto-starts an agent.
+  function recordConversation(path, state) {
+    if (!path) return; // never persist a provider's transient/new-chat URL
+    sessionRecords.set(path, { state, updatedAt: Date.now() });
+    const disabledKey = disabledConversationKey(path);
+    if (state === "active") {
+      startedSessions.add(path);
+      disabledSessions.delete(disabledKey);
+    } else {
+      startedSessions.delete(path);
+      if (state === "disabled") disabledSessions.add(disabledKey);
+      else disabledSessions.delete(disabledKey);
+    }
+    persistSessionRecords();
+    decorateConversationIndicators();
+  }
+
+  function rememberSession(path) {
+    if (!path) return;
+    sessionRecords.set(path, { state: "active", updatedAt: Date.now() });
+    startedSessions.add(path);
+    disabledSessions.delete(disabledConversationKey(path));
+    persistSessionRecords();
+  }
+
+  function disableCurrentConversation() {
+    const path = P.conversationKey();
+    if (!path) {
+      ui.toast("Wait until this conversation has a stable ID before turning ZeroScript off.");
+      return false;
+    }
+    disabledSessions.add(disabledConversationKey(path));
+    recordConversation(path, "disabled");
+    A.startGen++;
+    A.starting = false;
+    A.startingKey = null;
+    A.stop = true;
+    A.userStopped = true;
+    A.resumeArmed = false;
+    if (A.running) {
+      A.loopAbandoned = true;
+      A.loopKey = null;
+    }
+    A.started = false;
+    A.stopping = false;
+    markStoppedTurn();
+    if (A.toolRunning && A.toolItem) {
+      A.toolItem.dataset.zStopped = "1";
+      rememberHalted(A.toolItem);
+      decorate.toolBox(A.toolItem, A.toolName, "err", "stopped", true, "", ZS.toolCategory(A.toolName));
+    }
+    try { P.stopGeneration(); } catch {}
+    ui.setStarted(false);
+    ui.setStarting(false);
+    ui.showStop(false);
+    ui.inputCover(false);
+    try { P.setInputLock(false); } catch {}
+    ui.updateStartGate();
+    ui.toast("ZeroScript is off in this conversation. Normal chat remains available; an already-running tool may finish.");
+    diag("conversation.disabled", { conversation: path });
+    return true;
+  }
+
+  function enableCurrentConversation() {
+    const path = P.conversationKey();
+    if (!path) {
+      ui.toast("Wait until this conversation has a stable ID before enabling ZeroScript.");
+      return false;
+    }
+    disabledSessions.delete(disabledConversationKey(path));
+    recordConversation(path, "failed");
+    A.started = false;
+    ui.setStarted(false);
+    ui.updateStartGate();
+    diag("conversation.enabled", { conversation: path });
+    if (A.running || A.starting || A.injecting || A.workerTask) {
+      A.userStopped = true;
+      A.stop = true;
+      ui.toast("ZeroScript is enabled again. Let the stopped operation finish, then click Start agent.");
+      return true;
+    }
+    A.userStopped = false;
+    A.stop = false;
+    A.stopping = false;
+    startSession(true);
+    return true;
+  }
+
+  // Restore IDs and states before re-evaluating this conversation. Old versions
+  // stored only zsStartedSessions, so keep reading that key for compatibility.
+  try {
+    chrome.storage.local.get(["zsStartedSessions", "zsDisabledConversations", "zsConversationSessions"], (r) => {
+      if (r && Array.isArray(r.zsStartedSessions)) {
+        for (const p of r.zsStartedSessions) {
+          if (typeof p === "string" && p) startedSessions.add(p);
+        }
+      }
+      if (r && Array.isArray(r.zsDisabledConversations)) {
+        for (const key of r.zsDisabledConversations) {
+          if (typeof key === "string" && key) disabledSessions.add(key);
+        }
+      }
+      if (r && Array.isArray(r.zsConversationSessions)) {
+        for (const item of r.zsConversationSessions) {
+          if (!item || typeof item.conversationId !== "string" || !item.conversationId) continue;
+          if (item.provider !== P.id) continue;
+          const state = item.state === "active" ? "active" :
+            item.state === "disabled" ? "disabled" :
+            item.state === "starting" ? "interrupted" :
+            item.state === "failed" ? "failed" : "unknown";
+          sessionRecords.set(item.conversationId, {
+            state, updatedAt: Number(item.updatedAt) || 0
+          });
+          if (state === "active") {
+            startedSessions.add(item.conversationId);
+            disabledSessions.delete(disabledConversationKey(item.conversationId));
+          } else {
+            startedSessions.delete(item.conversationId);
+            if (state === "disabled") disabledSessions.add(disabledConversationKey(item.conversationId));
+          }
+        }
+      }
+      // A browser/extension restart during bootstrap must not leave a session
+      // permanently stuck in "Starting". It remains retryable and not active.
+      const disabledPrefix = `${P.id}:`;
+      for (const key of disabledSessions) {
+        if (key.startsWith(disabledPrefix)) startedSessions.delete(key.slice(disabledPrefix.length));
+      }
+      for (const [id, record] of sessionRecords) {
+        if (record.state === "interrupted") {
+          record.state = "failed";
+          startedSessions.delete(id);
+        }
+      }
+      persistSessionRecords();
+      syncSessionState();
+      decorateConversationIndicators();
+    });
+  } catch (e) {
+    diag("session.restoreFailed", { message: String((e && e.message) || e) });
+  }
+
+  // Mark known ArcScript conversations in ChatGPT's sidebar. This is deliberately
+  // an additive, tiny text badge; it never changes the native link target or title.
+  // Keys are the same /c/<id> paths persisted by rememberSession().
+  function decorateConversationIndicators() {
+    if (P.id !== "chatgpt") return;
+    const links = document.querySelectorAll('a[href*="/c/"]');
+    for (const link of links) {
+      let path = "";
+      try {
+        const pathname = new URL(link.href, location.origin).pathname;
+        const match = pathname.match(/(?:^|\/)c\/([^/]+)/);
+        if (match) path = `/c/${match[1]}`;
+      } catch {}
+      const known = !!path && startedSessions.has(path);
+      let badge = link.querySelector(":scope > .zs-conversation-indicator");
+      if (!known) {
+        if (badge) badge.remove();
+        link.classList.remove("zs-has-conversation-indicator");
+        continue;
+      }
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "zs-conversation-indicator";
+        badge.textContent = "ArcScript";
+        badge.setAttribute("aria-label", "ArcScript-enabled conversation");
+        badge.title = "ArcScript-enabled conversation";
+        link.appendChild(badge);
+      }
+      link.classList.add("zs-has-conversation-indicator");
+    }
+  }
+  // Session identity is explicit, never inferred from arbitrary chat text.
+  // A normal GPT conversation can quote the ArcScript marker, tool output, or
+  // these instructions. Treating those strings as proof of a session caused
+  // ordinary GPT chats to inherit "Agent active" and the Start gate. The durable
+  // per-conversation registry is written only after startSession succeeds.
+  function domHasZsSignal() {
     return false;
   }
   function syncSessionState() {
@@ -4114,7 +4851,10 @@
     if (A.starting) {
       const key = P.conversationKey();
       if (A.startingKey == null) {
-        if (key && !P.chatIsEmpty()) A.startingKey = key; // pin the stable id
+        if (key && !P.chatIsEmpty()) {
+          A.startingKey = key; // pin the stable id
+          recordConversation(key, "starting");
+        }
       } else if (key !== A.startingKey && P.chatIsEmpty()) {
         A.startGen++;
         A.starting = false;
@@ -4130,29 +4870,73 @@
         ui.inputCover(false);
       }
     }
-    // Same idea for a RUNNING loop: if the user opens a NEW, empty conversation
-    // via the SITE's own new-chat (not ZeroScript's button), the loop is bound to
-    // a chat the user left, so abandon it. Otherwise A.running keeps this function
-    // early-returning below and the stale "Agent active" / Stop button lingers on
-    // the fresh chat instead of "Start Roblox agent". The "/app" → "/app/<id>" id
-    // assignment of the SAME chat is not a move (loopKey is pinned only once the
-    // chat has both an id and content), so a normal session is never disturbed.
+    // A loop belongs to ONE conversation, not to the ChatGPT tab. ChatGPT's
+    // SPA can navigate directly from one populated /c/<id> route to another, so
+    // checking only for an empty new chat lets the old loop read/execute against
+    // an ordinary GPT conversation. Abort on every confirmed conversation change.
+    // A route with no id is treated as a transition; a loop pinned to a real id
+    // must never be allowed to operate while that id is no longer current.
     if (A.running) {
       const key = P.conversationKey();
-      if (A.loopKey == null) {
-        if (key && !P.chatIsEmpty()) A.loopKey = key; // pin the loop's conversation
-      } else if (key !== A.loopKey && P.chatIsEmpty()) {
-        diag("loop.abandonedNewChat", { from: A.loopKey, to: key });
-        A.stop = true;       // the loop breaks at its next checkpoint; its finally
-        A.loopKey = null;    // resets A.running / cover / lock, then state recomputes
+      if (A.loopAbandoned) {
+        // Never re-bind an abandoned loop to whatever conversation the user
+        // navigated into. It may still be unwinding an awaited provider operation.
+      } else if (A.loopKey == null) {
+        if (key && !P.chatIsEmpty()) A.loopKey = key; // pin only after stable content
+      } else if (key !== A.loopKey && (key || P.chatIsEmpty())) {
+        diag("loop.abandonedConversationChange", {
+          from: A.loopKey, to: key || "(unassigned)", chatEmpty: P.chatIsEmpty()
+        });
+        // Abort every layer of the old turn. Setting A.stop alone is not enough:
+        // waitForResponse can still be waiting on the site's generation, and the
+        // native stream can leave the status bar looking active indefinitely.
+        A.stop = true;
+        A.userStopped = true;
+        A.resumeArmed = false;
+        A.loopAbandoned = true;
+        A.loopKey = null;
+        try { P.stopGeneration(); } catch {}
+        // Clear the stale active state immediately; the loop's finally also
+        // releases its lock/cover when its awaited operation unwinds.
+        A.started = false;
+        A.stopping = false;
+        ui.setStarted(false);
+        ui.showStop(false);
+        ui.setStarting(false);
+        ui.inputCover(false);
+        P.setInputLock(false);
       }
     }
-    if (A.starting || A.injecting || A.running) return;
+    // A bootstrap also belongs to one conversation. Abort if navigation lands
+    // on a different populated conversation, not only when the destination is
+    // empty. This prevents delayed bootstrap results from attaching to plain GPT.
+    if (A.starting && A.startingKey != null) {
+      const key = P.conversationKey();
+      if (key !== A.startingKey && (key || P.chatIsEmpty())) {
+        diag("start.abandonedConversationChange", {
+          from: A.startingKey, to: key || "(unassigned)"
+        });
+        A.startGen++;
+        A.starting = false;
+        A.startingKey = null;
+        A.started = false;
+        ui.setStarted(false);
+        ui.setStarting(false);
+        ui.inputCover(false);
+        P.setInputLock(false);
+      }
+    }
+    if (A.starting || A.injecting || A.running || A.workerTask) return;
     const path = P.conversationKey();
+    // The persistent registry is the only source of truth for session identity.
+    // Never auto-register a conversation merely because its text resembles an
+    // ArcScript prompt or tool result.
     const markerInDom = domHasZsSignal();
-    if (markerInDom) rememberSession(path);
     let has;
-    if (path && path === lastSyncPath) {
+    if (isConversationDisabled(path)) {
+      has = false;
+      lastSyncPath = path;
+    } else if (path && path === lastSyncPath) {
       // SAME, REAL conversation: never downgrade a known-started session just
       // because virtualization scrolled the marker out of the DOM. "started" is
       // sticky until the key actually changes (a different conversation).
@@ -4171,6 +4955,83 @@
       ui.setStarted(has);
     }
   }
+
+  // ChatGPT is a client-side router: route changes do not reliably emit a
+  // popstate event, and a sidebar click can replace the conversation without a
+  // full navigation. Observe the URL independently of DOM mutations so session
+  // ownership is recalculated even when React reuses the same message shell.
+  let lastObservedHref = location.href;
+  let lastObservedConversationKey = P.conversationKey();
+  function handleConversationNavigation(source) {
+    const nextHref = location.href;
+    const nextKey = P.conversationKey();
+    const previousHref = lastObservedHref;
+    const previousKey = lastObservedConversationKey;
+    const hrefChanged = nextHref !== previousHref;
+    const conversationChanged = nextKey !== previousKey;
+    if (!hrefChanged && !conversationChanged && source !== "sidebar-mutation") {
+      decorateConversationIndicators();
+      return;
+    }
+    lastObservedHref = nextHref;
+    lastObservedConversationKey = nextKey;
+    diag("navigation.urlChanged", {
+      from: previousHref, to: nextHref, fromConversation: previousKey,
+      toConversation: nextKey, source
+    });
+
+    // This route boundary is authoritative. Never let the active-state latch or
+    // a still-unwinding loop keep the old chat's state on the destination chat.
+    // Do this even if loopKey has not yet been pinned or the provider DOM has not
+    // finished replacing the old message list.
+    if (conversationChanged) {
+      const hasWork = A.running || A.starting || A.injecting || A.started ||
+        A.stopping || A.toolRunning;
+      if (hasWork) {
+        diag("session.routeBoundary", {
+          from: previousKey || "(unassigned)", to: nextKey || "(unassigned)",
+          running: A.running, starting: A.starting, injecting: A.injecting
+        });
+      }
+      if (A.running) {
+        A.stop = true;
+        A.userStopped = true;
+        A.resumeArmed = false;
+        A.loopAbandoned = true;
+        A.loopKey = null;
+        try { P.stopGeneration(); } catch {}
+      }
+      if (A.starting) {
+        A.startGen++;
+        A.starting = false;
+        A.startingKey = null;
+      }
+      A.started = false;
+      A.stopping = false;
+      A.resumeArmed = false;
+      ui.setStarted(false);
+      ui.setStarting(false);
+      ui.showStop(false);
+      ui.inputCover(false);
+      try { P.setInputLock(false); } catch {}
+      // Force the session resolver to evaluate the destination even if the
+      // message observer is temporarily still exposing the previous chat.
+      lastSyncPath = null;
+    }
+
+    syncSessionState();
+    decorateConversationIndicators();
+    scheduleSweep();
+  }
+  setInterval(() => handleConversationNavigation("url-poll"), 250);
+  window.addEventListener("popstate", () => handleConversationNavigation("popstate"));
+  // ChatGPT mounts/recycles sidebar links asynchronously. Keep labels in sync
+  // with the actual rendered sidebar instead of relying only on message sweeps.
+  try {
+    const sidebarObserver = new MutationObserver(() => decorateConversationIndicators());
+    sidebarObserver.observe(document.documentElement, { childList: true, subtree: true });
+  } catch {}
+  decorateConversationIndicators();
 
   // Schedule a debounced sweep. requestAnimationFrame is PAUSED in a background
   // tab, so when hidden we fall back to a timer (throttled, but it runs).
@@ -4240,10 +5101,19 @@
   // User-send interception: the provider wires the site's composer events to
   // these callbacks.
   P.installSendHooks({
-    isBlocked: () => A.injecting || A.running || A.starting,
-    isStarted: () => A.started,
+    isBlocked: () => A.injecting || (!isConversationDisabled() && (A.running || A.starting || !!A.workerTask)),
+    isStarted: () => A.started && !isConversationDisabled(),
     onBlockedAttempt: () => ui.nudgeStart(),
     onUserMessage: (base) => {
+      if (isConversationDisabled()) {
+        diag("userMessage.normalChatWhileConversationDisabled");
+        return;
+      }
+      // A separate CLI lease owns tool execution until it explicitly releases control.
+      if (A.externalControl) {
+        ui.toast("The independent CLI agent owns this task. Continue from the ZeroScript terminal.");
+        return;
+      }
       // A fresh user message = fresh intent: clear any previous manual stop so
       // the loop is allowed to run again.
       A.userStopped = false;
@@ -4271,6 +5141,10 @@
       diag("nativeStop");
     },
     onNativeContinue: () => {
+      if (isConversationDisabled()) {
+        diag("nativeContinue.ignoredConversationDisabled");
+        return;
+      }
       // The site's "Continue" button = a clear intent to RESUME after a stop/
       // truncation. Clear the manual-stop latch so auto-resume can pick the
       // (resumed) turn's tool call back up cleanly.
@@ -4309,7 +5183,7 @@
   // spontaneously fires a command on some later unrelated DOM churn.
   const RESUME_FRESH_MS = 180000;
   setInterval(() => {
-    if (!A.started || A.running || A.starting || A.injecting) return;
+    if (!A.started || isConversationDisabled() || A.running || A.starting || A.injecting) return;
     if (document.hidden) return;                         // AI tab not foreground → don't parse/exec off-screen (agentLoop gates too)
     if (A.userStopped) return;                          // user halted → never relaunch
     if (P.isGenerating()) return;
@@ -4386,7 +5260,7 @@
   const SYS_FALLBACK_IDLE_MS = 20000;
   setInterval(async () => {
     if (!sysResendDue()) return;
-    if (!A.started || A.running || A.starting || A.injecting) return;
+    if (!A.started || isConversationDisabled() || A.running || A.starting || A.injecting) return;
     if (document.hidden || A.userStopped) return;
     if (P.isGenerating()) return;
     // The user is composing - their draft owns the editor, leave it alone.
@@ -4406,5 +5280,5 @@
     }
   }, 5000);
 
-  log(`ZeroScript content script ready (provider: ${P.id})`);
+  log(`ArcScript content script ready (provider: ${P.id})`);
 })();

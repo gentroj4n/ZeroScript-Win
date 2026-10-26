@@ -1,9 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "ZeroScript-Win — Local Coding Agent",
-  "version": "1.6.0",
-  "description": "Turn supported AI chat sites into a local-first coding agent for Windows projects, with optional MCP and Roblox Studio integrations.",
-  "permissions": ["storage"],
+  "name": "ArcScript — Local Coding Agent",
+  "version": "1.13.1",
+  "description": "Free, local-first AI development agent for Windows workspaces, with optional MCP and Roblox Studio integrations.",
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
     "https://chat.deepseek.com/*",
     "https://deepseek.com/*",
@@ -30,7 +32,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "ZeroScript-Win",
+    "default_title": "ArcScript",
     "default_icon": {
       "16": "icon.png",
       "48": "icon.png",
@@ -39,63 +41,163 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chat.deepseek.com/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/deepseek.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/deepseek.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["providers/chatgpt-cm.js"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "providers/chatgpt-cm.js"
+      ],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/chatgpt.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/chatgpt.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://gemini.google.com/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/gemini.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/gemini.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.kimi.ai/*", "https://kimi.ai/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/kimi.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://www.kimi.ai/*",
+        "https://kimi.ai/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/kimi.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://chat.z.ai/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/glm.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://chat.z.ai/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/glm.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://arena.ai/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/arena.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://arena.ai/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/arena.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.meta.ai/*", "https://meta.ai/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/meta.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://www.meta.ai/*",
+        "https://meta.ai/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/meta.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://chat.qwen.ai/*"],
-      "js": ["providers/qwen-net.js"],
+      "matches": [
+        "https://chat.qwen.ai/*"
+      ],
+      "js": [
+        "providers/qwen-net.js"
+      ],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://chat.qwen.ai/*"],
-      "js": ["core/config.js", "core/parser.js", "providers/qwen.js", "core/main.js"],
-      "css": ["overlay.css"],
+      "matches": [
+        "https://chat.qwen.ai/*"
+      ],
+      "js": [
+        "core/config.js",
+        "core/parser.js",
+        "core/autopilot-ledger.js",
+        "core/autopilot-policy.js",
+        "providers/qwen.js",
+        "core/main.js"
+      ],
+      "css": [
+        "overlay.css"
+      ],
       "run_at": "document_idle"
     }
   ]

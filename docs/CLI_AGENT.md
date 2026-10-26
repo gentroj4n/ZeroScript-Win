@@ -1,0 +1,116 @@
+# Independent ZeroScript CLI Agent
+
+ZeroScript Code is a local-first terminal coding agent. It has a styled terminal dashboard, persistent multiline input history, Markdown responses, progress indicators, saved conversations, context compaction, task-scoped tool access, and explicit permission modes. It uses a configured model API directly and reuses the existing bridge's workspace, Git, Roblox, Blender, and other MCP tool implementations. It does not read, scrape, or reuse authentication from a browser provider session.
+
+## Requirements and setup
+
+- Windows and Python 3.9 or newer.
+- Start the ZeroScript bridge with start.bat.
+- Run zeroscript.bat; it installs the CLI's websockets, Rich, and prompt-toolkit dependencies for the selected Python interpreter if missing.
+- Configure a model API endpoint and model. The CLI supports OpenAI Chat Completions-compatible endpoints; that includes compatible hosted gateways and local servers which expose the same API shape.
+
+For a source checkout, install the command entry point from the repository root:
+
+    py -3 -m pip install -e .
+    zeroscript
+
+Alternatively, run zeroscript.bat or:
+
+    py -3 -m zeroscript_cli
+
+Environment variables:
+
+- ZS_MODEL_BASE_URL: API base URL; defaults to https://api.openai.com/v1.
+- ZS_MODEL: model name accepted by that endpoint.
+- ZS_MODEL_API_KEY: API key. OPENAI_API_KEY is also accepted. An HTTP local endpoint may not require a key.
+- ZS_BRIDGE_URL: optional override for the bridge WebSocket; defaults to ws://127.0.0.1:17613.
+- ZS_CLI_HOME: optional directory for local run transcripts and input history; defaults to .zeroscript-win under the user's home directory.
+
+Example PowerShell configuration (replace the model with one supported by your chosen endpoint):
+
+    $env:ZS_MODEL_BASE_URL = "https://api.openai.com/v1"
+    $env:ZS_MODEL = "YOUR_SUPPORTED_MODEL"
+    $env:ZS_MODEL_API_KEY = "YOUR_API_KEY"
+    zeroscript
+
+The API credential is supplied by the user and is not written into the saved session transcript. Tool results and conversation context are stored locally under the CLI session directory, so project source or command output included in those results may also be present there. Choose the model endpoint according to your project's privacy requirements.
+
+## Model profiles, vision, and context limits
+
+Profiles are stored locally in `%USERPROFILE%\\.zeroscript-win\\model-profiles.json` (or under `ZS_CLI_HOME`). They contain only the endpoint, model name, optional vision capability, and approximate context window; API keys remain in environment variables.
+
+Create and use a profile:
+
+    zeroscript profiles set local http://127.0.0.1:11434/v1 qwen3:8b false 8192
+    zeroscript profiles
+    zeroscript --profile local "Inspect the project and run its tests"
+
+The optional values after the model are `vision:true|false` and `context_tokens`. Set vision to `true` only when the configured model and endpoint accept OpenAI-compatible image input. For example, a vision profile can inspect image payloads returned by MCP tools; non-vision profiles receive a notice instead of an image interpretation claim. `--vision` enables image input for a compatible model, and `--context-tokens N` overrides a saved profile's approximate context window.
+
+When a context limit is configured, the adapter estimates the request size and removes oldest complete conversation turns as needed. It preserves system instructions and tool-call/result groups. If the fixed instructions/tool catalogue or newest turn alone exceeds the estimated budget, it fails with a specific error rather than silently sending an oversized request. Token counts are estimates, not tokenizer-exact limits.
+
+## Commands
+
+- zeroscript — start the interactive prompt.
+- zeroscript "Describe a task" — start a new independent CLI run.
+- zeroscript takeover — wait for a browser agent to queue a handoff, then claim it.
+- zeroscript resume RUN_ID — restore a saved CLI transcript after an interrupted run.
+- zeroscript status — show the active run, its owner, and workspace status.
+- zeroscript stop — request a cooperative stop at the next safe checkpoint.
+- zeroscript return-browser — explicitly yield an active CLI run back to the browser agent when no tool operation is in flight.
+- zeroscript --yes "Describe a task" — bypass CLI approval prompts. Use only when you intend to grant that broader autonomy.
+
+Inside the interactive prompt, use `/help` for the full command list. Core commands include `/status`, `/new`, `/sessions`, `/load RUN_ID`, `/resume RUN_ID`, `/continue`, `/compact`, `/model`, `/mode`, `/tools`, `/context`, `/workspace [PATH]`, `/takeover`, `/stop`, `/return-browser`, and `/quit`. Plain task prompts continue the same conversation in the current terminal; `/new` resets the active context without deleting saved sessions. Use `/load` to load a saved conversation, and `/resume` only to recover an interrupted run. Press Ctrl+C to interrupt a run; its transcript is saved for recovery.
+
+The multiline prompt accepts Enter submits the prompt; Esc then Enter inserts a newline for multiline prompts. Prompt history is stored locally in `input-history.txt`.
+
+## Terminal UI, sessions, and permissions
+
+The interactive interface uses Rich for the dashboard, tables, Markdown rendering, tool panels, and progress indicators; prompt-toolkit provides multiline editing, persistent input history, and slash-command completion. The UI falls back to standard console output if these packages are unavailable.
+
+Each run saves its transcript below `%USERPROFILE%\\.zeroscript-win\\sessions` (unless `ZS_CLI_HOME` changes it). Transcripts may include project snippets, prompts, model replies, and tool output, but the API key is not included. `/sessions` shows recent saved runs, `/load RUN_ID` restores a saved conversation into the current prompt context, and `/compact` asks the configured model to create a carry-forward summary when history grows large. The current conversation persists while the terminal stays open; start a new one with `/new`.
+
+Permission modes:
+
+- `default`: ordinary workspace edits can proceed; command/task execution and allowed consequential operations require confirmation. The hard-deny list is blocked without exception.
+- `plan`: the model only receives read-only tools, and the executor independently rejects any attempted non-read-only call.
+- `auto`: bypasses confirmation prompts for otherwise allowed operations, but cannot override the hard-deny list. Enabling auto mode does not authorize destructive filesystem operations, Git state changes, workspace switching/moves, package installation, publishing/deployment, external communications, purchases, or credential/security changes. The interactive prompt asks for confirmation before switching into this mode.
+
+The tool catalogue is scoped to the current task to reduce unrelated schemas and improve tool calling with smaller local models. `/tools QUERY` searches the full bridge catalogue; `--all-tools` deliberately exposes the whole catalogue to the model. You can also start in a mode with `--mode plan` or `--mode auto`.
+
+For a local Ollama OpenAI-compatible endpoint, a typical Windows CMD setup is:
+
+    set ZS_MODEL_BASE_URL=http://127.0.0.1:11434/v1
+    set ZS_MODEL=qwen3:8b
+    set ZS_MODEL_API_KEY=ollama
+    zeroscript.bat
+
+The local placeholder key is sent only to the loopback Ollama endpoint. It is not a paid provider credential. The model must support the OpenAI Chat Completions-compatible tool-calling payload expected by this adapter.
+
+## Browser-to-CLI handoff
+
+**The CLI and browser agent are separate runtimes.** `zeroscript takeover` waits for and claims a handoff; it does not inject a message into the browser, start a browser-agent handoff by itself, or reuse the model/login from ChatGPT or another website. The CLI needs its own configured OpenAI Chat Completions-compatible model endpoint before it can claim work.
+
+Use this sequence:
+
+1. Configure `ZS_MODEL` and the endpoint. Set `ZS_MODEL_API_KEY` for a hosted endpoint, or point `ZS_MODEL_BASE_URL` at a local OpenAI-compatible server that accepts requests without a key.
+2. Start `zeroscript` and run `/takeover` (or start `zeroscript takeover` in a second terminal). Leave it waiting.
+3. In the existing browser conversation, explicitly ask the browser agent to hand the task to the CLI using `zeroscript_handoff_to_cli`. The browser agent must actually call that tool. The bridge accepts the handoff only while a configured CLI is armed and waiting, then queues the goal, context, plan, and acceptance criteria. The CLI claims it after in-flight browser tool calls settle.
+4. Leave the terminal running until the CLI completes or you use `/stop`. Use `/return-browser` only while the CLI owns an active run and no CLI tool operation is in flight.
+
+The CLI uses an explicit arm/disarm handshake. If no configured CLI is waiting, the browser handoff tool returns an error without queueing the task or pausing the browser. If the only waiting CLI exits before claiming an already-queued handoff, the bridge cancels the orphaned queue and broadcasts the release. If the terminal reports a transient bridge disconnect, retry the command; the interactive CLI reconnects on its next bridge request.
+
+The bridge keeps a single active owner. A claim is rejected while a browser tool call is still in flight. An active CLI lease is renewed with heartbeats; if the CLI process disappears without recording a result, the bridge marks the run interrupted after the six-minute stale-lease threshold. This is longer than the CLI's bounded tool-call timeout, reducing the chance of giving control back while a long-running tool is still executing. The saved transcript can then be resumed.
+
+## Execution and approvals
+
+The CLI uses the same workspace and MCP tool implementations as the bridge; it does not implement a parallel filesystem or Roblox/Blender backend. File reads, ordinary workspace edits, source searches, and inspection tools are available to the model. The default approval policy requests confirmation before command/task execution, applying broad replacements, and non-read-only Roblox/Blender or other MCP operations.
+
+The CLI is an autonomous software agent, not an OS sandbox. Existing path protections are still in force for workspace-scoped tools, but arbitrary native processes may access more than the selected folder. Select trusted workspaces, review tool approval prompts, and keep the bridge bound to loopback. A shared hard-deny fixture is tested by both the CLI and browser Autopilot policies. Destructive filesystem operations, Git state changes (including stage/unstage/commit/push/reset), workspace switching/moves, package install/uninstall, publishing/deployment, external communication, purchases, and credential/security changes are blocked in automated dispatch, including auto mode. The --yes option only bypasses ordinary confirmation prompts; it does not override this denylist.
+
+## Current limitations
+
+- The built-in model adapter is for OpenAI Chat Completions-compatible endpoints. A separate native Anthropic Messages adapter is not included.
+- Vision input is opt-in per saved profile or via `--vision`; when enabled, supported image payloads returned by MCP tools are passed to the model. This depends on the selected endpoint/model supporting OpenAI-compatible image input.
+- The CLI uses a bounded tool loop (40 turns by default, configurable up to 100) and stores transcripts for resume. It does not claim successful verification unless a tool actually returns its result.
+- The run record and transcript are persisted locally, but browser and CLI do not yet share a single conversation transcript beyond the explicit handoff context. The bridge coordinates ownership, not hidden provider chat histories.

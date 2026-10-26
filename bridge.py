@@ -1,7 +1,7 @@
 # # SPDX-License-Identifier: GPL-3.0-or-later
 # bridge.py
 # ──────────────────────────────────────────────────────────────────────────
-#  ZeroScript-Win Bridge
+#  ArcScript-Win Bridge
 #  Local WebSocket <-> workspace tools and optional MCP integrations.
 #  The browser extension talks to this over ws://127.0.0.1:<PORT>.
 #
@@ -19,9 +19,12 @@
 #     Nothing ever hangs the agentic loop silently.
 # ──────────────────────────────────────────────────────────────────────────
 import asyncio
+import base64
 import json
 import os
+from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -32,6 +35,51 @@ try:
 except Exception:
     Workspace = None
     WorkspaceError = RuntimeError
+
+try:
+    from workspace_agent.agent_control import AgentControlStore
+except Exception:
+    AgentControlStore = None
+
+try:
+    from workspace_agent.roblox_export import export_tree as export_roblox_tree
+except Exception:
+    export_roblox_tree = None
+
+try:
+    from workspace_agent import unity_recovery
+except Exception:
+    unity_recovery = None
+
+try:
+    from workspace_agent import unity_asset_inspector
+except Exception:
+    unity_asset_inspector = None
+
+try:
+    from workspace_agent import reconstruction_tracker
+except Exception:
+    reconstruction_tracker = None
+
+try:
+    from workspace_agent import code_intelligence
+except Exception:
+    code_intelligence = None
+
+try:
+    from workspace_agent import browser_qa
+except Exception:
+    browser_qa = None
+
+try:
+    from workspace_agent import browser_server
+except Exception:
+    browser_server = None
+
+try:
+    from workspace_agent import assetripper_jobs
+except Exception:
+    assetripper_jobs = None
 
 try:
     # Sibling script (same folder as bridge.py, which Python puts on sys.path
@@ -80,7 +128,7 @@ def _enable_ansi_colors():
 HOST = "127.0.0.1"
 # Keep in sync with zeroscript-extension/manifest.json "version" - printed at
 # startup so a user's terminal output alone tells us which build they're on.
-BRIDGE_VERSION = "1.6.0"
+BRIDGE_VERSION = "1.11.0"
 PORT = int(os.environ.get("ZS_BRIDGE_PORT", "17613"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -479,9 +527,9 @@ def _reclaim_bridge_port():
     cmdline = _process_cmdline(pid_i)
     if "bridge.py" not in cmdline.lower():
         log(f"port {PORT} is held by pid {pid_i} ('{name}') but it does not look "
-            f"like a ZeroScript bridge - leaving it alone.", "yl")
+            f"like an ArcScript bridge - leaving it alone.", "yl")
         return False
-    log(f"port {PORT} is held by a leftover ZeroScript bridge (pid {pid_i}) from a "
+    log(f"port {PORT} is held by a leftover ArcScript bridge (pid {pid_i}) from a "
         "previous session - killing it so this one can start.", "yl")
     try:
         subprocess.run(["taskkill", "/F", "/PID", str(pid_i)],
@@ -858,7 +906,7 @@ class MCPClient:
                 self._request("initialize", {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "zeroscript-bridge", "version": "1.0"},
+                    "clientInfo": {"name": "arcscript-bridge", "version": "1.0"},
                 }, timeout=30)
                 self._notify("notifications/initialized")
                 # Some MCP servers (notably Roblox's StudioMCP) advertise 0 tools at
@@ -1067,10 +1115,32 @@ class MCPManager:
         self.clients = {}          # server_id -> MCPClient
         self.index = {}            # advertised_name -> (holder, real_name)
         self.index_lock = threading.Lock()
-        # The workspace root is explicit and configurable through the
-        # ZS_WORKSPACE_ROOT environment variable. Default to the repository
-        # folder so the coding tools work without requiring Roblox Studio.
-        self.workspace_root = os.environ.get("ZS_WORKSPACE_ROOT", HERE)
+        # An explicit environment override wins; otherwise restore the last
+        # user-selected workspace from a private local settings file. Falling
+        # back to the bridge directory keeps old installs usable, but is NOT
+        # treated as an intentional project selection.
+        self.workspace_settings_path = os.path.join(HERE, ".zs-workspace.json")
+        env_root = os.environ.get("ZS_WORKSPACE_ROOT", "").strip()
+        settings = {}
+        try:
+            with open(self.workspace_settings_path, "r", encoding="utf-8") as fp:
+                loaded_settings = json.load(fp)
+            if isinstance(loaded_settings, dict):
+                settings = loaded_settings
+        except (OSError, ValueError, TypeError):
+            settings = {}
+        saved_root = str(settings.get("root", "")).strip()
+        recent_roots = settings.get("recent_roots", [])
+        self.workspace_history = []
+        if isinstance(recent_roots, list):
+            for entry in recent_roots:
+                if isinstance(entry, str) and entry.strip() and entry.strip() not in self.workspace_history:
+                    self.workspace_history.append(entry.strip())
+        self.workspace_root = env_root or saved_root or HERE
+        self.workspace_configured = bool(env_root or saved_root)
+        self.workspace_source = "environment" if env_root else ("saved" if saved_root else "default")
+        if self.workspace_configured and self.workspace_root not in self.workspace_history:
+            self.workspace_history.insert(0, self.workspace_root)
         self.workspace = None
         self.workspace_error = None
         self._load_workspace()
@@ -1078,54 +1148,427 @@ class MCPManager:
     def _load_workspace(self):
         if Workspace is None:
             self.workspace_error = "Workspace tools could not be imported."
+            self.workspace_configured = False
+            self.workspace_source = "unavailable"
             return
         try:
             self.workspace = Workspace(self.workspace_root)
             log(f"workspace selected: {self.workspace.root}", "cy")
         except Exception as exc:
             self.workspace_error = str(exc)
+            self.workspace_configured = False
+            self.workspace_source = "invalid"
             log(f"workspace unavailable: {exc}", "yl")
 
     def _workspace_tools(self):
-        if self.workspace is None:
-            return []
-        return [
-            {"name": "workspace_info", "description": "Get the selected project root and name.",
+        tools = [
+            {"name": "workspace_info", "description": f"Current workspace path: {self.workspace_root}; configured: {str(self.workspace_configured).lower()}. If configured is false, ask the user for a project folder before inspecting or editing anything.",
              "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_recent_roots", "description": "List the most recently selected project folders saved locally, including whether each still exists and which one is active. Use this before offering a recent-project switch.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_open_recent", "description": "Activate a folder only if it is present in workspace_recent_roots. This switches the active local project and persists the choice; ask the user to confirm which project they want before calling.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_set_root", "description": "Set and persist the user's explicitly provided local project folder. Use only a path the user supplied or confirmed.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_browse", "description": "Open a native folder picker and return the selected_path without changing the active workspace. After the user chooses the folder, call workspace_set_root with that exact selected_path to activate it.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_project_info", "description": "Inspect common project manifests, framework/language hints, Git presence, source-file counts, and package scripts.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_create_file", "description": "Create a new UTF-8 file inside the workspace without overwriting an existing file. Parent directory must exist.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string", "default": ""}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_create_directory", "description": "Create a new directory within the workspace. Existing paths are never overwritten; use a workspace-relative path.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_move_path", "description": "Rename or move a file/directory within the selected workspace. Destination must not exist; symbolic links and moving the workspace root are refused.",
+             "inputSchema": {"type": "object", "properties": {"source": {"type": "string"}, "destination": {"type": "string"}}, "required": ["source", "destination"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_delete_file", "description": "Delete one regular file inside the selected workspace. Directories and symbolic links are refused; only use when the user explicitly requests deletion.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_find_files", "description": "Find project files by glob pattern (for example **/*.luau, *.json, or src/*.ts). Generated directories are skipped.",
+             "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500}, "include_hidden": {"type": "boolean"}}, "required": ["pattern"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_symbols", "description": "Find likely function, class, type, and variable declarations across source files. Optional query filters symbol names or declaration text.",
+             "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "default": ""}, "path": {"type": "string", "default": "."}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_tree", "description": "Return a bounded directory tree with file sizes, skipping generated folders and symbolic links.", 
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "default": "."}, "max_depth": {"type": "integer", "minimum": 0, "maximum": 12, "default": 4}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 300}, "include_hidden": {"type": "boolean", "default": False}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_file_outline", "description": "Show imports, headings, variables, and likely declarations with line numbers for one source file.", 
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 300}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_list_files", "description": "List source files in the selected project. Generated directories are skipped.",
              "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "default": "."}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500}, "include_hidden": {"type": "boolean"}}, "additionalProperties": False}, "server": "workspace"},
-            {"name": "workspace_read_file", "description": "Read a UTF-8 text file inside the selected project (maximum 1 MB).",
+            {"name": "workspace_read_file", "description": "Read a UTF-8 text file inside the selected project (maximum 1 MB). Optional 1-based start_line/end_line bounds the read.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_preview_image", "description": "Preview an image inside the selected workspace using a workspace-relative path (forward or backslashes) or an absolute path that remains inside the workspace. Returns image content for the ArcScript preview panel and vision-capable providers. Supports PNG, JPEG, WebP, GIF, and safe SVG up to 8 MB. The active provider must support vision to analyze pixels; a preview-only result is not visual QA.",
              "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
-            {"name": "workspace_search", "description": "Search source text case-insensitively inside the selected project.",
-             "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string", "default": "."}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": ["query"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_search", "description": "Search source text inside the selected project. Supports optional case-sensitive matching and regular expressions; results include line and column.",
+             "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string", "default": "."}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500}, "case_sensitive": {"type": "boolean", "default": False}, "regex": {"type": "boolean", "default": False}}, "required": ["query"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_replace_in_files", "description": "Preview or apply literal/regex replacements across project files. First call with apply=false to inspect affected files/diffs; only apply after user confirmation by passing the returned preview_hash as expected_hash. Stale previews are rejected.",
+             "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "minLength": 1}, "replacement": {"type": "string"}, "path": {"type": "string", "default": "."}, "max_files": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}, "case_sensitive": {"type": "boolean", "default": False}, "regex": {"type": "boolean", "default": False}, "apply": {"type": "boolean", "default": False}, "expected_hash": {"type": "string", "default": ""}}, "required": ["query", "replacement"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_multi_edit", "description": "Apply a batch of exact-match replacements across existing files. All edits are validated before writing any file; ambiguous matches are rejected. Returns a per-file unified diff. Prefer this for coordinated multi-file code changes.",
+             "inputSchema": {"type": "object", "properties": {"edits": {"type": "array", "minItems": 1, "maxItems": 200, "items": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean", "default": False}, "whole_file": {"type": "boolean", "default": False}}, "required": ["path", "old_string", "new_string"], "additionalProperties": False}}}, "required": ["edits"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_apply_patch", "description": "Apply an exact old_string to new_string edit to an existing UTF-8 file. Ambiguous matches are rejected unless replace_all is true. Prefer this to replacing whole files for targeted edits.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean", "default": False}}, "required": ["path", "old_string", "new_string"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_write_files", "description": "Import many UTF-8 text files into the selected workspace in one call. Use this to transfer source captured from Roblox Studio MCP into local project files. Paths must be workspace-relative. Existing files are protected unless overwrite=true. Validates the entire batch before writing; returns per-file byte counts. Maximum 200 files and 10 MB total.",
+             "inputSchema": {"type": "object", "properties": {"files": {"type": "array", "minItems": 1, "maxItems": 200, "items": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}, "overwrite": {"type": "boolean", "default": False}}, "required": ["files"], "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_write_file", "description": "Create or replace a UTF-8 text file inside the selected project. Returns a unified diff. This modifies files.",
              "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_git_changed_files", "description": "List changed files with staged, unstaged, untracked, added, deleted, or renamed state. Use for source-control browsing; it does not mutate Git.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_git_stage_file", "description": "Stage one file path inside the selected workspace using Git. Does not stage an entire directory. Only call after the user explicitly asks to stage that file.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_git_unstage_file", "description": "Remove one file path from the Git index without changing its working-tree contents. Only call after the user explicitly asks to unstage that file.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_git_commit", "description": "Create a local commit from already-staged changes; this does not push. Only call when the user explicitly requests a commit and provides or confirms the commit message.",
+             "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 500}}, "required": ["message"], "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_git_status", "description": "Get Git working-tree status for the selected project.",
              "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_git_diff", "description": "Read staged or unstaged Git changes, optionally limited to a workspace-relative path.",
+             "inputSchema": {"type": "object", "properties": {"staged": {"type": "boolean", "default": False}, "path": {"type": "string", "default": "."}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_git_branches", "description": "List local and remote Git branches without changing repository state.", 
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_git_log", "description": "Read recent Git commit summaries without modifying the repository.",
+             "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_run_task", "description": "Run a whitelisted built-in task for detected Python/Rust/Go/.NET/Maven/Gradle/CMake projects, or a root package.json script addressed as package:<script-name>. Package scripts are executable project code and may modify files or access networks; only run relevant tasks requested by the user.",
+             "inputSchema": {"type": "object", "properties": {"task": {"type": "string", "minLength": 1}, "timeout": {"type": "integer", "minimum": 1, "maximum": 300, "default": 300}}, "required": ["task"], "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_run_command", "description": "Run a command as an argument array from the selected project directory. Shell expansion is disabled. Use only commands required for the requested development task.",
              "inputSchema": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100}, "timeout": {"type": "integer", "minimum": 1, "maximum": 300}}, "required": ["command"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "scan_unity_installation", "description": "Inspect an installed Unity player without modifying it. Reports Unity version when detectable, Mono vs IL2CPP evidence, managed assemblies, large asset files, and whether a full editable project exists. Defaults to the selected workspace; pass install_path only when the installation is elsewhere.",
+             "inputSchema": {"type": "object", "properties": {"install_path": {"type": "string", "default": ""}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "catalog_unity_assets", "description": "Create or resume a deterministic, file-level Unity asset catalog. Writes only under the selected workspace; never extracts or modifies original assets. Re-call until status=complete. Serialized Unity object dependencies are not parsed.",
+             "inputSchema": {"type": "object", "properties": {"install_path": {"type": "string", "default": ""}, "output_path": {"type": "string", "default": "recovery/asset-catalog.json"}, "batch_size": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 500}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "update_reconstruction_feature", "description": "Create/update an evidence-linked browser restoration feature record. Records decompiled source locators, asset files, implementation files, tests, status, and notes in recovery/reconstruction/features.json. Paths must exist inside the workspace; this records evidence but does not claim tests passed.",
+             "inputSchema": {"type": "object", "properties": {"feature_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"}, "name": {"type": "string", "minLength": 1, "maxLength": 200}, "status": {"type": "string", "enum": ["planned", "investigating", "implemented", "blocked"], "default": "planned"}, "notes": {"type": "string", "maxLength": 4000, "default": ""}, "source_evidence": {"type": "array", "items": {"type": "object", "properties": {"path": {"type": "string"}, "locator": {"type": "string"}}, "required": ["path", "locator"], "additionalProperties": False}}, "asset_evidence": {"type": "array", "items": {"type": "string"}}, "implementation_files": {"type": "array", "items": {"type": "string"}}, "test_files": {"type": "array", "items": {"type": "string"}}}, "required": ["feature_id", "name"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "report_reconstruction_readiness", "description": "Report missing source, asset, implementation, and regression-test evidence for browser restoration features. Can inspect one feature_id or the entire inventory. Readiness is not a test pass or proof of gameplay parity.",
+             "inputSchema": {"type": "object", "properties": {"feature_id": {"type": "string", "default": ""}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "inspect_unity_serialized_file", "description": "Inspect UnityPy object types, path IDs, and object names in one selected serialized asset/bundle file. Refuses files above a bounded size (default 256 MiB) to protect memory; do not point it at a 1.64 GB resources.assets file. Requires UnityPy installed in the bridge Python environment and never modifies source assets.",
+             "inputSchema": {"type": "object", "properties": {"install_path": {"type": "string"}, "asset_path": {"type": "string", "description": "Path relative to the Unity installation, such as YandereSimulator_Data/sharedassets0.assets."}, "max_file_mb": {"type": "integer", "minimum": 1, "maximum": 512, "default": 256}, "max_objects": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 1000}}, "required": ["install_path", "asset_path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "inspect_recovery_tooling", "description": "Check PATH availability of ILSpy CLI, AssetRipper, Unity Editor, .NET, Node/npm, Git, and 7-Zip, plus browser-port markers. Does not install software.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "decompile_unity_type", "description": "Decompile a named managed type from the installed Mono assembly using ilspycmd. Bounded timeout, no shell, original DLL is read-only. Requires ILSpy CLI to be installed.",
+             "inputSchema": {"type": "object", "properties": {"install_path": {"type": "string"}, "type_name": {"type": "string", "minLength": 1}, "assembly_path": {"type": "string", "default": ""}, "timeout": {"type": "integer", "minimum": 1, "maximum": 180, "default": 90}}, "required": ["install_path", "type_name"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "export_unity_assembly", "description": "Export one managed assembly to C# source using ilspycmd. Refuses to overwrite a non-empty output directory; output must remain within the selected workspace. Requires ILSpy CLI.",
+             "inputSchema": {"type": "object", "properties": {"install_path": {"type": "string"}, "assembly_path": {"type": "string", "default": ""}, "output_path": {"type": "string", "default": "recovery/decompiled"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 180, "default": 180}}, "required": ["install_path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "list_unity_symbols", "description": "List Unity managed assembly types, methods, fields, or namespaces using ILSpy metadata listing. Supports a substring filter and bounded results; does not modify the assembly.",
+             "inputSchema": {"type": "object", "properties": {"install_path": {"type": "string", "default": ""}, "symbol_kind": {"type": "string", "enum": ["types", "classes", "methods", "fields", "namespaces"], "default": "types"}, "assembly_path": {"type": "string", "default": ""}, "query": {"type": "string", "default": ""}, "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}, "timeout": {"type": "integer", "minimum": 1, "maximum": 180, "default": 90}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "search_unity_source", "description": "Search exported C# source for a symbol, method, field, or string. Returns file/line/context matches. Run export_unity_assembly first; this is source search, not an IL-level call graph.",
+             "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "minLength": 1}, "source_path": {"type": "string", "default": "recovery/decompiled"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}, "case_sensitive": {"type": "boolean", "default": False}, "regex": {"type": "boolean", "default": False}, "context_lines": {"type": "integer", "minimum": 0, "maximum": 5, "default": 2}}, "required": ["query"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "inspect_browser_port", "description": "Audit browser-port/index.html and local script/style references without launching a browser. Reports missing local files and package scripts. Output is diagnostic only.",
+             "inputSchema": {"type": "object", "properties": {"port_path": {"type": "string", "default": "browser-port"}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "run_browser_qa", "description": "Smoke-test a running browser restoration over HTTP; optionally run up to 40 selector-based Playwright steps (click, fill, press, visibility/text assertions, waits, screenshots). Interactive scenarios are restricted to localhost/127.0.0.1. Requires Python Playwright plus Chromium for browser scenarios; does not install dependencies.",
+             "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "port_path": {"type": "string", "default": "browser-port"}, "screenshot_path": {"type": "string", "default": "recovery/browser-qa.png"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60, "default": 20}, "scenarios": {"type": "array", "maxItems": 40, "items": {"type": "object", "properties": {"action": {"type": "string", "enum": ["click", "fill", "press", "expect_visible", "expect_text", "wait_ms", "screenshot"]}, "selector": {"type": "string"}, "value": {"type": ["string", "integer"]}, "key": {"type": "string"}, "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 10000}, "label": {"type": "string"}}, "required": ["action"], "additionalProperties": False}}}, "required": ["url"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "start_browser_server", "description": "Start a static HTTP server for browser-port/index.html bound only to 127.0.0.1. Returns a job ID, PID, URL, and log path. Does not install packages or expose the server to the LAN.",
+             "inputSchema": {"type": "object", "properties": {"port_path": {"type": "string", "default": "browser-port"}, "port": {"type": "integer", "minimum": 1024, "maximum": 65535, "default": 4173}}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "browser_server_status", "description": "Read the recorded browser-server job state and report whether the process is running.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "stop_browser_server", "description": "Stop only a browser server process spawned and tracked by this bridge instance. It will not kill an unverified PID left over from another bridge session.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "start_assetripper_export", "description": "Start an asynchronous AssetRipper CLI-compatible export. Requires an explicit executable path and input directory. Writes only to a workspace-relative output directory, refuses non-empty output, supports Unity/Primary modes, and returns a job ID plus log path. It does not install AssetRipper.",
+             "inputSchema": {"type": "object", "properties": {"executable_path": {"type": "string"}, "input_path": {"type": "string"}, "output_path": {"type": "string", "default": "recovery/assetripper-export"}, "mode": {"type": "string", "enum": ["Unity", "Primary"], "default": "Primary"}, "script_content_level": {"type": "string", "enum": ["Level0", "Level1", "Level2"], "default": "Level1"}, "timeout_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 240}}, "required": ["executable_path", "input_path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "assetripper_job_status", "description": "Poll an AssetRipper export job by its returned job ID. Persists state and reports success, failure, interruption, or whether the process is still running.",
+             "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "cancel_assetripper_job", "description": "Cancel an AssetRipper job only if this bridge instance spawned and still tracks the process. It will not kill an unverified PID after a bridge restart.",
+             "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"], "additionalProperties": False}, "server": "workspace"},
         ]
+        tools.append({
+            "name": "roblox_export_tree",
+            "description": "Export all Script, LocalScript, and ModuleScript source from the connected Roblox Studio place into the selected local workspace. Traverses the full DataModel, preserves hierarchy as directories, keeps server/client/module suffixes, and writes locally in bounded batches without sending script contents through the agent conversation. Requires a configured workspace and Roblox Studio MCP connection. Existing files are protected unless overwrite=true.",
+            "inputSchema": {"type": "object", "properties": {
+                "root_path": {"type": "string", "default": "RobloxExport", "description": "Workspace-relative directory to create the export under."},
+                "overwrite": {"type": "boolean", "default": False, "description": "Explicitly replace matching existing files."},
+                "exclude": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 100, "default": [], "description": "Case-insensitive substrings matched against slash-separated instance hierarchy paths; matching scripts are skipped before source is read."},
+                "max_script_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 1048576, "description": "Skip and report scripts larger than this UTF-8 byte limit; oversized scripts do not abort the export."}
+            }, "additionalProperties": False},
+            "server": "roblox-export"
+        })
+        tools.extend([
+            {
+                "name": "zeroscript_handoff_to_cli",
+                "description": "Transfer this task to the independent ZeroScript CLI agent. Include the original goal, relevant context, completed work, outstanding steps, a plan, and acceptance criteria where known. After a successful handoff, stop further implementation/tool calls in the browser agent. The CLI must claim the handoff before ownership changes.",
+                "inputSchema": {"type": "object", "properties": {
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 12000},
+                    "context": {"type": "string", "maxLength": 40000, "default": ""},
+                    "plan": {"type": "array", "maxItems": 80, "items": {"type": "string", "maxLength": 2000}, "default": []},
+                    "acceptance_criteria": {"type": "array", "maxItems": 80, "items": {"type": "string", "maxLength": 2000}, "default": []}
+                }, "required": ["goal"], "additionalProperties": False},
+                "server": "zeroscript-control"
+            },
+            {
+                "name": "zeroscript_agent_control_status",
+                "description": "Read shared browser/CLI agent-control state. This is the only tool available to the browser agent while the CLI owns an active run.",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "server": "zeroscript-control"
+            }
+        ])
+        return tools
+
+    def _set_workspace(self, path, source="selected", persist=True):
+        if Workspace is None:
+            raise RuntimeError("Workspace tools could not be imported.")
+        if not isinstance(path, str) or not path.strip():
+            raise RuntimeError("A local folder path is required.")
+        if not Path(path).expanduser().is_absolute():
+            raise RuntimeError("Use an absolute folder path, or open workspace_browse to choose a folder.")
+        candidate = Workspace(path)
+        selected_root = str(candidate.root)
+        history = [selected_root]
+        for prior in getattr(self, "workspace_history", []):
+            if not isinstance(prior, str) or not prior.strip():
+                continue
+            try:
+                normalized_prior = str(Path(prior).expanduser().resolve())
+            except OSError:
+                continue
+            if normalized_prior != selected_root and normalized_prior not in history:
+                history.append(normalized_prior)
+            if len(history) >= 10:
+                break
+        self.workspace_history = history
+        if persist:
+            try:
+                temp_path = self.workspace_settings_path + ".tmp"
+                with open(temp_path, "w", encoding="utf-8") as fp:
+                    json.dump({"root": selected_root, "recent_roots": history}, fp, ensure_ascii=False, indent=2)
+                os.replace(temp_path, self.workspace_settings_path)
+            except OSError as exc:
+                raise RuntimeError(f"The folder is valid, but workspace settings could not be saved: {exc}") from exc
+        self.workspace = candidate
+        self.workspace_root = selected_root
+        self.workspace_configured = True
+        self.workspace_source = source
+        self.workspace_error = None
+        log(f"workspace selected: {self.workspace_root}", "cy")
+        return self._workspace_description()
+
+    def _workspace_description(self):
+        if self.workspace is None:
+            return {"root": self.workspace_root, "name": os.path.basename(self.workspace_root), "exists": False,
+                    "configured": self.workspace_configured, "source": self.workspace_source, "error": self.workspace_error}
+        data = self.workspace.describe()
+        data.update({"configured": self.workspace_configured, "source": self.workspace_source})
+        return data
+
+    def _browse_workspace(self):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except Exception as exc:
+            raise RuntimeError("The native folder picker is unavailable in this Python install. Use workspace_set_root with the full folder path instead.") from exc
+        root = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+            chosen = filedialog.askdirectory(parent=root, title="Choose an ArcScript coding workspace",
+                                            initialdir=self.workspace_root if os.path.isdir(self.workspace_root) else HERE,
+                                            mustexist=True)
+        except Exception as exc:
+            raise RuntimeError(f"Could not open the native folder picker: {exc}. Use workspace_set_root with the full folder path.") from exc
+        finally:
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+        if not chosen:
+            return {"cancelled": True, "message": "Folder selection cancelled; the active workspace was not changed.", **self._workspace_description()}
+        selected = Path(chosen).expanduser().resolve()
+        if not selected.is_dir():
+            raise RuntimeError("The selected workspace path is no longer an existing directory.")
+        return {"chosen": True, "selected_path": str(selected),
+                "message": "Folder selected but not yet activated. Call workspace_set_root with this exact selected_path to make it active."}
 
     def _call_workspace(self, name, arguments):
-        if self.workspace is None:
-            raise RuntimeError(self.workspace_error or "Workspace is unavailable.")
         args = arguments or {}
         if name == "workspace_info":
-            return self.workspace.describe()
+            return self._workspace_description()
+        if name == "workspace_recent_roots":
+            history = list(getattr(self, "workspace_history", []))
+            if self.workspace_configured and self.workspace_root not in history:
+                history.insert(0, self.workspace_root)
+            roots = []
+            seen = set()
+            for item in history:
+                try:
+                    resolved = str(Path(item).expanduser().resolve())
+                except (OSError, RuntimeError):
+                    resolved = item
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                candidate = Path(resolved)
+                roots.append({
+                    "path": resolved,
+                    "name": candidate.name or resolved,
+                    "exists": candidate.is_dir(),
+                    "current": bool(self.workspace_configured and resolved == str(Path(self.workspace_root).expanduser().resolve())),
+                })
+            return {"recent_roots": roots[:10]}
+        if name == "workspace_set_root":
+            return self._set_workspace(args.get("path", ""))
+        if name == "workspace_browse":
+            return self._browse_workspace()
+        if name == "workspace_open_recent":
+            requested = args.get("path", "")
+            if not isinstance(requested, str) or not requested.strip():
+                raise RuntimeError("A recent workspace path is required.")
+            try:
+                normalized = str(Path(requested).expanduser().resolve())
+                history_paths = {
+                    str(Path(item).expanduser().resolve())
+                    for item in getattr(self, "workspace_history", [])
+                    if isinstance(item, str) and item.strip()
+                }
+                if self.workspace_configured and self.workspace_root:
+                    history_paths.add(str(Path(self.workspace_root).expanduser().resolve()))
+            except (OSError, RuntimeError) as exc:
+                raise RuntimeError("The requested recent workspace path is invalid.") from exc
+            if normalized not in history_paths:
+                raise RuntimeError("That path is not in the saved recent-workspace list. Ask the user to choose a folder or use workspace_set_root with their explicit path.")
+            return self._set_workspace(normalized, source="recent")
+        if not self.workspace_configured:
+            raise RuntimeError("No project workspace has been selected. Ask the user to choose an absolute folder path or call workspace_browse; do not inspect the default bridge directory.")
+        if self.workspace is None:
+            raise RuntimeError(self.workspace_error or "Workspace is unavailable. Select a folder with workspace_set_root or workspace_browse.")
+        if name == "workspace_create_file":
+            return self.workspace.create_file(args["path"], args.get("content", ""))
+        if name == "workspace_create_directory":
+            return self.workspace.create_directory(args["path"])
+        if name == "workspace_move_path":
+            return self.workspace.move_path(args["source"], args["destination"])
+        if name == "workspace_delete_file":
+            return self.workspace.delete_file(args["path"])
+        if name == "workspace_project_info":
+            return self.workspace.project_info()
+        if name == "workspace_find_files":
+            return self.workspace.find_files(args.get("pattern", "*"), args.get("path", "."), args.get("max_results", 200), args.get("include_hidden", False))
+        if name == "workspace_symbols":
+            return self.workspace.symbols(args.get("query", ""), args.get("path", "."), args.get("max_results", 200))
+        if name == "workspace_tree":
+            return self.workspace.tree(args.get("path", "."), args.get("max_depth", 4), args.get("max_results", 300), args.get("include_hidden", False))
+        if name == "workspace_file_outline":
+            return self.workspace.file_outline(args["path"], args.get("max_results", 300))
         if name == "workspace_list_files":
             return self.workspace.list_files(args.get("path", "."), args.get("max_results", 200), args.get("include_hidden", False))
         if name == "workspace_read_file":
-            return self.workspace.read_file(args["path"])
+            result = self.workspace.read_file(args["path"])
+            if "start_line" in args or "end_line" in args:
+                lines = result["content"].splitlines(keepends=True)
+                start_line = max(1, int(args.get("start_line", 1)))
+                end_line = max(start_line, int(args.get("end_line", len(lines) or 1)))
+                result["content"] = "".join(lines[start_line - 1:end_line])
+                result["start_line"] = start_line
+                result["end_line"] = min(end_line, len(lines))
+                result["total_lines"] = len(lines)
+            return result
         if name == "workspace_search":
-            return self.workspace.search(args["query"], args.get("path", "."), args.get("max_results", 100))
+            return self.workspace.search(args["query"], args.get("path", "."), args.get("max_results", 100),
+                                         args.get("case_sensitive", False), args.get("regex", False))
+        if name == "workspace_replace_in_files":
+            return self.workspace.replace_in_files(
+                args["query"], args["replacement"], args.get("path", "."),
+                args.get("max_files", 100), args.get("case_sensitive", False),
+                args.get("regex", False), args.get("apply", False), args.get("expected_hash", ""),
+            )
+        if name == "workspace_multi_edit":
+            return self.workspace.multi_edit(args["edits"])
+        if name == "workspace_apply_patch":
+            return self.workspace.apply_patch(args["path"], args["old_string"], args["new_string"], args.get("replace_all", False))
+        if name == "workspace_write_files":
+            return self.workspace.write_files(args["files"], args.get("overwrite", False))
         if name == "workspace_write_file":
             return self.workspace.write_file(args["path"], args["content"])
+        if name == "workspace_git_changed_files":
+            return self.workspace.git_changed_files()
+        if name == "workspace_git_stage_file":
+            return self.workspace.git_stage_file(args["path"])
+        if name == "workspace_git_unstage_file":
+            return self.workspace.git_unstage_file(args["path"])
+        if name == "workspace_git_commit":
+            return self.workspace.git_commit(args["message"])
         if name == "workspace_git_status":
             return self.workspace.git_status()
+        if name == "workspace_git_diff":
+            return self.workspace.git_diff(args.get("staged", False), args.get("path", "."))
+        if name == "workspace_git_branches":
+            return self.workspace.git_branches()
+        if name == "workspace_git_log":
+            return self.workspace.git_log(args.get("limit", 10))
+        if name == "workspace_run_task":
+            return self.workspace.run_task(args["task"], args.get("timeout", 300))
         if name == "workspace_run_command":
             return self.workspace.run_command(args["command"], args.get("timeout", 60))
+        if name in {"start_assetripper_export", "assetripper_job_status", "cancel_assetripper_job"}:
+            if assetripper_jobs is None:
+                raise RuntimeError("AssetRipper job helpers could not be imported.")
+            if name == "start_assetripper_export":
+                return assetripper_jobs.start_assetripper_export(
+                    self.workspace_root, args["executable_path"], args["input_path"],
+                    args.get("output_path", "recovery/assetripper-export"),
+                    args.get("mode", "Primary"), args.get("script_content_level", "Level1"),
+                    args.get("timeout_minutes", 240),
+                )
+            if name == "assetripper_job_status":
+                return assetripper_jobs.assetripper_job_status(self.workspace_root, args["job_id"])
+            return assetripper_jobs.cancel_assetripper_job(self.workspace_root, args["job_id"])
+        if name in {"start_browser_server", "browser_server_status", "stop_browser_server"}:
+            if browser_server is None:
+                raise RuntimeError("Browser server helpers could not be imported.")
+            if name == "start_browser_server":
+                return browser_server.start_browser_server(self.workspace_root, args.get("port_path", "browser-port"), args.get("port", 4173))
+            if name == "browser_server_status":
+                return browser_server.browser_server_status(self.workspace_root)
+            return browser_server.stop_browser_server(self.workspace_root)
+        if name == "inspect_browser_port":
+            if browser_qa is None:
+                raise RuntimeError("Browser QA helpers could not be imported.")
+            return browser_qa.inspect_browser_port(self.workspace_root, args.get("port_path", "browser-port"))
+        if name == "run_browser_qa":
+            if browser_qa is None:
+                raise RuntimeError("Browser QA helpers could not be imported.")
+            return browser_qa.run_browser_qa(self.workspace_root, args["url"], args.get("port_path", "browser-port"), args.get("screenshot_path", "recovery/browser-qa.png"), args.get("timeout_seconds", 20), args.get("scenarios"))
+        if name in {"list_unity_symbols", "search_unity_source"}:
+            if code_intelligence is None:
+                raise RuntimeError("Unity code intelligence helpers could not be imported.")
+            if name == "list_unity_symbols":
+                return code_intelligence.list_unity_symbols(
+                    (args.get("install_path") or self.workspace_root), args.get("symbol_kind", "types"),
+                    args.get("assembly_path", ""), args.get("query", ""), args.get("limit", 200),
+                    args.get("timeout", 90),
+                )
+            return code_intelligence.search_unity_source(
+                self.workspace_root, args["query"], args.get("source_path", "recovery/decompiled"),
+                args.get("max_results", 100), args.get("case_sensitive", False),
+                args.get("regex", False), args.get("context_lines", 2),
+            )
+        if name in {"update_reconstruction_feature", "report_reconstruction_readiness"}:
+            if reconstruction_tracker is None:
+                raise RuntimeError("Reconstruction tracker could not be imported.")
+            if name == "update_reconstruction_feature":
+                return reconstruction_tracker.update_reconstruction_feature(
+                    self.workspace_root, args["feature_id"], args["name"], args.get("status", "planned"),
+                    args.get("notes", ""), args.get("source_evidence"), args.get("asset_evidence"),
+                    args.get("implementation_files"), args.get("test_files"),
+                )
+            return reconstruction_tracker.report_reconstruction_readiness(self.workspace_root, args.get("feature_id", ""))
+        if name == "inspect_unity_serialized_file":
+            if unity_asset_inspector is None:
+                raise RuntimeError("Unity asset inspector could not be imported.")
+            return unity_asset_inspector.inspect_unity_serialized_file(
+                args["install_path"], args["asset_path"], args.get("max_file_mb", 256), args.get("max_objects", 1000)
+            )
+        if name in {"scan_unity_installation", "catalog_unity_assets", "inspect_recovery_tooling", "decompile_unity_type", "export_unity_assembly"}:
+            if unity_recovery is None:
+                raise RuntimeError("Unity recovery helpers could not be imported.")
+            if name == "scan_unity_installation":
+                return unity_recovery.scan_unity_installation(args.get("install_path", ""), self.workspace_root)
+            if name == "catalog_unity_assets":
+                return unity_recovery.catalog_unity_assets(args.get("install_path", ""), self.workspace_root, args.get("output_path", "recovery/asset-catalog.json"), args.get("batch_size", 500))
+            if name == "inspect_recovery_tooling":
+                return unity_recovery.inspect_recovery_tooling(self.workspace_root)
+            if name == "decompile_unity_type":
+                return unity_recovery.decompile_unity_type(args["install_path"], self.workspace_root, args["type_name"], args.get("assembly_path", ""), args.get("timeout", 90))
+            if name == "export_unity_assembly":
+                return unity_recovery.export_unity_assembly(args["install_path"], self.workspace_root, args.get("assembly_path", ""), args.get("output_path", "recovery/decompiled"), args.get("timeout", 180))
         raise RuntimeError(f"unknown workspace tool '{name}'")
-
     def load_config(self):
         servers = _read_config().get("mcpServers", {}) or {}
         for sid, spec in servers.items():
@@ -1166,7 +1609,17 @@ class MCPManager:
                     name = t.get("name")
                     if not name:
                         continue
-                    advertised = name if name not in self.index else f"{sid}/{name}"
+                    # Keep Roblox as a distinct tool namespace. Workspace and
+                    # other MCP tools remain independently addressable, even when
+                    # a third-party server advertises the same bare name.
+                    advertised = f"{sid}/{name}" if sid == PRIMARY_SERVER_ID else name
+                    if advertised in self.index:
+                        advertised = f"{sid}/{name}"
+                    base = advertised
+                    suffix = 2
+                    while advertised in self.index:
+                        advertised = f"{base}#{suffix}"
+                        suffix += 1
                     self.index[advertised] = (client, name)
 
     def list_tools(self, refresh=False):
@@ -1199,16 +1652,115 @@ class MCPManager:
         return out
 
     def call(self, name, arguments, timeout):
+        if arguments is not None and not isinstance(arguments, dict):
+            raise RuntimeError("MCP arguments must be a JSON object.")
+        args = arguments or {}
+        if name == "zeroscript_handoff_to_cli":
+            if agent_control is None:
+                raise RuntimeError("ZeroScript agent-control module is unavailable.")
+            result = agent_control.handoff(arguments or {}, self._workspace_description())
+            return {"text": json.dumps(result, ensure_ascii=False, indent=2), "images": []}
+        if name == "zeroscript_agent_control_status":
+            if agent_control is None:
+                raise RuntimeError("ZeroScript agent-control module is unavailable.")
+            return {"text": json.dumps(agent_control.status(), ensure_ascii=False, indent=2), "images": []}
+        if name == "roblox_export_tree":
+            if export_roblox_tree is None:
+                raise RuntimeError("Roblox tree exporter could not be imported. Check workspace_agent/roblox_export.py.")
+            result = export_roblox_tree(self, arguments or {})
+            return {"text": json.dumps(result, ensure_ascii=False, indent=2), "images": []}
+        if name == "workspace_preview_image":
+            args = arguments or {}
+            if not self.workspace_configured or self.workspace is None:
+                raise RuntimeError("No project workspace has been selected. Select a workspace before previewing images.")
+            relative_path = args.get("path")
+            if not isinstance(relative_path, str) or not relative_path.strip():
+                raise RuntimeError("A workspace-relative image path is required.")
+            # Accept workspace-relative paths with either separator, plus absolute
+            # paths that still resolve INSIDE the selected workspace. Normalize
+            # separators before resolution; otherwise a Windows-style relative
+            # path can be interpreted as a literal backslash-containing filename
+            # by path implementations running in compatibility/test environments.
+            normalized_path = relative_path.strip()
+            if not Path(normalized_path).is_absolute():
+                normalized_path = normalized_path.replace("\\", os.sep).replace("/", os.sep)
+            try:
+                raw_target = self.workspace.root / normalized_path
+                if raw_target.is_symlink():
+                    raise RuntimeError("Symbolic-link image paths are not supported.")
+                target = self.workspace._resolve(normalized_path)
+            except (OSError, ValueError, WorkspaceError) as exc:
+                raise RuntimeError(f"Could not resolve image path '{relative_path}': {exc}") from exc
+            if not target.exists():
+                raise RuntimeError(f"Image file not found: '{relative_path}' (resolved path: {target}).")
+            if not target.is_file():
+                raise RuntimeError(f"Image path is not a regular file: '{relative_path}' (resolved path: {target}).")
+            mime_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                          ".webp": "image/webp", ".gif": "image/gif", ".svg": "image/svg+xml"}
+            mime_type = mime_types.get(target.suffix.lower())
+            if not mime_type:
+                raise RuntimeError("Unsupported image type. Supported formats: PNG, JPEG, WebP, GIF, SVG.")
+            size = target.stat().st_size
+            if size < 1 or size > 8 * 1024 * 1024:
+                raise RuntimeError(f"Image size must be between 1 byte and 8 MB; file is {size} bytes.")
+            data = target.read_bytes()
+            signatures = {
+                "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                "image/jpeg": data.startswith(b"\xff\xd8\xff"),
+                "image/gif": data.startswith((b"GIF87a", b"GIF89a")),
+                "image/webp": len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+            }
+            if mime_type == "image/svg+xml":
+                try:
+                    svg = data.decode("utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    raise RuntimeError("SVG must be valid UTF-8 text.") from exc
+                if "<svg" not in svg[:4096].lower():
+                    raise RuntimeError("The .svg file does not contain a valid SVG root element.")
+                lower_svg = svg.lower()
+                if (any(token in lower_svg for token in ("<script", "<foreignobject", "javascript:", " onload=", " onclick=", " onerror="))
+                        or re.search(r"""(?:href|src)\s*=\s*["']\s*(?:https?:|file:|javascript:|//)""", svg, re.I)):
+                    raise RuntimeError("SVG contains active script, event handlers, embedded HTML, or external resource references; remove them before previewing.")
+            elif not signatures[mime_type]:
+                expected = {
+                    "image/png": "PNG signature 89 50 4E 47 0D 0A 1A 0A",
+                    "image/jpeg": "JPEG signature FF D8 FF",
+                    "image/gif": "GIF87a or GIF89a signature",
+                    "image/webp": "RIFF....WEBP signature",
+                }[mime_type]
+                actual = data[:12].hex(" ").upper() or "(empty)"
+                raise RuntimeError(
+                    f"Image validation failed for '{target}' (extension {target.suffix.lower()}, "
+                    f"{size} bytes): expected {expected}; first bytes were {actual}. "
+                    "The path resolved and the file was read, so verify that this is the intended image file."
+                )
+            metadata = {"path": target.relative_to(self.workspace.root).as_posix(),
+                        "mime_type": mime_type, "bytes": size,
+                        "message": "Image attached for visual inspection."}
+            return {"text": json.dumps(metadata, ensure_ascii=False, indent=2),
+                    "images": [{"data": base64.b64encode(data).decode("ascii"), "mimeType": mime_type}]}
         if name.startswith("workspace_"):
             result = self._call_workspace(name, arguments)
             return {"text": json.dumps(result, ensure_ascii=False, indent=2), "images": []}
         with self.index_lock:
             entry = self.index.get(name)
+            # Backward compatibility for old conversations that call a Roblox
+            # command without its required roblox/ namespace.
+            if entry is None and "/" not in name:
+                candidates = [(key, value) for key, value in self.index.items()
+                              if value[0].id == PRIMARY_SERVER_ID and value[1] == name]
+                if len(candidates) == 1:
+                    entry = candidates[0][1]
         if entry is None:
             # Maybe a freshly added tool - rebuild once and retry.
             self.rebuild_index()
             with self.index_lock:
                 entry = self.index.get(name)
+                if entry is None and "/" not in name:
+                    candidates = [(key, value) for key, value in self.index.items()
+                                  if value[0].id == PRIMARY_SERVER_ID and value[1] == name]
+                    if len(candidates) == 1:
+                        entry = candidates[0][1]
         if entry is None:
             raise RuntimeError(f"unknown tool '{name}'")
         holder, real_name = entry
@@ -1236,6 +1788,15 @@ class MCPManager:
 # ══════════════════════════════════════════════════════════════════════════
 mgr = MCPManager()
 clients = set()
+client_roles = {}
+client_inflight = {}
+# A browser-to-CLI handoff is allowed only while a configured CLI is waiting.
+# Keys are WebSocket objects; handler cleanup removes stale arm records.
+client_takeover_armed = {}
+agent_control = AgentControlStore() if AgentControlStore is not None else None
+# Serializes tool admission with run ownership transitions. The tool itself runs
+# outside this lock; only the ownership check and in-flight counter are atomic.
+agent_control_lock = asyncio.Lock()
 
 # ── Studio connectivity probe ──────────────────────────────────────────────
 # The MCP server process stays alive even when Roblox Studio is closed or its
@@ -1253,8 +1814,8 @@ clients = set()
 #    the active place closed) it returns "...doesn't have a place opened / previously
 #    active Studio has disconnected". That is the authoritative "place loaded" signal
 #    (same phrase the call path already recognises in core/main.js).
-STUDIO_PROBE_TOOL = "list_roblox_studios"
-STUDIO_STATE_TOOL = "get_studio_state"
+STUDIO_PROBE_TOOL = "roblox/list_roblox_studios"
+STUDIO_STATE_TOOL = "roblox/get_studio_state"
 # Substrings get_studio_state emits when a Studio is connected but no place is open.
 NO_PLACE_MARKERS = ("doesn't have a place", "no place opened", "place opened",
                     "has disconnected", "no active studio")
@@ -1336,63 +1897,81 @@ def safe_call(name, arguments, timeout):
         return {"ok": False, "error": str(e), "kind": type(e).__name__}
 
 
-async def run_tool_task(ws, name, args, timeout, rid):
-    """Execute one tool off the socket read loop and send its result back.
-
-    Kept as a standalone task (not awaited inline in handler) so a long tool
-    never starves the connection's ability to answer app-level pings - see the
-    call_tool branch in handler() for the full rationale."""
+async def run_tool_task(ws, name, args, timeout, rid, role):
+    """Execute one tool off the socket read loop; always settle in-flight accounting."""
     t0 = time.monotonic()
-    res = await asyncio.to_thread(safe_call, name, args, timeout)
-    elapsed = time.monotonic() - t0
-    tag = "gr" if res.get("ok") else "rd"
-    summary = (res.get("text") or res.get("error") or "")[:80].replace("\n", " ")
-    slow = "  [SLOW]" if elapsed > 5 else ""
-    # Routine per-call traces are technical noise for a non-dev user watching
-    # the console; they still land in bridge_debug.log. A failed/slow call
-    # DOES surface on the terminal - that's the signal a user should notice.
-    log(f"<- {name} ({elapsed:.1f}s){slow}: {summary}", tag, terminal=not res.get("ok") or elapsed > 5)
     try:
-        await ws.send(json.dumps({"type": "tool_result", "id": rid, **res}))
-    except websockets.ConnectionClosed:
-        pass
+        if name == "zeroscript_handoff_to_cli" and role == "browser":
+            # Recheck the CLI readiness while holding the same lock used by
+            # disarm/claim. This closes the race where the CLI exits between
+            # request admission and the handoff tool actually queueing state.
+            async with agent_control_lock:
+                cli_ready = any(
+                    client_roles.get(client) == "cli" and bool(client_takeover_armed.get(client))
+                    for client in clients
+                )
+                if cli_ready:
+                    res = await asyncio.to_thread(safe_call, name, args, timeout)
+                else:
+                    res = {
+                        "ok": False,
+                        "kind": "control",
+                        "error": "No configured CLI is waiting for takeover. The handoff was not queued; the browser agent retains control.",
+                    }
+        else:
+            res = await asyncio.to_thread(safe_call, name, args, timeout)
+        elapsed = time.monotonic() - t0
+        tag = "gr" if res.get("ok") else "rd"
+        summary = (res.get("text") or res.get("error") or "")[:80].replace("\\n", " ")
+        slow = "  [SLOW]" if elapsed > 5 else ""
+        log(f"<- {name} ({elapsed:.1f}s){slow}: {summary}", tag, terminal=not res.get("ok") or elapsed > 5)
+        try:
+            await ws.send(json.dumps({"type": "tool_result", "id": rid, **res}))
+        except websockets.ConnectionClosed:
+            pass
+        if res.get("ok") and name.startswith("workspace_"):
+            await broadcast_status()
+        if res.get("ok") and name == "zeroscript_handoff_to_cli":
+            await broadcast_agent_control()
+    finally:
+        # A disconnected handler may already have removed this socket's
+        # counters. Do not resurrect an orphaned entry after the task finishes.
+        if ws in client_inflight:
+            client_inflight[ws] = max(0, int(client_inflight.get(ws, 1)) - 1)
+
+def _connected_status_payload(studio, studio_proc):
+    """Build a complete bridge status payload without blocking the asyncio loop."""
+    return json.dumps({
+        "type": "connected",
+        "mcp_alive": mgr.any_alive(),
+        "studio": studio["place"], "studio_app": studio["app"],
+        "studio_proc": studio_proc,
+        "servers": mgr.health(),
+        "tools": mgr.list_tools(),
+        "workspace": mgr._workspace_description(),
+        "agent_control": agent_control.status() if agent_control is not None else {},
+        "port": PORT,
+    })
 
 
 async def broadcast_status():
-    """Push a fresh status snapshot to every currently-connected extension tab.
+    """Broadcast a fresh status snapshot while keeping the socket event loop responsive.
 
-    Needed because the socket now starts listening (see _boot_and_diagnose in
-    main()) before every MCP server has necessarily finished launching in the
-    background - an extension that connects in that window gets an early,
-    incomplete "connected" snapshot (e.g. an addon server not started yet).
-    The extension's own periodic poll only reads a passively cached copy of
-    the LAST message it received (background.js never re-probes on its own),
-    so without a follow-up push that stale snapshot can persist forever (seen
-    live 2026-07-11: Blender not yet alive at connect-time froze the "Start
-    Roblox agent" button in its fully-disabled, non-degraded state even long
-    after Blender was actually up). background.js already handles a second
-    "connected" message arriving at any time (updates its cache and re-renders
-    the bar), so re-sending this exact shape once startup truly settles is
-    enough to self-correct with zero extension-side changes needed.
+    MCP manager introspection can block when a child process is slow or unhealthy.
+    Running the entire snapshot in a worker thread prevents routine workspace tools
+    (including workspace_info) from starving WebSocket ping/pong and agent-control
+    messages while they finish.
     """
     if not clients:
         return
     try:
         _st = await asyncio.to_thread(probe_studio)
         _proc = await asyncio.to_thread(_roblox_studio_app_running)
-        payload = json.dumps({
-            "type": "connected",
-            "mcp_alive": mgr.any_alive(),
-            "studio": _st["place"], "studio_app": _st["app"],
-            # Whether a Roblox Studio WINDOW process exists at all - lets the
-            # extension word the corrective step correctly ("open the MCP
-            # panel in your already-open Studio" vs "launch Studio").
-            "studio_proc": _proc,
-            "servers": mgr.health(),
-            "tools": mgr.list_tools(),
-            "port": PORT,
-        })
-    except Exception:
+        # Keep manager health/list_tools calls off the asyncio loop too. In
+        # particular, workspace_info triggers this broadcast on every success.
+        payload = await asyncio.to_thread(_connected_status_payload, _st, _proc)
+    except Exception as exc:
+        log(f"status broadcast failed: {exc}", "yl", terminal=False)
         return
     for ws in list(clients):
         try:
@@ -1401,10 +1980,31 @@ async def broadcast_status():
             pass
 
 
+async def broadcast_agent_control():
+    """Push ownership changes so the browser agent can stop when CLI takes over."""
+    if agent_control is None:
+        return
+    try:
+        state = await asyncio.to_thread(agent_control.status)
+        payload = json.dumps({"type": "agent_control", "control": state}, ensure_ascii=False)
+    except Exception as exc:
+        log(f"agent-control broadcast failed: {exc}", "rd")
+        return
+    for client in list(clients):
+        if client_roles.get(client) != "browser":
+            continue
+        try:
+            await client.send(payload)
+        except Exception:
+            pass
+
+
 async def handler(ws):
     peer = getattr(ws, "remote_address", ("?",))[0]
     clients.add(ws)
-    log(f"extension connected  ({peer})  [{len(clients)} client(s)]", "gr")
+    client_roles[ws] = "browser"
+    client_inflight[ws] = 0
+    log(f"client connected  ({peer})  [{len(clients)} client(s)]", "gr")
     try:
         _st = await asyncio.to_thread(probe_studio)
         await ws.send(json.dumps({
@@ -1414,6 +2014,8 @@ async def handler(ws):
             "studio_proc": await asyncio.to_thread(_roblox_studio_app_running),
             "servers": mgr.health(),
             "tools": mgr.list_tools(),
+            "workspace": mgr._workspace_description(),
+            "agent_control": agent_control.status() if agent_control is not None else {},
             "port": PORT,
         }))
         async for raw in ws:
@@ -1424,7 +2026,119 @@ async def handler(ws):
             mtype = msg.get("type")
             rid = msg.get("id")
 
-            if mtype == "ping":
+            if mtype == "register_client":
+                requested = msg.get("client")
+                if requested in ("browser", "cli"):
+                    client_roles[ws] = requested
+                await ws.send(json.dumps({"type": "client_registered", "client": client_roles.get(ws, "browser")}))
+
+            elif mtype == "agent_control_status":
+                try:
+                    state = await asyncio.to_thread(agent_control.status) if agent_control is not None else {}
+                    await ws.send(json.dumps({"type": "agent_control_result", "id": rid, "ok": True, "control": state}))
+                except Exception as exc:
+                    await ws.send(json.dumps({"type": "agent_control_result", "id": rid, "ok": False, "error": str(exc)}))
+
+            elif mtype in ("agent_arm", "agent_disarm", "agent_claim", "agent_start", "agent_heartbeat", "agent_complete", "agent_stop", "agent_yield"):
+                if client_roles.get(ws, "browser") != "cli":
+                    await ws.send(json.dumps({"type": "agent_control_result", "id": rid, "ok": False, "error": "This control action is available only to the registered CLI client."}))
+                    continue
+                try:
+                    if agent_control is None:
+                        raise RuntimeError("ZeroScript agent-control module is unavailable.")
+                    async with agent_control_lock:
+                        if mtype == "agent_arm":
+                            arm_session = str(msg.get("session_id") or "").strip()
+                            if not arm_session:
+                                raise RuntimeError("A session ID is required to arm CLI takeover.")
+                            current_control = await asyncio.to_thread(agent_control.status)
+                            if current_control.get("owner") == "cli" and current_control.get("state") in {"active", "stop_requested"}:
+                                raise RuntimeError("The CLI already owns an active run; finish or stop it before arming another takeover.")
+                            another_waiter = any(
+                                client is not ws
+                                and client_roles.get(client) == "cli"
+                                and bool(client_takeover_armed.get(client))
+                                for client in clients
+                            )
+                            if another_waiter:
+                                raise RuntimeError("Another CLI session is already armed and waiting for takeover.")
+                            client_takeover_armed[ws] = arm_session
+                            payload = {"ok": True, "control": current_control, "armed": True}
+                        elif mtype == "agent_disarm":
+                            requested_session = str(msg.get("session_id") or "").strip()
+                            active_arm = client_takeover_armed.get(ws)
+                            if active_arm and requested_session and requested_session != active_arm:
+                                raise RuntimeError("The requested session does not match the armed CLI session.")
+                            current_control = await asyncio.to_thread(agent_control.status)
+                            another_waiter = any(
+                                client is not ws
+                                and client_roles.get(client) == "cli"
+                                and bool(client_takeover_armed.get(client))
+                                for client in clients
+                            )
+                            if active_arm and current_control.get("state") == "queued" and not another_waiter:
+                                # If the only waiter exits before claiming, cancel
+                                # the queued handoff so the browser is not left paused.
+                                current_control = await asyncio.to_thread(
+                                    agent_control.request_stop, current_control.get("run_id")
+                                )
+                            client_takeover_armed.pop(ws, None)
+                            payload = {"ok": True, "control": current_control, "armed": False}
+                        elif mtype == "agent_claim":
+                            current_control = await asyncio.to_thread(agent_control.status)
+                            selected_workspace = mgr._workspace_description()
+                            expected_root = str(current_control.get("workspace") or "")
+                            selected_root = str(selected_workspace.get("root") or "") if selected_workspace.get("configured") is True else ""
+                            if expected_root and os.path.normcase(os.path.abspath(expected_root)) != os.path.normcase(os.path.abspath(selected_root)):
+                                raise RuntimeError("The selected workspace no longer matches the queued run. Restore the original project folder before claiming or resuming this task.")
+                            browser_busy = any(
+                                client_roles.get(client) == "browser" and count > 0
+                                for client, count in client_inflight.items()
+                            )
+                            result = await asyncio.to_thread(agent_control.claim, msg.get("session_id", ""), msg.get("run_id"), not browser_busy)
+                            payload = {"ok": bool(result.get("ok")), "control": result.get("control") or {}, "error": result.get("error"), "busy": bool(result.get("busy"))}
+                        elif mtype == "agent_start":
+                            browser_busy = any(
+                                client_roles.get(client) == "browser" and count > 0
+                                for client, count in client_inflight.items()
+                            )
+                            if browser_busy:
+                                raise RuntimeError("A browser tool call is still in flight. Wait for it to finish before starting a direct CLI task.")
+                            state = await asyncio.to_thread(
+                                agent_control.start_run,
+                                {"goal": msg.get("goal", ""), "context": msg.get("context", ""),
+                                 "plan": msg.get("plan") or [], "acceptance_criteria": msg.get("acceptance_criteria") or []},
+                                mgr._workspace_description(), msg.get("session_id", ""))
+                            payload = {"ok": True, "control": state}
+                        elif mtype == "agent_heartbeat":
+                            state = await asyncio.to_thread(agent_control.heartbeat, msg.get("run_id", ""), msg.get("session_id", ""), msg.get("progress"))
+                            payload = {"ok": True, "control": state}
+                        elif mtype == "agent_complete":
+                            state = await asyncio.to_thread(agent_control.finish, msg.get("run_id", ""), msg.get("session_id", ""), msg.get("status", "completed"), msg.get("summary", ""))
+                            payload = {"ok": True, "control": state}
+                        elif mtype == "agent_stop":
+                            state = await asyncio.to_thread(agent_control.request_stop, msg.get("run_id"))
+                            payload = {"ok": True, "control": state}
+                        else:
+                            cli_busy = any(
+                                client_roles.get(client) == "cli" and count > 0
+                                for client, count in client_inflight.items()
+                            )
+                            if cli_busy:
+                                raise RuntimeError("A CLI tool call is still in flight. Wait for it to finish before returning control to the browser.")
+                            state = await asyncio.to_thread(agent_control.yield_to_browser, msg.get("run_id", ""), msg.get("session_id", ""), msg.get("summary", ""))
+                            payload = {"ok": True, "control": state}
+                except Exception as exc:
+                    payload = {"ok": False, "error": str(exc)}
+                if payload.get("ok") and mtype == "agent_claim":
+                    # Ownership is now persisted; this session no longer needs
+                    # to advertise itself as waiting for a future handoff.
+                    client_takeover_armed.pop(ws, None)
+                await ws.send(json.dumps({"type": "agent_control_result", "id": rid, **payload}))
+                if payload.get("ok") and mtype not in {"agent_heartbeat", "agent_arm"}:
+                    await broadcast_agent_control()
+
+            elif mtype == "ping":
                 await ws.send(json.dumps({"type": "pong", "id": rid}))
 
             elif mtype == "studio_status":
@@ -1433,6 +2147,8 @@ async def handler(ws):
                     "type": "studio_status", "id": rid,
                     "studio": studio["place"], "studio_app": studio["app"],
                     "studio_proc": await asyncio.to_thread(_roblox_studio_app_running),
+                    "workspace": mgr._workspace_description(),
+            "agent_control": agent_control.status() if agent_control is not None else {},
                     "mcp_alive": mgr.any_alive(),
                 }))
 
@@ -1446,6 +2162,8 @@ async def handler(ws):
                 await ws.send(json.dumps({
                     "type": "tools", "id": rid,
                     "tools": tools, "mcp_alive": mgr.any_alive(),
+                    "workspace": mgr._workspace_description(),
+            "agent_control": agent_control.status() if agent_control is not None else {},
                     "studio": _st["place"], "studio_app": _st["app"],
                     "studio_proc": await asyncio.to_thread(_roblox_studio_app_running),
                     "servers": mgr.health(),
@@ -1454,8 +2172,36 @@ async def handler(ws):
             elif mtype == "call_tool":
                 name = msg.get("name", "")
                 args = msg.get("arguments") or {}
+                role = client_roles.get(ws, "browser")
+                blocked_reason = None
+                async with agent_control_lock:
+                    if role == "browser" and name == "zeroscript_handoff_to_cli":
+                        cli_ready = any(
+                            client_roles.get(client) == "cli" and bool(client_takeover_armed.get(client))
+                            for client in clients
+                        )
+                        if not cli_ready:
+                            blocked_reason = (
+                                "No configured ZeroScript CLI is waiting for takeover. "
+                                "Start the CLI, configure its model endpoint, and run /takeover first. "
+                                "This handoff was not queued; the browser agent retains control."
+                            )
+                    if (blocked_reason is None and role == "browser" and agent_control is not None
+                            and not agent_control.browser_tool_allowed(name)):
+                        blocked_reason = (
+                            "The independent CLI agent currently owns this task, or a handoff is already queued. "
+                            "Browser-originated tool calls are paused until control is released."
+                        )
+                    if blocked_reason is None:
+                        client_inflight[ws] = int(client_inflight.get(ws, 0)) + 1
+                if blocked_reason is not None:
+                    await ws.send(json.dumps({
+                        "type": "tool_result", "id": rid, "ok": False, "kind": "control",
+                        "error": blocked_reason,
+                    }))
+                    continue
                 timeout = float(msg.get("timeout", 120000)) / 1000.0
-                log(f"-> tool  {name}({', '.join(args.keys())})", "cy", terminal=False)
+                log(f"-> tool  {name}({', '.join(args.keys())}) [{role}]", "cy", terminal=False)
                 # Run the tool as a BACKGROUND task instead of awaiting it here.
                 # Awaiting inline parks this read loop for the WHOLE tool call, so
                 # a long tool (e.g. wait_job_finished > 25s) means the client's
@@ -1466,7 +2212,7 @@ async def handler(ws):
                 # The extension only ever has ONE call_tool in flight (its agent
                 # loop awaits each result before sending the next), so this never
                 # overlaps tool executions.
-                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid))
+                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid, role))
 
             elif mtype in ("add_server", "remove_server"):
                 # Adding/removing an addon MCP server rewrites config.json, which
@@ -1515,8 +2261,30 @@ async def handler(ws):
     except Exception as e:
         log(f"handler error: {e}", "rd")
     finally:
-        clients.discard(ws)
-        log(f"extension disconnected  [{len(clients)} client(s)]", "yl")
+        should_broadcast_control = False
+        # Serialize disconnect cleanup with the handoff task's readiness check
+        # and queue write. Otherwise a CLI could disconnect after the readiness
+        # check but just before the handoff was recorded, leaving an orphan queue.
+        async with agent_control_lock:
+            armed_session = client_takeover_armed.pop(ws, None)
+            clients.discard(ws)
+            client_roles.pop(ws, None)
+            client_inflight.pop(ws, None)
+            if armed_session and agent_control is not None:
+                try:
+                    current_control = await asyncio.to_thread(agent_control.status)
+                    another_waiter = any(
+                        client_roles.get(client) == "cli" and bool(client_takeover_armed.get(client))
+                        for client in clients
+                    )
+                    if current_control.get("state") == "queued" and not another_waiter:
+                        await asyncio.to_thread(agent_control.request_stop, current_control.get("run_id"))
+                        should_broadcast_control = True
+                except Exception as exc:
+                    log(f"could not clean up abandoned handoff: {exc}", "yl")
+        if should_broadcast_control:
+            await broadcast_agent_control()
+        log(f"client disconnected  [{len(clients)} client(s)]", "yl")
 
 
 async def server_watch():
@@ -1855,7 +2623,7 @@ async def _supervised(name, coro_factory):
 
 
 async def main():
-    print(f"\n{C['cy']}  ZeroScript Bridge v{BRIDGE_VERSION}{C['reset']}  {C['dim']}- Roblox Studio - ws://{HOST}:{PORT}{C['reset']}\n")
+    print(f"\n{C['cy']}  ArcScript Bridge v{BRIDGE_VERSION}{C['reset']}  {C['dim']}- Roblox Studio - ws://{HOST}:{PORT}{C['reset']}\n")
     log(f"===== BRIDGE START  v{BRIDGE_VERSION}  pid={os.getpid()}  log={LOG_PATH} =====", "cy")
     await asyncio.to_thread(_kill_orphan_studio_mcp)
     killed_squatter = await asyncio.to_thread(check_studio_port)
@@ -2067,7 +2835,7 @@ async def main():
 
     try:
         server_ctx = await websockets.serve(
-            handler, HOST, PORT, ping_interval=20, ping_timeout=20,
+            handler, HOST, PORT, ping_interval=20, ping_timeout=60,
             max_size=16 * 1024 * 1024)
     except OSError as e:
         # errno 10048 (Win) / EADDRINUSE: something we could NOT auto-kill still

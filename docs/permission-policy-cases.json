@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "description": "Shared denylist parity cases. These operations must be denied by both CLI and browser Autopilot even in automatic mode.",
+  "denied": [
+    "workspace_delete_file",
+    "workspace_remove_path",
+    "workspace_destroy_workspace",
+    "workspace_purge_cache",
+    "workspace_wipe_data",
+    "workspace_format_disk",
+    "workspace_reset_workspace",
+    "workspace_set_root",
+    "workspace_open_recent",
+    "workspace_move_path",
+    "workspace_git_reset",
+    "workspace_git_commit",
+    "workspace_git_push",
+    "workspace_git_stage_file",
+    "workspace_git_unstage_file",
+    "publish_release",
+    "deploy_production",
+    "release_build",
+    "send_email",
+    "send_message",
+    "purchase_item",
+    "checkout_order",
+    "payment_capture",
+    "rotate_credential",
+    "change_password",
+    "workspace_install_package",
+    "workspace_uninstall_package"
+  ]
+}

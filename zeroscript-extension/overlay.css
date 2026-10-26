@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* overlay.css - ZeroScript Free in-page UI. Scoped under #zs-root / .zs-* */
+/* overlay.css - ArcScript Free in-page UI. Scoped under #zs-root / .zs-* */
 
 #zs-root {
   position: fixed;
@@ -125,7 +125,7 @@ html.zs-light #zs-bar.zs-bar-anchored {
   width: auto;
   /* The card's corner radius is 28px and the bar sits flush with its top edge,
      so the bar's outermost children land inside the corner arc. With the
-     generic 16px padding the Discord button ended up 8px from the card edge and
+     generic 16px padding the right-side control ended up 8px from the card edge and
      7.3px from its top - its top-right corner falls OUTSIDE the rounded rect and
      was being sliced off by the card's `overflow-clip` (measured live). 24px
      puts both ends 16px in from the card edge, which clears the arc with room to
@@ -144,7 +144,7 @@ html.zs-light #zs-bar.zs-bar-anchored {
 
 /* Meta AI's composer card has a large corner radius (rounded-32 = 32px), so the
    full-width anchored bar's left/right ends run under the curve - the brand and
-   the Discord/switch/support icons crowd the rounding. Inset the content by ~the
+   the brand and switch control crowd the rounding. Inset the content by ~the
    radius so both edges clear the corners cleanly. */
 #zs-bar.zs-bar-anchored.zs-prov-meta { padding-left: 30px; padding-right: 30px; }
 
@@ -232,6 +232,11 @@ html.zs-light #zs-unstable {
   box-shadow: 0 2px 12px rgba(217, 119, 6, 0.45);
 }
 #zs-action[data-kind="start-degraded"]:hover { filter: brightness(1.08); }
+#zs-action[data-kind="enable"] {
+  background: linear-gradient(135deg, #0f766e, #14b8a6); color: #fff; border-color: transparent;
+  box-shadow: 0 2px 10px rgba(20, 184, 166, 0.25);
+}
+#zs-action[data-kind="enable"]:hover { filter: brightness(1.08); }
 #zs-action:disabled {
   background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.45);
   border-color: rgba(255, 255, 255, 0.10); box-shadow: none; cursor: not-allowed;
@@ -256,17 +261,6 @@ html.zs-light #zs-unstable {
   background: #b45309; cursor: progress; opacity: 0.85;
 }
 #zs-stop[data-state="stopping"]:hover { background: #b45309; }
-
-/* bar controls: one neutral icon-button family (Discord, support, switch) */
-#zs-discord, #zs-support {
-  flex: none; width: 28px; height: 28px; padding: 0;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(255, 255, 255, 0.06); color: #b8b8bf;
-  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
-  cursor: pointer; text-decoration: none;
-  transition: background 0.14s ease, color 0.14s ease;
-}
-#zs-discord:hover, #zs-support:hover { background: rgba(255, 255, 255, 0.11); color: #ededf0; }
 
 /* model switcher: names the current AI and opens the panel at Switch AI */
 #zs-switch {
@@ -324,6 +318,19 @@ html.zs-light #zs-menu::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); b
 }
 .zs-menu-note { font-size: 10.5px; color: #6b6b73; line-height: 1.45; margin: 0 0 9px; }
 
+/* Per-conversation agent stop/enable controls. */
+.zs-chat-control {
+  width: 100%; box-sizing: border-box; padding: 8px 10px;
+  border: 1px solid rgba(248, 113, 113, 0.28); border-radius: 8px;
+  color: #fca5a5; background: rgba(127, 29, 29, 0.16);
+  font-size: 11.5px; font-weight: 650; text-align: left; cursor: pointer;
+}
+.zs-chat-control:hover { background: rgba(127, 29, 29, 0.27); }
+.zs-chat-control-enable {
+  border-color: rgba(52, 211, 153, 0.3); color: #6ee7b7; background: rgba(6, 78, 59, 0.18);
+}
+.zs-chat-control-enable:hover { background: rgba(6, 78, 59, 0.28); }
+
 /* AI site rows: plain list, subtle surface on hover */
 .zs-site-opt {
   width: 100%; box-sizing: border-box; margin: 1px 0; padding: 8px 10px;
@@ -368,27 +375,6 @@ button.zs-site-opt:hover .zs-site-go { opacity: 1; transform: translateX(0); }
 #zs-set-save:hover, #zs-mcp-add:hover { background: rgba(255, 255, 255, 0.15); }
 #zs-set-status, #zs-mcp-status { font-size: 11px; color: #8a8a92; font-weight: 500; }
 
-/* support actions: neutral rows, differentiated by the aside text, not colour */
-.zs-tip-opt {
-  width: 100%; margin: 5px 0; padding: 9px 11px;
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px;
-  color: #e4e4e8; font-size: 12.5px; font-weight: 600; cursor: pointer; text-align: left;
-  transition: background 0.13s ease;
-}
-.zs-tip-opt:hover { background: rgba(255, 255, 255, 0.09); }
-.zs-tip-sub { font-size: 10px; font-weight: 400; color: #7a7a82; white-space: nowrap; }
-.zs-rbx-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.zs-tip-rbx {
-  justify-content: center; gap: 3px; margin: 0; padding: 8px 6px;
-  font-size: 12px; font-weight: 500; color: #c8c8ce;
-}
-.zs-rbx-cur { color: #7a7a82; font-weight: 400; }
-.zs-tip-sep {
-  font-size: 10px; color: #6b6b73; margin: 11px 0 8px; text-align: center;
-}
-
 /* ── custom MCP servers list (add-your-own, same shell as Custom prompt) ── */
 .zs-mcp-item {
   display: flex; align-items: center; gap: 8px;
@@ -403,7 +389,7 @@ button.zs-site-opt:hover .zs-site-go { opacity: 1; transform: translateX(0); }
 .zs-mcp-health-off { background: #f87171; }
 .zs-mcp-health-unknown { background: #6b7280; }
 /* Roblox: always first, greyed out - no health dot (own status lives in the
-   main ZeroScript dot) and no remove button (protected bridge-side too). */
+   main ArcScript dot) and no remove button (protected bridge-side too). */
 .zs-mcp-item-primary { opacity: 0.55; background: rgba(255, 255, 255, 0.02); }
 .zs-mcp-item-primary .zs-mcp-name { font-weight: 500; }
 .zs-mcp-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
@@ -574,7 +560,7 @@ html.zs-site-meta .zs-hidden > .zs-chip {
 /* Qwen (Ant Design) renders its model / thinking-mode select popup AND the
    composer "+" attachment menu (Upload attachment / Deep Research / Create
    image / Web Dev / Slides / More) at z-index 1050-1150 - far below #zs-root
-   (2147483600) - so the ZeroScript bar covered the bottom of whichever menu was
+   (2147483600) - so the ArcScript bar covered the bottom of whichever menu was
    open (reported live: the "+" menu's "More" row and the bar's own "Tools"
    toggle drew on top of each other). Both popups are portalled to <body>, so
    raising their z-index above the bar lifts them back on top. Inert when a
@@ -584,7 +570,7 @@ html.zs-site-meta .zs-hidden > .zs-chip {
 
 /* Qwen's model list has an "Expand more models" fly-out submenu (the Qwen3.6
    family etc.) rendered as a SEPARATE body-portalled `.ant-dropdown` at z-index
-   1050 - NOT the `.qwen-select-dropdown` above - so the ZeroScript bar drew on
+   1050 - NOT the `.qwen-select-dropdown` above - so the ArcScript bar drew on
    top of it (reported live: the bar's "Start Roblox agent" row covered the
    Qwen3.6-Max-Preview description). Scoped with :has() to the dropdown that
    actually holds model rows, so unrelated Ant dropdowns/tooltips are untouched. */
@@ -595,7 +581,7 @@ html.zs-site-meta .zs-hidden > .zs-chip {
    photos / Presets / Plugins / Skills / Web search), and that same button's
    OWN hover tooltip ("Add files & photos…") - into a
    .v-binder-follower-container at z-index ~20-2001, far below #zs-root
-   (2147483600) - so the ZeroScript bar/pill covered the open menu/tooltip
+   (2147483600) - so the ArcScript bar/pill covered the open menu/tooltip
    (reported live: opening "+", or just hovering it, while the agent was
    working drew the "unstable" pill and composer cover through it). Lift the
    container above the bar. :has scopes this to those known popovers
@@ -617,7 +603,7 @@ html.zs-site-meta .zs-hidden > .zs-chip {
 /* GLM / Z.ai (bits-ui floating library) portals its composer-toolbar popovers -
    the Search / Advanced Search hover card, and similar tooltips/dropdowns - into
    a [data-bits-floating-content-wrapper] at z-index ~9999, far below #zs-root
-   (2147483600), so the ZeroScript bar sat in front of them (the popover appeared
+   (2147483600), so the ArcScript bar sat in front of them (the popover appeared
    "behind" the bar on hover). The wrapper is the positioned/stacking element, so
    lifting it above the bar fixes every bits-ui popover anchored near the bar. */
 [data-bits-floating-content-wrapper] { z-index: 2147483646 !important; }
@@ -625,10 +611,10 @@ html.zs-site-meta .zs-hidden > .zs-chip {
 /* Gemini (Angular Material) portals its composer "+" menu (Import files /
    Create image / Canvas / Deep Research…) and its other dialogs into a single
    body-level .cdk-overlay-container at z-index 1000 - far below #zs-root
-   (2147483600) / #zs-unstable (2147483601). The ZeroScript bar and its
+   (2147483600) / #zs-unstable (2147483601). The ArcScript bar and its
    floating "unstable" pill sat OVER the open menu (reported live: opening "+"
    while the agent was working drew the pill straight through the menu).
-   Lift the whole overlay container above every ZeroScript surface. */
+   Lift the whole overlay container above every ArcScript surface. */
 .cdk-overlay-container { z-index: 2147483646 !important; }
 
 /* DeepSeek (its own "ds-" design system) portals tooltips and popovers - e.g.
@@ -638,7 +624,7 @@ html.zs-site-meta .zs-hidden > .zs-chip {
    over the input during agent activity, it visually covered the tooltip
    (reported live: hovering DeepThink while the agent was working showed the
    tooltip clipped/behind the bar). Lift every DeepSeek floating portal above
-   ZeroScript's own overlays. */
+   ArcScript's own overlays. */
 .ds-floating-container { z-index: 2147483646 !important; }
 
 /* Arena (Radix UI) portals its header dropdowns - the model picker and the
@@ -876,7 +862,7 @@ ol.flex-col-reverse > div.w-full:not(.mx-auto) > .zs-chip {
 }
 #zs-setup-dismiss:hover { background: rgba(255, 255, 255, 0.06); }
 
-/* ── capture preview popup (left-hand, ZeroScript style) ─────── */
+/* ── capture preview popup (left-hand, ArcScript style) ─────── */
 .zs-shot {
   position: fixed; left: 18px; top: 72px; width: 300px; max-width: 32vw;
   background: #161618; color: #ececee;
@@ -950,14 +936,10 @@ html.zs-light #zs-state { color: #4b5563; }
 html.zs-light #zs-state b { color: #4f46e5; }
 html.zs-light #zs-state.zs-state-warn { color: #b91c1c; }
 html.zs-light #zs-bar.tone-active #zs-state b { color: #059669; }
-html.zs-light #zs-discord,
-html.zs-light #zs-support,
 html.zs-light #zs-switch {
   background: rgba(0, 0, 0, 0.05); color: #4b5563;
   border-color: rgba(0, 0, 0, 0.12);
 }
-html.zs-light #zs-discord:hover,
-html.zs-light #zs-support:hover,
 html.zs-light #zs-switch:hover { background: rgba(0, 0, 0, 0.09); color: #1f2430; }
 html.zs-light #zs-action:disabled {
   background: rgba(0, 0, 0, 0.05); color: rgba(0, 0, 0, 0.35); border-color: rgba(0, 0, 0, 0.08);
@@ -1006,16 +988,38 @@ html.zs-light button.zs-site-opt:hover { background: rgba(0, 0, 0, 0.05); }
 html.zs-light .zs-site-badge { color: #6b7280; border-color: rgba(0, 0, 0, 0.14); }
 html.zs-light .zs-site-go { color: #9ca3af; }
 html.zs-light #zs-set-save,
-html.zs-light #zs-mcp-add,
-html.zs-light .zs-tip-opt {
+html.zs-light #zs-mcp-add {
   background: rgba(0, 0, 0, 0.05); color: #1f2430; border-color: rgba(0, 0, 0, 0.12);
 }
 html.zs-light #zs-set-save:hover,
-html.zs-light #zs-mcp-add:hover,
-html.zs-light .zs-tip-opt:hover { background: rgba(0, 0, 0, 0.09); }
+html.zs-light #zs-mcp-add:hover { background: rgba(0, 0, 0, 0.09); }
 html.zs-light #zs-set-status,
-html.zs-light #zs-mcp-status,
-html.zs-light .zs-tip-sub,
-html.zs-light .zs-rbx-cur,
-html.zs-light .zs-tip-sep { color: #6b7280; }
-html.zs-light .zs-tip-rbx { color: #374151; }
+html.zs-light #zs-mcp-status { color: #6b7280; }
+
+
+/* ChatGPT sidebar: identify conversations previously attached to ArcScript. */
+a.zs-has-conversation-indicator {
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+}
+.zs-conversation-indicator {
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(130, 170, 255, 0.28);
+  border-radius: 5px;
+  padding: 1px 5px;
+  color: #a8c5ff;
+  background: rgba(90, 130, 210, 0.12);
+  font: 10px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  pointer-events: none;
+}
+html.zs-light .zs-conversation-indicator {
+  color: #315da8;
+  border-color: rgba(49, 93, 168, 0.24);
+  background: rgba(49, 93, 168, 0.08);
+}

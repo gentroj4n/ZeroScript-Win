@@ -48,12 +48,14 @@ function el(tag, opts, children) {
 }
 
 // ── Load the provider against the stub globals ──────────────────────────────
+let querySelectorAllHandler = () => [];
 global.document = {
   querySelector: () => null,
-  querySelectorAll: () => [],
+  querySelectorAll: (selector) => querySelectorAllHandler(selector),
+  getElementById: () => null,
   addEventListener: () => {},
   dispatchEvent: () => {},
-  documentElement: { classList: { contains: () => false } },
+  documentElement: { classList: { contains: () => false }, setAttribute: () => {} },
   body: null,
 };
 global.window = { location: { pathname: "/" }, addEventListener: () => {} };
@@ -64,8 +66,110 @@ global.getComputedStyle = () => ({});
 const P = new Function(
   fs.readFileSync(__dirname + "/providers/chatgpt.js", "utf8") + "; return ZSProvider;"
 )();
+const Parse = new Function(
+  fs.readFileSync(__dirname + "/core/parser.js", "utf8") + "; return ZSParse;"
+)();
 
 const ok = (name, cond) => { console.log((cond ? "PASS" : "FAIL") + "  " + name); if (!cond) process.exitCode = 1; };
+
+// ── Current ChatGPT composer and turn markup (October 2026) ────────────────
+// The signed-in Chat layout no longer always exposes data-message-author-role
+// or the old composer wrapper. These tests guard the new semantic attributes.
+const modernUser = {
+  getAttribute: (name) => name === "data-content-search-unit-key" ? "turn-abc:user" : null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+};
+const modernAssistant = {
+  getAttribute: (name) => name === "data-content-search-unit-key" ? "turn-abc:assistant" : null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+};
+ok("new user content unit is classified as a user turn", P.isUserItem(modernUser));
+ok("new assistant content unit is classified as an assistant turn", P.isAssistantItem(modernAssistant));
+ok("new assistant unit supplies a stable turn identity", P.itemKey(modernAssistant) === "turn-abc:assistant");
+ok("new assistant unit is a readable reply fallback", P.replyNodes(modernAssistant)[0] === modernAssistant);
+
+// October ChatGPT may render a code block beside (rather than inside) its
+// .markdown subtree. The prose node alone is not a complete assistant reply.
+const siblingMarkdown = el("div", { class: "markdown" }, ["One moment."]);
+const siblingCommand = el("pre", {}, ['{"command":"list_tools","params":{}}']);
+const splitReply = {
+  getAttribute: (name) => name === "data-message-author-role" ? "assistant" : null,
+  querySelectorAll: (selector) => selector === ".markdown" ? [siblingMarkdown] :
+    selector === "pre" ? [siblingCommand] : [],
+};
+ok("orphaned fenced command outside markdown is included in reply nodes",
+  P.replyNodes(splitReply).includes(siblingCommand));
+ok("orphaned fenced command text reaches the parser",
+  P.itemText(splitReply).includes('"command":"list_tools"'));
+ok("orphaned fenced list_tools call parses as a tool dispatch",
+  Parse.parseToolCalls(P.itemText(splitReply)).some((call) =>
+    call.tool === "list_tools" && Object.keys(call.arguments).length === 0));
+
+// Some ChatGPT versions put the code block beside the selected role node,
+// inside a common conversation-turn wrapper. Verify the provider climbs only
+// to that turn and still returns the command text to the parser.
+const turnMarkdown = el("div", { class: "markdown" }, ["Starting Up"]);
+const turnCommand = el("pre", {}, ['{"command":"list_tools","params":{}}']);
+const turnWrapper = {
+  querySelectorAll: (selector) => selector === ".markdown" ? [turnMarkdown] :
+    selector === "pre" ? [turnCommand] : [],
+};
+const turnAssistant = {
+  getAttribute: (name) => name === "data-message-author-role" ? "assistant" : null,
+  querySelectorAll: (selector) => selector === ".markdown" ? [turnMarkdown] :
+    selector === "pre" ? [] : [],
+  closest: (selector) => selector === "[data-testid^='conversation-turn-']" ? turnWrapper : null,
+};
+ok("sibling command is recovered from the same conversation turn",
+  P.replyNodes(turnAssistant).includes(turnCommand));
+ok("sibling command from turn wrapper parses as list_tools",
+  Parse.parseToolCalls(P.itemText(turnAssistant)).some((call) => call.tool === "list_tools"));
+const stopIconPath = "M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C15.5 14.9404 14.9404 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z";
+const modernStopButton = {
+  getAttribute: () => null,
+  matches: (selector) => selector.includes(stopIconPath),
+};
+const modernSendButton = {
+  getAttribute: (name) => name === "data-testid" ? "send-button" : null,
+  matches: () => false,
+};
+ok("new icon-based Stop button is recognised", P.isStopBtn(modernStopButton));
+ok("new-layout Send button is not mistaken for Stop", !P.isStopBtn(modernSendButton));
+querySelectorAllHandler = (selector) => {
+  if (selector.includes("data-message-author-role")) return [];
+  if (selector.includes("data-content-search-unit-key")) return [modernUser, modernAssistant];
+  return [];
+};
+const modernItems = P.allItems();
+ok("new content-search units are enumerated as turns", modernItems.length === 2 &&
+  modernItems[0] === modernUser && modernItems[1] === modernAssistant);
+const modernComposerForm = {};
+const modernComposerEditor = {
+  tagName: "DIV",
+  id: "",
+  offsetParent: {},
+  textContent: "",
+  getClientRects: () => [],
+  getAttribute: () => null,
+  setAttribute: () => {},
+  removeAttribute: () => {},
+  closest: (selector) => {
+    if (selector === "form[data-chatgpt-composer]" || selector === "form") return modernComposerForm;
+    return null;
+  },
+};
+querySelectorAllHandler = (selector) => {
+  if (selector.includes("data-composer-markdown") || selector.includes('data-testid="prompt-textarea"') || selector.includes("#prompt-textarea")) {
+    return [modernComposerEditor];
+  }
+  return [];
+};
+ok("new composer contenteditable is found", P.getEditor() === modernComposerEditor);
+ok("new composer uses anchored fallback when no safe grid surface exists", P.barMount() === null);
+ok("new composer anchor targets its React form", P.barAnchor() === modernComposerForm);
+querySelectorAllHandler = () => [];
 
 // ── The CodeMirror line collapse (the 1.5.1 headline bug) ───────────────────
 // A code block is <div class="cm-content"> with one <div class="cm-line"> per

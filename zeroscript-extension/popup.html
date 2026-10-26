@@ -1,38 +1,196 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ArcScript</title>
   <style>
-    body { width: 248px; margin: 0; font-family: "Segoe UI", sans-serif; background: #16161a; color: #e8e8ec; }
-    .wrap { padding: 14px; }
-    h1 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
-    .ver { font-size: 9.5px; font-weight: 500; letter-spacing: 0.2px;
-           color: rgba(255,255,255,0.55); background: none; border: none;
-           padding: 0; }
-    .dot { width: 9px; height: 9px; border-radius: 50%; background: #6b7280; }
-    .dot.on { background: #34d399; box-shadow: 0 0 8px #34d399; }
-    .dot.warn { background: #fbbf24; box-shadow: 0 0 8px #fbbf24; }
-    .row { font-size: 12px; opacity: 0.85; margin: 6px 0; }
-    button { width: 100%; margin-top: 8px; padding: 8px; border: 0; border-radius: 8px; cursor: pointer; font-size: 12px; }
-    .ghost { background: rgba(255,255,255,0.08); color: #e8e8ec; }
-    .kofi { background: rgba(255,105,135,.16); color: #ff8fa3; border: 1px solid rgba(255,105,135,.4) !important; font-weight: 700; }
-    code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; }
+    :root { color-scheme: dark; font-family: "Segoe UI Variable", "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { width: 360px; max-height: 600px; margin: 0; overflow-y: auto; color: #e8edf6; background: #0a0d13; }
+    button { font: inherit; cursor: pointer; transition: background .15s ease, border-color .15s ease, transform .15s ease; }
+    button:disabled { opacity: .55; cursor: progress; }
+    .wrap { padding: 18px; background: radial-gradient(ellipse at top left, rgba(78, 104, 167, .17), transparent 55%); }
+    .header { display: flex; align-items: center; gap: 11px; margin-bottom: 18px; }
+    .logo { width: 36px; height: 36px; object-fit: contain; padding: 6px; border: 1px solid #29354b; border-radius: 11px; background: #121925; }
+    .brand { min-width: 0; flex: 1; }
+    h1 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: -.15px; }
+    .subtitle { margin-top: 3px; font-size: 11px; color: #8b98ad; }
+    .version { padding: 4px 7px; border: 1px solid #29354b; border-radius: 7px; color: #94a7c6; font-size: 10px; }
+    .status { display: flex; align-items: center; gap: 9px; padding: 11px 12px; border: 1px solid #252e3e; border-radius: 11px; background: rgba(20, 27, 39, .82); }
+    .dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: #687386; }
+    .dot.on { background: #4adea1; box-shadow: 0 0 10px rgba(74, 222, 161, .38); }
+    .dot.warn { background: #f7be61; box-shadow: 0 0 9px rgba(247, 190, 97, .28); }
+    .status-copy { min-width: 0; flex: 1; }
+    .status-title { font-size: 12px; font-weight: 600; }
+    .status-detail { margin-top: 3px; font-size: 10px; color: #8b98ad; }
+    .section-label { margin: 20px 0 8px; color: #7f8ba0; font-size: 9px; font-weight: 750; letter-spacing: 1.2px; text-transform: uppercase; }
+    .card { padding: 13px; border: 1px solid #293245; border-radius: 12px; background: #111722; }
+    .card-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .card-title { font-size: 12px; font-weight: 650; }
+    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 6px; color: #b5c3db; background: #1b2738; font-size: 9px; font-weight: 650; white-space: nowrap; }
+    .badge.ready { color: #80e0b3; background: rgba(27, 104, 76, .22); }
+    .root { color: #dfe7f5; font-family: Consolas, "Cascadia Code", monospace; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; user-select: text; }
+    .hint { margin-top: 7px; color: #8c9ab0; font-size: 10px; line-height: 1.45; }
+    .primary { width: 100%; margin-top: 12px; padding: 10px 12px; border: 1px solid #7193ef; border-radius: 9px; color: white; background: #4569c8; font-size: 11px; font-weight: 650; }
+    .primary:hover { background: #5379dc; border-color: #9bb4ff; }
+    .integration { display: flex; align-items: flex-start; gap: 10px; padding: 11px 12px; border: 1px solid #252e3e; border-radius: 10px; background: rgba(17, 23, 34, .78); }
+    .integration-icon { display: grid; place-items: center; width: 29px; height: 29px; flex: 0 0 29px; border: 1px solid #394054; border-radius: 9px; background: #192130; color: #aab8d0; font-size: 14px; }
+    .integration-copy { min-width: 0; flex: 1; }
+    .integration-title { font-size: 11px; font-weight: 650; }
+    .integration-sub { margin-top: 4px; color: #8c9ab0; font-size: 10px; line-height: 1.45; }
+    .integration-status { margin-top: 7px; color: #aab6c9; font-size: 10px; }
+    .integration-status strong { color: #e1e8f4; font-weight: 600; }
+    .tools-row { display: flex; justify-content: space-between; margin: 11px 2px 0; color: #8592a8; font-size: 10px; }
+    .tools-row strong { color: #ced8e8; font-weight: 600; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 17px; }
+    .secondary { min-width: 0; padding: 9px 8px; border: 1px solid #2c374a; border-radius: 9px; color: #d4dceb; background: #151c28; font-size: 10px; font-weight: 600; }
+    .secondary:hover { border-color: #465b7d; background: #1a2534; }
+    .wide { grid-column: 1 / -1; }
+
+    .explorer-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+    .explorer-actions .primary { margin-top: 0; }
+    .explorer-secondary-actions { margin-top: 8px; }
+    .recent-panel { margin-top: 13px; padding-top: 11px; border-top: 1px solid #273246; }
+    .recent-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; }
+    .recent-list { display: grid; gap: 6px; }
+    .recent-workspace { display: flex; align-items: center; gap: 9px; padding: 8px; border: 1px solid #283449; border-radius: 8px; background: #0e141e; }
+    .recent-workspace-copy { min-width: 0; flex: 1; }
+    .recent-workspace-name { overflow: hidden; color: #e3eaf5; font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .recent-workspace-path { margin-top: 3px; overflow-wrap: anywhere; color: #8190a7; font-family: Consolas, "Cascadia Code", monospace; font-size: 9px; line-height: 1.4; }
+    .recent-workspace button { flex: 0 0 auto; padding: 6px 8px; border: 1px solid #34435a; border-radius: 7px; color: #d9e4f5; background: #192333; font-size: 9px; font-weight: 650; }
+    .recent-workspace button:hover:not(:disabled) { border-color: #7294ef; background: #22324b; }
+    .recent-workspace button:disabled { cursor: default; opacity: .55; }
+    .recent-empty { padding: 10px 8px; color: #8794a9; font-size: 10px; line-height: 1.5; }
+    .project-summary { max-height: 150px; overflow: auto; margin: 10px 0 0; padding: 10px; border: 1px solid #29364a; border-radius: 8px; color: #c7d2e4; background: #0b111a; font: 10px/1.55 Consolas, "Cascadia Code", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .explorer-status { min-height: 15px; margin-top: 9px; }
+    .explorer-status.error { color: #f0a2a2; }
+    .explorer-status.success { color: #8ee0b7; }
+    .advanced-section { margin-top: 10px; }
+    .advanced-section > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0; padding: 9px 2px; cursor: pointer; list-style: none; user-select: none; }
+    .advanced-section > summary::-webkit-details-marker { display: none; }
+    .advanced-section > summary::after { content: "+"; color: #8292ad; font-size: 15px; font-weight: 500; }
+    .advanced-section[open] > summary::after { content: "−"; }
+    .advanced-section[open] > summary { margin-bottom: 8px; }
+
+
+    .footer { margin-top: 15px; color: #657187; font-size: 9px; line-height: 1.5; text-align: center; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1><span id="dot" class="dot"></span> ZeroScript-Win <span id="ver" class="ver"></span> <span style="font-size:9px;opacity:.6">Coding Agent</span></h1>
-    <div class="row" id="state">Bridge: …</div>
-    <div class="row" id="tools"></div>
-    <div class="row" id="servers" style="white-space:pre-line; font-family:ui-monospace,monospace; opacity:0.75"></div>
-    <button class="ghost" id="reconnect">↻ Reconnect bridge</button>
-    <button class="ghost" id="restart">⟳ Restart MCP servers</button>
-    <button class="ghost" id="settings">⚙ Settings</button>
-    <button class="kofi" id="kofi">♥ Tip the developer on Ko-fi</button>
-    <div class="row" style="margin-top:10px; opacity:0.6">
-      Run <code>start.bat</code>, select a project workspace, then use a supported AI chat site.
-    </div>
-  </div>
+  <main class="wrap">
+    <header class="header">
+      <img class="logo" src="icon.png" alt="" />
+      <div class="brand">
+        <h1>ArcScript</h1>
+        <div class="subtitle">Free, local-first AI development</div>
+      </div>
+      <span id="ver" class="version"></span>
+    </header>
+
+    <section class="status" aria-live="polite">
+      <span id="dot" class="dot"></span>
+      <div class="status-copy">
+        <div id="state" class="status-title">Checking bridge…</div>
+        <div id="stateDetail" class="status-detail">Local connection status</div>
+      </div>
+    </section>
+
+    <div class="section-label">Explorer</div>
+    <section class="card" id="explorerCard">
+      <div class="card-heading">
+        <div class="card-title">Current project</div>
+        <span id="workspaceBadge" class="badge">Checking</span>
+      </div>
+      <div id="workspaceRoot" class="root">Waiting for bridge status…</div>
+      <div id="workspaceHint" class="hint">Choose a project folder to enable project-aware tools. Your selection is saved locally on this computer.</div>
+      <div class="explorer-actions">
+        <button id="browseWorkspace" class="primary">Choose project folder</button>
+        <button id="toggleRecentWorkspaces" class="secondary" aria-expanded="false">Recent projects</button>
+      </div>
+      <div id="recentWorkspacePanel" class="recent-panel" hidden>
+        <div class="recent-heading">
+          <span class="card-title">Recent projects</span>
+          <span class="hint">Last 10</span>
+        </div>
+        <div id="recentWorkspaceList" class="recent-list"></div>
+      </div>
+      <div class="explorer-actions explorer-secondary-actions">
+        <button id="inspectProject" class="secondary">Project overview</button>
+        <button id="showGitStatus" class="secondary">Git status</button>
+      </div>
+      <pre id="projectSummary" class="project-summary" hidden></pre>
+      <div id="explorerStatus" class="hint explorer-status" aria-live="polite">Connect the local bridge, then choose or reopen a project.</div>
+    </section>
+
+    <details class="advanced-section">
+      <summary class="section-label">Autonomy · optional</summary>
+    <section class="card" id="autopilotCard">
+      <div class="card-heading">
+        <div class="card-title">Single-session fallback · Legacy</div>
+        <span id="autopilotBadge" class="badge">Off</span>
+      </div>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+        <input id="autopilotToggle" type="checkbox" style="margin-top:3px;accent-color:#7193ef;width:16px;height:16px" />
+        <span>
+          <span style="display:block;font-size:11px;font-weight:650">Continue in this conversation</span>
+          <span style="display:block;margin-top:4px;color:#8c9ab0;font-size:10px;line-height:1.5">Legacy mode runs up to 7 role-separated phases in one conversation. Use Independent Autopilot run below for a durable task graph and independent provider-tab workers. Off by default; use Stop to interrupt.</span>
+        </span>
+      </label>
+      <div class="hint">Legacy single-session mode only. The independent coordinator below handles worker sessions and acceptance-criterion gating. Neither mode can authorize publishing, deployment, destructive actions, spending, or security changes.</div>
+    </section>
+    </details>
+
+    <details class="advanced-section">
+      <summary class="section-label">Independent Autopilot run · advanced</summary>
+    <section class="card" id="autopilotRunCard">
+      <div class="card-heading">
+        <div class="card-title">Coordinator & worker pool</div>
+        <span id="runStateBadge" class="badge">No run</span>
+      </div>
+      <label for="runGoal" class="hint">Goal</label>
+      <textarea id="runGoal" rows="3" placeholder="Describe the project outcome to deliver…" style="box-sizing:border-box;width:100%;resize:vertical;background:#0d131d;color:#e1e8f4;border:1px solid #2c374a;border-radius:8px;padding:9px;font:11px/1.5 inherit"></textarea>
+      <label for="runCriteria" class="hint" style="display:block;margin-top:10px">Acceptance criteria (one per line)</label>
+      <textarea id="runCriteria" rows="3" placeholder="Feature behaves as requested\nRelevant tests pass\nDocs reflect actual behavior" style="box-sizing:border-box;width:100%;resize:vertical;background:#0d131d;color:#e1e8f4;border:1px solid #2c374a;border-radius:8px;padding:9px;font:11px/1.5 inherit"></textarea>
+      <div class="hint">Creates a persistent dependency graph and dispatches tasks to idle, already-started ArcScript sessions in open provider tabs. Analysis/review workers are tool-gated to read-only operations, documentation edits are path-limited, writes are serialized while workers share the workspace, and QA must cite output excerpts for every acceptance criterion. Open and start multiple provider tabs for parallel read-only workers. Runs and evidence survive popup closure.</div>
+      <div class="actions" style="margin-top:10px">
+        <button class="primary" id="startAutopilotRun">Start run</button>
+        <button class="secondary" id="stopAutopilotRun" disabled>Stop run</button>
+      </div>
+      <div id="runProgress" class="hint" aria-live="polite">No run selected.</div>
+      <div id="runTasks" style="font-size:10px;line-height:1.6;max-height:140px;overflow:auto"></div>
+    </section>
+    </details>
+
+    <div class="section-label">Integrations</div>
+    <section class="integration">
+      <div class="integration-icon">⌘</div>
+      <div class="integration-copy">
+        <div class="integration-title">General development</div>
+        <div class="integration-sub">Files, source search, symbol lookup, project metadata, Git, and command execution. Scoped to the selected local workspace.</div>
+        <div class="integration-status"><strong id="toolCount">—</strong> workspace and integration tools</div>
+      </div>
+      <span class="badge ready">Local</span>
+    </section>
+    <section class="integration" style="margin-top:8px">
+      <div class="integration-icon">◇</div>
+      <div class="integration-copy">
+        <div class="integration-title">Roblox Studio adapter</div>
+        <div class="integration-sub">A separate <code>roblox/</code> tool namespace for live Studio/DataModel operations. It is optional and never treated as the local filesystem.</div>
+        <div id="robloxStatus" class="integration-status">Studio connection not checked</div>
+      </div>
+      <span id="robloxBadge" class="badge">Optional</span>
+    </section>
+
+    <div id="servers" class="tools-row"></div>
+
+    <div class="actions">
+      <button class="secondary" id="reconnect">↻ Reconnect bridge</button>
+      <button class="secondary" id="restart">⟳ Restart MCP servers</button>
+      <button class="secondary wide" id="settings">⚙ Agent settings</button>
+      </div>
+    <div class="footer">ArcScript is free to use, with no subscriptions or paid unlocks. Run <code>start.bat</code> to launch the local bridge.</div>
+  </main>
   <script src="popup.js"></script>
 </body>
 </html>

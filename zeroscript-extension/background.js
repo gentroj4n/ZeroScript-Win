@@ -7,10 +7,54 @@
 // Contract with content.js: every sendMessage ALWAYS gets a response object,
 // even when the bridge is offline. The agentic loop must never hang waiting.
 
+importScripts("core/autopilot-ledger.js");
+
+const AUTOPILOT_RUNS_KEY = "zsAutopilotRuns";
+let autopilotStorageQueue = Promise.resolve();
+async function readAutopilotRuns() {
+  const result = await chrome.storage.local.get({ [AUTOPILOT_RUNS_KEY]: {} });
+  return result[AUTOPILOT_RUNS_KEY] && typeof result[AUTOPILOT_RUNS_KEY] === "object"
+    ? result[AUTOPILOT_RUNS_KEY] : {};
+}
+function writeAutopilotRuns(runs) {
+  autopilotStorageQueue = autopilotStorageQueue.catch(() => {}).then(() =>
+    chrome.storage.local.set({ [AUTOPILOT_RUNS_KEY]: runs })
+  );
+  return autopilotStorageQueue;
+}
+async function mutateAutopilotRun(runId, mutate) {
+  return autopilotStorageQueue = autopilotStorageQueue.catch(() => {}).then(async () => {
+    const runs = await readAutopilotRuns();
+    const run = runs[runId];
+    if (!run) throw new Error("Unknown Autopilot run: " + runId);
+    const value = await mutate(run);
+    runs[runId] = run;
+    await chrome.storage.local.set({ [AUTOPILOT_RUNS_KEY]: runs });
+    return value === undefined ? run : value;
+  });
+}
+async function recoverAutopilotRuns() {
+  const runs = await readAutopilotRuns();
+  let changed = false;
+  for (const [id, run] of Object.entries(runs)) {
+    try {
+      const recovered = ZSAutopilotLedger.recoverExpiredLeases(run);
+      if (recovered.length) changed = true;
+      ZSAutopilotLedger.refreshReady(run);
+      if (run.stopRequested) run.state = "cancelled";
+      runs[id] = run;
+    } catch (error) {
+      console.warn("[ArcScript] Autopilot ledger recovery skipped", id, String(error));
+    }
+  }
+  if (changed) await writeAutopilotRuns(runs);
+  return runs;
+}
+
 const PORT = 17613;
 const URL = `ws://127.0.0.1:${PORT}`;
 
-// Chat sites where a ZeroScript provider content script runs. Status pushes go
+// Chat sites where a ArcScript provider content script runs. Status pushes go
 // to every tab matching these. Add the new provider's URL pattern here (and in
 // manifest.json content_scripts + host_permissions) when integrating another AI.
 const PROVIDER_URLS = ["https://chat.deepseek.com/*", "https://chatgpt.com/*", "https://chat.openai.com/*", "https://gemini.google.com/*", "https://www.kimi.ai/*", "https://kimi.ai/*", "https://chat.z.ai/*", "https://chat.qwen.ai/*", "https://arena.ai/*", "https://www.meta.ai/*", "https://meta.ai/*"];
@@ -51,6 +95,8 @@ let studioApp = null;
 // Assistant Settings > MCP Servers inside Studio (validated live 3x), which
 // "open Roblox Studio" wording completely fails to convey.
 let studioProc = null;
+let workspaceCache = null;
+let agentControlCache = null;
 
 function log(...a) {
   console.log("[zs-bg]", ...a);
@@ -75,6 +121,7 @@ function connect() {
     reconnectDelay = RECONNECT_MIN;
     lastMessageAt = Date.now();
     log("connected to bridge");
+    try { ws.send(JSON.stringify({ type: "register_client", client: "browser" })); } catch {}
     startHeartbeat();
     broadcastStatus();
   };
@@ -208,6 +255,18 @@ async function refreshStudioStatus() {
 }
 
 function handleBridgeMessage(msg) {
+  if (msg.agent_control && typeof msg.agent_control === "object") {
+    agentControlCache = msg.agent_control;
+  }
+  if (msg.type === "agent_control") {
+    agentControlCache = msg.control && typeof msg.control === "object" ? msg.control : {};
+    broadcastAgentControl();
+    broadcastStatus();
+    return;
+  }
+  if (msg.workspace && typeof msg.workspace === "object") {
+    workspaceCache = msg.workspace;
+  }
   if ("studio" in msg && (typeof msg.studio === "boolean" || msg.studio === null)) {
     studioConnected = msg.studio;
   }
@@ -286,7 +345,16 @@ function failAllPending(reason) {
 
 // ── status push to any open DeepSeek tab + popup ─────────────────────────
 function statusObj() {
-  return { type: "zs-status", connected, mcpAlive, studio: studioConnected, studioApp, studioProc, tools: toolsCache.length, servers: serversCache };
+  return { type: "zs-status", connected, mcpAlive, studio: studioConnected, studioApp, studioProc, tools: toolsCache.length, servers: serversCache, workspace: workspaceCache, agentControl: agentControlCache };
+}
+
+function broadcastAgentControl() {
+  const control = agentControlCache || {};
+  const message = { type: "zs-agent-control", ...control };
+  chrome.runtime.sendMessage(message).catch(() => {});
+  chrome.tabs.query({ url: PROVIDER_URLS }, (tabs) => {
+    for (const t of tabs) chrome.tabs.sendMessage(t.id, message).catch(() => {});
+  });
 }
 
 function broadcastStatus() {
@@ -300,6 +368,140 @@ function broadcastStatus() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     switch (msg.type) {
+      case "autopilot_create_run": {
+        const input = { ...(msg.input || {}) };
+        if (!input.workspace && workspaceCache && workspaceCache.root) input.workspace = workspaceCache.root;
+        const run = ZSAutopilotLedger.createRun(input);
+        const runs = await readAutopilotRuns();
+        runs[run.id] = run;
+        await writeAutopilotRuns(runs);
+        sendResponse({ ok: true, run });
+        break;
+      }
+      case "autopilot_get_run": {
+        const runs = await readAutopilotRuns();
+        sendResponse({ ok: !!runs[msg.runId], run: runs[msg.runId] || null });
+        break;
+      }
+      case "autopilot_list_runs": {
+        const runs = await recoverAutopilotRuns();
+        sendResponse({ ok: true, runs: Object.values(runs).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 50) });
+        break;
+      }
+      case "autopilot_refresh_ready": {
+        const run = await mutateAutopilotRun(msg.runId, (value) => ZSAutopilotLedger.refreshReady(value));
+        sendResponse({ ok: true, run });
+        break;
+      }
+      case "autopilot_dispatch_ready": {
+        // Recovery must be committed, not performed on a detached read snapshot.
+        // Otherwise an expired lease remains persisted and cannot be reclaimed
+        // when no worker happens to be available during this dispatch pass.
+        const run = await mutateAutopilotRun(msg.runId, (value) => {
+          ZSAutopilotLedger.recoverExpiredLeases(value);
+          ZSAutopilotLedger.refreshReady(value);
+          return value;
+        });
+        if (run.stopRequested || ["completed", "blocked", "needs_approval", "failed", "cancelled"].includes(run.state)) {
+          sendResponse({ ok: true, dispatched: [], runState: run.state });
+          break;
+        }
+        const tabs = await new Promise((resolve) => chrome.tabs.query({ url: PROVIDER_URLS }, resolve));
+        const dispatched = [];
+        for (const tab of tabs) {
+          if (!tab.id) continue;
+          let worker = null;
+          try {
+            worker = await new Promise((resolve) => chrome.tabs.sendMessage(tab.id, { type: "zs-autopilot-worker-probe" }, (response) => {
+              if (chrome.runtime.lastError) resolve(null); else resolve(response || null);
+            }));
+          } catch {}
+          if (!worker || worker.available !== true) continue;
+          const claimed = await mutateAutopilotRun(msg.runId, (value) =>
+            ZSAutopilotLedger.claimNext(value, {
+              id: (worker.workerId || worker.provider || "worker") + ":" + tab.id,
+              provider: worker.provider, tabId: tab.id, roles: worker.roles,
+            })
+          );
+          if (!claimed) continue;
+          const task = claimed.task, lease = claimed.lease;
+          const accepted = await new Promise((resolve) => chrome.tabs.sendMessage(tab.id, {
+            type: "zs-autopilot-worker-dispatch", runId: msg.runId, taskId: task.id, task, lease,
+          }, (response) => {
+            if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+            else resolve(response || { ok: false, error: "Worker did not acknowledge dispatch." });
+          }));
+          if (accepted.ok) dispatched.push({ taskId: task.id, role: task.role, tabId: tab.id, provider: worker.provider });
+          else {
+            await mutateAutopilotRun(msg.runId, (value) => {
+              const current = value.tasks.find((t) => t.id === task.id);
+              if (current && current.status === "leased" && current.lease && current.lease.token === lease.token) {
+                ZSAutopilotLedger.transition(value, task.id, "ready", { reason: accepted.error || "Worker rejected dispatch." });
+              }
+              return value;
+            });
+          }
+        }
+        const updated = await mutateAutopilotRun(msg.runId, (value) => {
+          ZSAutopilotLedger.refreshReady(value);
+          return { runState: value.state, ready: value.tasks.filter((t) => t.status === "ready").length, active: value.tasks.filter((t) => ["leased", "running"].includes(t.status)).length };
+        });
+        sendResponse({ ok: true, dispatched, ...updated });
+        break;
+      }
+      case "autopilot_claim_task": {
+        const result = await mutateAutopilotRun(msg.runId, (run) => {
+          ZSAutopilotLedger.recoverExpiredLeases(run);
+          const claim = ZSAutopilotLedger.claimNext(run, msg.worker || {});
+          return claim ? { task: claim.task, lease: claim.lease, runState: run.state } : { task: null, lease: null, runState: run.state };
+        });
+        sendResponse({ ok: true, ...result });
+        break;
+      }
+      case "autopilot_heartbeat_task": {
+        const lease = await mutateAutopilotRun(msg.runId, (run) =>
+          ZSAutopilotLedger.renewLease(run, msg.taskId, msg.leaseToken, msg.leaseMs)
+        );
+        sendResponse({ ok: true, lease });
+        break;
+      }
+      case "autopilot_retry_task": {
+        const run = await mutateAutopilotRun(msg.runId, (value) =>
+          ZSAutopilotLedger.retryTask(value, msg.taskId, "Manual retry requested from the Autopilot run panel.")
+        );
+        sendResponse({ ok: true, run });
+        break;
+      }
+      case "autopilot_transition_task": {
+        const run = await mutateAutopilotRun(msg.runId, (value) => {
+          ZSAutopilotLedger.transition(value, msg.taskId, msg.nextState, msg.payload || {});
+          ZSAutopilotLedger.refreshReady(value);
+          return value;
+        });
+        sendResponse({ ok: true, run });
+        break;
+      }
+      case "autopilot_finalize_run": {
+        const run = await mutateAutopilotRun(msg.runId, (value) => {
+          ZSAutopilotLedger.refreshReady(value);
+          ZSAutopilotLedger.finalize(value);
+          return value;
+        });
+        sendResponse({ ok: true, run });
+        break;
+      }
+      case "autopilot_cancel_run": {
+        const run = await mutateAutopilotRun(msg.runId, (value) => ZSAutopilotLedger.cancelRun(value, msg.reason));
+        const tabs = await new Promise((resolve) => chrome.tabs.query({ url: PROVIDER_URLS }, resolve));
+        for (const tab of tabs) {
+          if (!tab.id) continue;
+          try {
+            chrome.tabs.sendMessage(tab.id, { type: "zs-autopilot-worker-cancel", runId: msg.runId }).catch(() => {});
+          } catch {}
+        }
+        sendResponse({ ok: true, run });
+        break;
+      }
       case "status":
         if (!connected) connect(); // self-heal after a worker wake-up
         sendResponse(statusObj());
