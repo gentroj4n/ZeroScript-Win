@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import websockets
 
@@ -265,6 +265,131 @@ class BridgeClient:
         }
 
 
+def _decode_chat_completion_stream(lines: Any, on_text: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Consume OpenAI-compatible server-sent events into a normal chat-completion response."""
+    content_parts: List[str] = []
+    tool_parts: Dict[int, Dict[str, Any]] = {}
+    response_id = ""
+    finish_reason: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+    saw_event = False
+    done = False
+    data_lines: List[str] = []
+
+    def dispatch_event() -> bool:
+        nonlocal response_id, finish_reason, usage, saw_event
+        if not data_lines:
+            return False
+        payload = "\n".join(data_lines).strip()
+        data_lines.clear()
+        if payload == "[DONE]":
+            return True
+        try:
+            event = json.loads(payload)
+        except ValueError as exc:
+            raise RuntimeError("Model API returned malformed streaming JSON: " + str(exc)) from exc
+        if not isinstance(event, dict):
+            return False
+        saw_event = True
+        response_id = str(event.get("id") or response_id)
+        if isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            return False
+        for choice in choices:
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                continue
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            text_delta = ""
+            if isinstance(content, str):
+                text_delta = content
+            elif isinstance(content, list):
+                text_delta = "".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                )
+            if text_delta:
+                content_parts.append(text_delta)
+                if on_text is not None:
+                    on_text(text_delta)
+            calls = delta.get("tool_calls") or []
+            if isinstance(calls, list):
+                for call_delta in calls:
+                    if not isinstance(call_delta, dict):
+                        continue
+                    try:
+                        call_index = int(call_delta.get("index", 0))
+                    except (TypeError, ValueError):
+                        call_index = 0
+                    call = tool_parts.setdefault(call_index, {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if call_delta.get("id"):
+                        call["id"] = str(call_delta["id"])
+                    if call_delta.get("type"):
+                        call["type"] = str(call_delta["type"])
+                    function = call_delta.get("function") or {}
+                    if isinstance(function, dict):
+                        if isinstance(function.get("name"), str):
+                            call["function"]["name"] += function["name"]
+                        if isinstance(function.get("arguments"), str):
+                            call["function"]["arguments"] += function["arguments"]
+            if choice.get("finish_reason") is not None:
+                finish_reason = str(choice.get("finish_reason"))
+        return False
+
+    for raw_line in lines:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+        line = line.rstrip("\r\n")
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+        elif not line:
+            if dispatch_event():
+                done = True
+                break
+    if not done and data_lines:
+        done = dispatch_event()
+    if not saw_event:
+        raise RuntimeError("Model API streaming response contained no completion events.")
+    if not done and finish_reason is None:
+        raise RuntimeError("Model API stream ended before the completion marker.")
+    if not content_parts and not tool_parts:
+        raise RuntimeError("Model API stream completed without text or tool calls.")
+    if finish_reason is None:
+        finish_reason = "tool_calls" if tool_parts else "stop"
+
+    message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts) if content_parts else None,
+    }
+    if tool_parts:
+        calls_out = []
+        for index in sorted(tool_parts):
+            call = tool_parts[index]
+            if not call["id"]:
+                call["id"] = "stream_call_" + str(index)
+            calls_out.append(call)
+        message["tool_calls"] = calls_out
+    result: Dict[str, Any] = {
+        "object": "chat.completion",
+        "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
+    }
+    if response_id:
+        result["id"] = response_id
+    if usage is not None:
+        result["usage"] = usage
+    return result
+
+
 class OpenAICompatibleProvider:
     """OpenAI Chat Completions-compatible model API using only Python's stdlib."""
 
@@ -340,9 +465,98 @@ class OpenAICompatibleProvider:
             raise RuntimeError("Model API response did not contain choices.")
         return result
 
-    async def complete(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _post_stream(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]],
+                     emit_text: Callable[[str], None]) -> Dict[str, Any]:
+        self.validate()
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+            body["parallel_tool_calls"] = False
+        request = urllib.request.Request(
+            self._url(),
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream, application/json",
+                **({"Authorization": "Bearer " + self.api_key} if self.api_key else {}),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                content_type = str(response.headers.get("Content-Type", "")).lower()
+                if "text/event-stream" not in content_type:
+                    raw = response.read(12 * 1024 * 1024 + 1)
+                    if len(raw) > 12 * 1024 * 1024:
+                        raise RuntimeError("Model API response exceeded the 12 MiB response limit.")
+                    try:
+                        result = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise RuntimeError("Model API returned neither a valid event stream nor JSON: " + str(exc)) from exc
+                    if not isinstance(result, dict) or not result.get("choices"):
+                        raise RuntimeError("Model API response did not contain choices.")
+                    return result
+                return _decode_chat_completion_stream(response, emit_text)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(6000).decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            lowered = detail.casefold()
+            if exc.code in {400, 404, 405, 422} and any(
+                term in lowered for term in ("stream", "streaming", "unsupported", "not supported", "not implemented")
+            ):
+                # Some OpenAI-compatible local servers accept Chat Completions but
+                # do not implement server-sent events. Retry only this explicit case.
+                return self._post(messages, tools)
+            raise RuntimeError("Model API returned HTTP " + str(exc.code) + ": " + _clip(detail, 6000)) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError("Could not reach model API: " + str(exc.reason)) from exc
+
+    async def complete(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]],
+                       on_text: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
         prepared = fit_messages_to_context(messages, tools, self.context_tokens)
-        return await asyncio.to_thread(self._post, prepared, tools)
+        if on_text is None:
+            return await asyncio.to_thread(self._post, prepared, tools)
+
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue = asyncio.Queue()
+
+        def emit_text(chunk: str) -> None:
+            if chunk:
+                loop.call_soon_threadsafe(events.put_nowait, ("text", chunk))
+
+        def worker() -> Optional[Dict[str, Any]]:
+            try:
+                return self._post_stream(prepared, tools, emit_text)
+            except Exception as exc:
+                loop.call_soon_threadsafe(events.put_nowait, ("error", exc))
+                return None
+            finally:
+                loop.call_soon_threadsafe(events.put_nowait, ("done", None))
+
+        task = asyncio.create_task(asyncio.to_thread(worker))
+        error: Optional[Exception] = None
+        while True:
+            kind, payload = await events.get()
+            if kind == "text":
+                on_text(str(payload))
+            elif kind == "error":
+                error = payload if isinstance(payload, Exception) else RuntimeError(str(payload))
+            elif kind == "done":
+                break
+        result = await task
+        if error is not None:
+            raise error
+        if result is None:
+            raise RuntimeError("Model streaming request ended without a response.")
+        return result
 
 
 def _estimated_tokens(value: Any) -> int:
