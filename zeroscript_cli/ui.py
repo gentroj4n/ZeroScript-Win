@@ -37,7 +37,7 @@ except ImportError:
 
 COMMANDS = [
     "/help", "/status", "/new", "/sessions", "/load", "/resume", "/continue",
-    "/compact", "/clear", "/model", "/mode", "/tools", "/context", "/workspace", "/takeover",
+    "/compact", "/clear", "/model", "/tools", "/context", "/workspace", "/takeover",
     "/skills", "/skill", "/commands", "/init", "/doctor", "/stop", "/return-browser", "/quit",
 ]
 
@@ -136,10 +136,10 @@ class TerminalUI:
         elif title:
             print("\n== " + title + " ==")
 
-    def banner(self, model: str, endpoint: str, bridge_url: str, mode: str = "default") -> None:
+    def banner(self, model: str, endpoint: str, bridge_url: str) -> None:
         if not self.console:
             print("ZeroScript Code  |  model: " + (model or "not configured"))
-            print("Endpoint: " + endpoint + "  |  Bridge: " + bridge_url + "  |  Mode: " + mode)
+            print("Endpoint: " + endpoint + "  |  Bridge: " + bridge_url)
             print("Type /help for commands. Enter submits. Esc then Enter inserts a newline for multiline prompts.")
             return
         heading = Text()
@@ -152,8 +152,8 @@ class TerminalUI:
         details.add_column(ratio=1)
         details.add_column(style="dim", width=12)
         details.add_column(ratio=2)
-        details.add_row("MODEL", model or "not configured", "MODE", mode.upper())
-        details.add_row("ENDPOINT", endpoint, "BRIDGE", bridge_url)
+        details.add_row("MODEL", model or "not configured", "BRIDGE", bridge_url)
+        details.add_row("ENDPOINT", endpoint, "", "")
         self.console.print(Panel(
             details,
             title=heading,
@@ -258,7 +258,6 @@ class TerminalUI:
             ("/doctor", "Check local CLI and bridge prerequisites"),
             ("/workspace [PATH]", "Inspect or select the project workspace"),
             ("/model [NAME]", "Show or change the configured model name"),
-            ("/mode default|plan|auto", "Choose normal, read-only planning, or explicitly autonomous permissions"),
             ("/tools [QUERY]", "Inspect available bridge tools, optionally filtered"),
             ("/takeover", "Arm the CLI and wait for a browser handoff"),
             ("/stop", "Request a safe cooperative stop"),
