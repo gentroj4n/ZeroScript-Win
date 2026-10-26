@@ -242,7 +242,7 @@ class SkillCatalog:
         if len(result) > limit_chars:
             result = result[:limit_chars].rsplit("\n", 1)[0] + "\n- (catalog truncated)"
         return result
-def model_tool(self) -> dict[str, object] | None:
+    def model_tool(self) -> dict[str, object] | None:
         """Return a synthetic function tool that lets the model explicitly load a skill."""
         skills = [item for item in self.skills() if not item.disable_model_invocation]
         if not skills:
