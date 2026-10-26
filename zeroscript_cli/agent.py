@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import websockets
 
 from .ui import TerminalUI
-from .hooks import HookRunner
+from .hooks import HOOK_EVENTS, HookRunner
 from . import __version__
 from .remaster_services import AgentFlightRecorder, ArtifactGallery, IntegrationHealth, ModelProfiles, ProjectIntelligenceIndex, TaskVerificationGate, WorkspaceSnapshot, WorktreeManager
 from .visual_regression import compare_images
@@ -594,6 +594,18 @@ def _session_summaries(limit: int = 20) -> List[Dict[str, Any]]:
         except (OSError, ValueError, TypeError):
             continue
     return records
+
+
+def _show_hooks(hooks: HookRunner) -> None:
+    rows = []
+    for event in sorted(HOOK_EVENTS):
+        for spec in hooks.specs(event, match_value=None):
+            rows.append((event, spec.matcher or "*", Path(spec.settings_path).name, spec.command))
+    if not rows:
+        UI.info("No command hooks are configured in supported user/project settings files.")
+        UI.print("Settings: ~/.claude/settings.json, ~/.zeroscript-win/settings.json, .claude/settings.json, .claude/settings.local.json, .zeroscript/settings.json")
+        return
+    UI.table("Configured command hooks", ("Event", "Matcher", "Settings", "Command"), rows)
 
 
 def _show_definitions(catalog: SkillCatalog, kind: str, query: str = "") -> None:
@@ -2007,12 +2019,14 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     _show_definitions(skill_catalog, "command", argument)
                 elif slash == "/agents":
                     _show_definitions(skill_catalog, "agent", argument)
+                elif slash == "/hooks":
+                    _show_hooks(HookRunner(str(workspace.get("root") or "").strip() or None))
                 elif slash == "/reload":
                     skill_catalog.skills(refresh=True)
                     skill_catalog.commands(refresh=True)
                     skill_catalog.agents(refresh=True)
                     UI.set_commands(_available_slash_commands(skill_catalog))
-                    UI.success("Reloaded skills, custom commands, and agent profiles.")
+                    UI.success("Reloaded skills, custom commands, agent profiles, and current hook settings.")
                 elif slash == "/agent":
                     agent_name, _, agent_task = argument.partition(" ")
                     if not agent_name:
