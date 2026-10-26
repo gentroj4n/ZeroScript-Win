@@ -828,6 +828,19 @@ class IndependentAgent:
         if await self._check_stop():
             return "ERROR: Stop requested or control was released before this tool could run. Do not execute it."
         UI.tool_start(name, _clip(json.dumps(arguments, ensure_ascii=False, indent=2), 1800))
+        if name == "zeroscript_load_skill":
+            try:
+                skill_name = str(arguments.get("name") or "")
+                skill_arguments = str(arguments.get("arguments") or "")
+                output = self.skill_catalog.load_for_model(skill_name, skill_arguments)
+            except (ValueError, OSError) as exc:
+                output = "Skill load failed: " + str(exc)
+                self.recorder.record("skill.load_failed", skill=arguments.get("name"), error=str(exc))
+                UI.tool_result(_clip(output, 1800), ok=False)
+                return _clip(output)
+            self.recorder.record("skill.loaded", skill=skill_name, argument_chars=len(skill_arguments))
+            UI.tool_result(_clip(output, 4000), ok=True)
+            return _clip(output)
         try:
             with UI.status("[bold bright_cyan]Running tool[/bold bright_cyan] · " + name):
                 response = await self.bridge.call_tool(name, arguments)
