@@ -911,12 +911,13 @@ class IndependentAgent:
 
         if profile.allowed_tools:
             aliases = {
-                "read": {"workspace_read_file", "workspace_list_files", "workspace_tree", "workspace_info", "workspace_search"},
+                "read": {"workspace_read_file", "workspace_list_files", "workspace_tree", "workspace_info", "workspace_search", "workspace_symbols", "workspace_file_outline", "workspace_git_status", "workspace_git_changed_files", "workspace_git_diff", "workspace_git_log", "workspace_recent_roots", "workspace_preview_image"},
                 "write": {"workspace_write_file", "workspace_write_files", "workspace_create_file"},
                 "edit": {"workspace_multi_edit", "workspace_replace_in_files"},
                 "bash": {"workspace_run_command", "workspace_run_task"},
                 "glob": {"workspace_list_files", "workspace_tree"},
-                "grep": {"workspace_search"},
+                "grep": {"workspace_search", "workspace_symbols", "workspace_file_outline"},
+                "git": {"workspace_git_status", "workspace_git_changed_files", "workspace_git_diff", "workspace_git_log"}
             }
             patterns = [value.casefold() for value in profile.allowed_tools]
             def permitted(tool: Dict[str, Any]) -> bool:
