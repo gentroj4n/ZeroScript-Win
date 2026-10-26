@@ -404,7 +404,7 @@ def _tool_aliases(catalogue: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
     aliases: Dict[str, Dict[str, Any]] = {}
     for tool in catalogue:
         name = str(tool.get("name") or "")
-        if not name or name.startswith("zeroscript_"):
+        if not name or (name.startswith("zeroscript_") and name != "zeroscript_load_skill"):
             continue
         schema = tool.get("inputSchema")
         if not isinstance(schema, dict):
@@ -468,7 +468,7 @@ def _select_tools_for_task(catalogue: List[Dict[str, Any]], goal: str,
     usable = [
         tool for tool in catalogue
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
-        and not str(tool.get("name")).startswith("zeroscript_")
+        and (not str(tool.get("name")).startswith("zeroscript_") or str(tool.get("name")) == "zeroscript_load_skill")
     ]
     if include_all:
         return usable
@@ -514,6 +514,9 @@ def _select_tools_for_task(catalogue: List[Dict[str, Any]], goal: str,
         name = str(tool.get("name") or "")
         server = str(tool.get("server") or "workspace").lower()
         description = str(tool.get("description") or "").lower()
+        if name == "zeroscript_load_skill":
+            common.append((index, tool))
+            continue
         name_words = {w.lower() for w in _WORD_RE.findall(name.replace("/", " "))}
         desc_words = {w.lower() for w in _WORD_RE.findall(description)}
         score = 0.0
