@@ -1638,6 +1638,10 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     bridge = BridgeClient(args.bridge_url)
     try:
         await bridge.connect()
+        active_workspace = bridge.initial_status.get("workspace") or {}
+        workspace_root = str(active_workspace.get("root") or "").strip()
+        skill_catalog = SkillCatalog(workspace_root or None)
+        UI.set_commands(_available_slash_commands(skill_catalog))
         if command == "status":
             return await _status_command(bridge)
         if command == "stop":
