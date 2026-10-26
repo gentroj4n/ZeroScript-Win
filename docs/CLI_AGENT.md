@@ -79,6 +79,29 @@ Skills use .claude/skills/<name>/SKILL.md, .zeroscript/skills/<name>/SKILL.md, ~
 
 Invoke a skill manually with /skill NAME [ARGS] or zeroscript skill NAME [ARGS]. Skills not marked disable-model-invocation: true are exposed through a local runtime tool so the model can load complete instructions on demand. Supporting files beside SKILL.md are listed for selective reading instead of being dumped wholesale into context.
 
+### Command hooks
+
+The CLI supports command hooks in Claude-style JSON settings files: user-level `~/.claude/settings.json` and `~/.zeroscript-win/settings.json`, plus project-level `.claude/settings.json`, `.claude/settings.local.json`, and `.zeroscript/settings.json`. Supported events are `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`.
+
+Example:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "workspace_.*",
+        "hooks": [
+          { "type": "command", "command": "python scripts/check_workspace.py" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Matchers are regular expressions applied to the tool name for tool events, or to the prompt/source text for prompt/session events. The JSON event payload is sent to the command on stdin. Hook commands run as the current Windows user, with the project directory as their working directory, a bounded timeout, and bounded output. Hook stdout is passed back as untrusted context; non-zero exits and timeouts are surfaced in the terminal and do not silently veto or rewrite the agent's tool flow. Only configure commands you trust, because they can read or modify anything the current user can access.
+
 ### Agent profiles and delegation
 
 Agent profiles are Markdown files under .claude/agents/, .zeroscript/agents/, ~/.claude/agents/, or ~/.zeroscript-win/agents/. Frontmatter supports name, description, tools, model, max-turns, and disable-model-invocation. Run a profile directly with /agent NAME TASK or zeroscript agent NAME TASK. When profiles are available, the model can delegate bounded subtasks through zeroscript_run_subagent; child runs have separate conversation context, a maximum of 20 turns by profile, and cannot recursively spawn more subagents.
