@@ -251,7 +251,7 @@ class SkillCatalog:
         task_paths = {
             token.replace("\\", "/").strip("'\".,:;()")
             for token in re.findall(
-                r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_@.*?-]+[/\\\\])*[A-Za-z0-9_@.*?-]+\\.[A-Za-z0-9_-]+",
+                r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_@.*?-]+[/\\])*[A-Za-z0-9_@.*?-]+\.[A-Za-z0-9_-]+",
                 task_text,
             )
         }
