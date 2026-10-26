@@ -306,10 +306,13 @@ class SkillCatalog:
                 total += len(block)
         return output
 
-    def catalog_prompt(self, *, limit_chars: int = 8000) -> str:
+    def catalog_prompt(self, *, limit_chars: int = 8000, include_agents: bool = True) -> str:
         """Compact metadata for model-driven skill selection; definition bodies are not auto-loaded."""
         lines = ["Available project/user skills, custom commands, and agent profiles (load only relevant definitions when needed):"]
-        for item in self.skills() + self.commands() + self.agents():
+        items = self.skills() + self.commands()
+        if include_agents:
+            items += self.agents()
+        for item in items:
             if item.disable_model_invocation:
                 continue
             lines.append(
