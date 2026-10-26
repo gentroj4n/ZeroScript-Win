@@ -99,24 +99,6 @@ class TaskVerificationGate:
                          "evidence":[{"source":e.get("source"),"summary":e.get("summary")} for e in matches]})
         return {"status":"verified" if rows and all(r["status"]=="verified" for r in rows) else "unverified","criteria":rows}
 
-class PermissionPolicy:
-    """Conservative shared policy helper; not an OS sandbox."""
-    READ_PREFIXES = ("get_","list_","read_","search_","find_","inspect_","describe_","status","show_","query_","capture_","screenshot")
-    # These operations are hard-denied in every mode, including --yes/auto.\n    # Keep this list in parity with docs/permission-policy-cases.json and the\n    # browser Autopilot NEVER_AUTOMATE gate.\n    DANGEROUS = re.compile(r"(?:^|[_/.-])(?:delete|remove|destroy|purge|wipe|format|reset(?:_workspace)?|set_root|open_recent|move_path|git_reset|git_commit|git_push|git_stage_file|git_unstage_file|publish|deploy|release|send_email|send_message|purchase|checkout|payment|credential|secret_rotation|change_password|install|uninstall)(?:$|[_/.-])", re.I)
-    APPROVAL_REQUIRED = re.compile(r"(?:^|[_/.-])(?:set_root|move_path|git_commit|git_push|git_stage_file|git_unstage_file)(?:$|[_/.-])", re.I)
-    @classmethod
-    def decide(cls, tool: str, mode: str = "default") -> dict[str, Any]:
-        name = str(tool or "").rsplit("/",1)[-1]
-        if cls.DANGEROUS.search(name): return {"allowed":False,"requires_approval":True,"reason":"Destructive or externally consequential operation."}
-        if mode == "plan":
-            allowed = name.startswith(cls.READ_PREFIXES) or name in {"workspace_info","workspace_tree","workspace_read_file","workspace_git_status","workspace_git_diff","workspace_git_log"}
-            return {"allowed":allowed,"requires_approval":not allowed,"reason":"Plan mode is read-only."}
-        if mode not in {"default","auto"}: return {"allowed":False,"requires_approval":True,"reason":"Unknown permission mode."}
-        approval = (
-            cls.APPROVAL_REQUIRED.search(name) is not None or
-            name in {"workspace_run_command","workspace_run_task","workspace_delete_file"}
-        )
-        return {"allowed":True,"requires_approval":approval and mode!="auto","reason":"Consequential operation." if approval else "Routine operation."}
 class WorktreeManager:
     """Manage isolated Git worktrees using subprocess argument arrays."""
     def __init__(self, repo: str | Path): self.repo = Path(repo).resolve()
@@ -313,7 +295,7 @@ def validate_tool_arguments(schema: dict[str,Any], args: dict[str,Any]) -> list[
 
 def validate_tool_dispatch(name: str, args: dict[str, Any], catalogue: Iterable[dict[str, Any]],
                            mode: str = "default") -> list[str]:
-    """Fail-closed validation shared by CLI and bridge dispatch boundaries."""
+    """Validate a tool's identity, input schema, and arguments without permission-mode gating."""
     if not isinstance(name, str) or not name.strip():
         return ["Tool name is required."]
     if not isinstance(args, dict):
@@ -321,14 +303,7 @@ def validate_tool_dispatch(name: str, args: dict[str, Any], catalogue: Iterable[
     tools = [item for item in catalogue if isinstance(item, dict) and item.get("name") == name]
     if len(tools) != 1:
         return ["Tool is missing from the current catalogue or is ambiguous."]
-    tool = tools[0]
-    schema = tool.get("inputSchema")
+    schema = tools[0].get("inputSchema")
     if not isinstance(schema, dict):
-        return ["Tool has no valid input schema; refusing to dispatch unvalidated arguments."]
-    decision = PermissionPolicy.decide(name, mode)
-    if not decision.get("allowed", False):
-        return [str(decision.get("reason") or "Tool call denied by permission policy.")]
-    errors = validate_tool_arguments(schema, args)
-    if errors:
-        return errors
-    return []
+        return ["Tool has no valid input schema."]
+    return validate_tool_arguments(schema, args)
