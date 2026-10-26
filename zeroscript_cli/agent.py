@@ -1601,8 +1601,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             if not goal:
                 raise RuntimeError("Provide a task description.")
             return await _direct_run(
-                bridge, provider, goal, auto_approve, args.max_turns,
-                permission_mode=permission_mode, all_tools=args.all_tools,
+                bridge, provider, goal, args.max_turns,
+                all_tools=args.all_tools,
             )
 
         workspace = bridge.initial_status.get("workspace") or {}
@@ -1715,26 +1715,6 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                             ("Model", provider.model or "(not configured)"),
                             ("Base URL", provider.base_url),
                         ])
-                elif slash == "/mode":
-                    if not argument:
-                        UI.info("Current mode: " + permission_mode + ". Choose default, plan, or auto.")
-                    elif argument.lower() not in {"default", "plan", "auto"}:
-                        UI.error("Usage: /mode default|plan|auto")
-                    elif argument.lower() == "auto" and permission_mode != "auto" and not args.yes:
-                        UI.warning("Auto mode disables CLI confirmation prompts for consequential tools.")
-                        confirmation = await UI.prompt("type 'enable auto' to confirm")
-                        if confirmation.strip().lower() == "enable auto":
-                            permission_mode = "auto"
-                            UI.success("Auto mode enabled for subsequent tasks in this terminal.")
-                        else:
-                            UI.info("Permission mode unchanged.")
-                    else:
-                        permission_mode = argument.lower()
-                        UI.success("Permission mode: " + permission_mode + (
-                            " (read-only)" if permission_mode == "plan" else
-                            " (confirmation prompts bypassed)" if permission_mode == "auto" else
-                            " (consequential actions require approval)"
-                        ))
                 elif slash == "/tools":
                     await _show_tools(
                         bridge, str(conversation_state.get("goal") or ""),
@@ -1769,8 +1749,8 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     _remaster_command("doctor", [])
                 elif slash == "/takeover":
                     await _takeover_command(
-                        bridge, provider, auto_approve, args.max_turns,
-                        permission_mode=permission_mode, all_tools=args.all_tools,
+                        bridge, provider, args.max_turns,
+                        all_tools=args.all_tools,
                     )
                     try:
                         control = (await bridge.control("control_status", timeout=12)).get("control") or {}
@@ -1789,9 +1769,6 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     await _simple_control(bridge, "return-browser")
                 elif slash == "/clear":
                     UI.clear()
-                elif slash == "/mode-plan":
-                    permission_mode = "plan"
-                    UI.success("Read-only plan mode enabled.")
                 elif slash.startswith("/"):
                     definition = skill_catalog.find_skill(slash.lstrip("/"))
                     if definition is None:
@@ -1799,16 +1776,16 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     if definition and definition.user_invocable:
                         goal = definition.render(argument)
                         await _direct_run(
-                            bridge, provider, goal, auto_approve, args.max_turns,
-                            permission_mode=permission_mode, all_tools=args.all_tools,
+                            bridge, provider, goal, args.max_turns,
+                            all_tools=args.all_tools,
                             conversation_state=conversation_state,
                         )
                     else:
                         UI.error("Unknown command: " + slash + ". Type /help, /skills, or /commands.")
                 else:
                     await _direct_run(
-                        bridge, provider, line, auto_approve, args.max_turns,
-                        permission_mode=permission_mode, all_tools=args.all_tools,
+                        bridge, provider, line, args.max_turns,
+                        all_tools=args.all_tools,
                         conversation_state=conversation_state,
                     )
             except KeyboardInterrupt:
