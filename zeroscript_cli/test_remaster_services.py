@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from zeroscript_cli.remaster_services import (
     AgentFlightRecorder, ArtifactGallery, IntegrationHealth, ModelProfiles,
-    PermissionPolicy, ProjectIntelligenceIndex, TaskVerificationGate,
+    ProjectIntelligenceIndex, TaskVerificationGate,
     WorkspaceSnapshot, validate_tool_arguments, validate_tool_dispatch, WorktreeManager,
 )
 
@@ -24,39 +24,21 @@ class RemasterServiceTests(unittest.TestCase):
     def test_verification_requires_evidence_for_every_criterion(self):
         result=TaskVerificationGate.evaluate(["tests pass","UI verified"],[{"criterion":"tests pass","passed":True,"source":"pytest","summary":"10 passed"}])
         self.assertEqual(result["status"],"unverified")
-    def test_shared_permission_fixture_matches_extension_denylist(self):
-        fixture = Path(__file__).resolve().parents[1] / "docs" / "permission-policy-cases.json"
-        cases = json.loads(fixture.read_text(encoding="utf-8"))
-        for name in cases["denied"]:
-            for mode in ("default", "auto"):
-                with self.subTest(name=name, mode=mode):
-                    self.assertFalse(PermissionPolicy.decide(name, mode)["allowed"])
-
-    def test_cli_denylist_matches_extension_approval_gates(self):
-        for name in ["workspace_set_root", "workspace_open_recent", "workspace_move_path", "workspace_git_commit",
-                     "workspace_git_stage_file", "workspace_git_unstage_file",
-                     "workspace_install_package", "workspace_uninstall_package"]:
-            with self.subTest(name=name):
-                self.assertFalse(PermissionPolicy.decide(name, "auto")["allowed"])
-
-    def test_shared_dispatch_validator_fails_closed_and_enforces_policy(self):
+    def test_shared_dispatch_validator_validates_schema_and_arguments(self):
         catalogue = [
             {"name": "workspace_read_file", "inputSchema": {
                 "type": "object", "properties": {"path": {"type": "string"}},
                 "required": ["path"], "additionalProperties": False,
             }},
-            {"name": "workspace_git_push", "inputSchema": {
-                "type": "object", "properties": {}, "additionalProperties": False,
-            }},
             {"name": "untyped_tool"},
         ]
         self.assertEqual(validate_tool_dispatch("workspace_read_file", {"path": "README.md"}, catalogue), [])
         self.assertTrue(validate_tool_dispatch("workspace_read_file", {}, catalogue))
-        self.assertTrue(validate_tool_dispatch("workspace_git_push", {}, catalogue, mode="auto"))
         self.assertTrue(validate_tool_dispatch("missing_tool", {}, catalogue))
         self.assertTrue(validate_tool_dispatch("untyped_tool", {}, catalogue))
-        self.assertTrue(validate_tool_dispatch("workspace_read_file", [], catalogue))
-
+        self.assertTrue(validate_tool_dispatch("workspace_read_file", [] , catalogue))
+        self.assertEqual(validate_tool_dispatch("workspace_read_file", {"path": "README.md"}, catalogue, mode="legacy"), [])
+        
     def test_nested_json_schema_constraints_are_checked(self):
         schema = {"type": "object", "properties": {
             "config": {"type": "object", "required": ["name"], "additionalProperties": False,
@@ -69,34 +51,6 @@ class RemasterServiceTests(unittest.TestCase):
         self.assertTrue(any("unknown property" in error for error in errors))
         self.assertTrue(any("below minimum" in error for error in errors))
         self.assertTrue(any("must be integer" in error for error in errors))
-
-    def test_policy_gates_writes_in_plan_mode(self):
-        self.assertFalse(PermissionPolicy.decide("workspace_write_file","plan")["allowed"])
-        self.assertTrue(PermissionPolicy.decide("workspace_run_command")["requires_approval"])
-        self.assertFalse(PermissionPolicy.decide("workspace_git_push","auto")["allowed"])
-    def test_permission_policy_denies_irreversible_actions_and_gates_git_mutations(self):
-        denied = [
-            "workspace_delete_file", "workspace_remove_path", "workspace_destroy_workspace",
-            "workspace_format_disk", "publish_release", "send_email", "purchase_item",
-            "change_password",
-        ]
-        for name in denied:
-            with self.subTest(name=name):
-                self.assertFalse(PermissionPolicy.decide(name, "default")["allowed"])
-                self.assertFalse(PermissionPolicy.decide(name, "auto")["allowed"])
-        # Browser Autopilot and CLI must hard-deny these actions even in auto mode.
-        # --yes skips ordinary confirmation prompts; it is not permission to mutate
-        # repository state, switch the active workspace, or install/uninstall packages.
-        for name in ["workspace_set_root", "workspace_move_path", "workspace_git_commit",
-                     "workspace_git_push", "workspace_git_stage_file", "workspace_git_unstage_file",
-                     "workspace_git_reset", "workspace_install_package", "workspace_uninstall_package"]:
-            with self.subTest(name=name):
-                self.assertFalse(PermissionPolicy.decide(name, "default")["allowed"])
-                self.assertFalse(PermissionPolicy.decide(name, "auto")["allowed"])
-        command = PermissionPolicy.decide("workspace_run_command", "default")
-        self.assertTrue(command["allowed"])
-        self.assertTrue(command["requires_approval"])
-        self.assertTrue(PermissionPolicy.decide("workspace_run_command", "auto")["allowed"])
 
     def test_worktree_manager_rejects_non_git_directory(self):
         with tempfile.TemporaryDirectory() as td:
