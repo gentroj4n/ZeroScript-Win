@@ -59,7 +59,7 @@ When a context limit is configured, the adapter estimates the request size and r
 - zeroscript stop — request a cooperative stop at the next safe checkpoint.
 - zeroscript return-browser — explicitly yield an active CLI run back to the browser agent when no tool operation is in flight.
 
-Inside the prompt, use /help for commands. Core commands include /status, /new, /sessions, /load RUN_ID, /resume RUN_ID, /continue, /compact, /model, /tools, /context, /workspace [PATH], /skills, /skill NAME [ARGS], /commands, /agents, /agent NAME TASK, /init, /takeover, /stop, /return-browser, and /quit. Plain task prompts continue the current conversation; /new resets active context without deleting saved sessions. Use /resume to recover an interrupted run. Press Ctrl+C to interrupt; the transcript is saved.
+Inside the prompt, use /help for commands. Core commands include /status, /new, /sessions, /load RUN_ID, /resume RUN_ID, /continue, /compact, /model, /tools, /context, /workspace [PATH], /skills, /skill NAME [ARGS], /commands, /agents, /agent NAME TASK, /hooks, /init, /takeover, /stop, /return-browser, and /quit. Plain task prompts continue the current conversation; /new resets active context without deleting saved sessions. Use /resume to recover an interrupted run. Press Ctrl+C to interrupt; the transcript is saved.
 
 The multiline prompt accepts Enter submits the prompt; Esc then Enter inserts a newline for multiline prompts. Prompt history is stored locally in `input-history.txt`.
 
