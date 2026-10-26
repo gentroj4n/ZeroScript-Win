@@ -357,8 +357,8 @@ class SkillCatalog:
             "server": "zeroscript-runtime",
             "description": (
                 "Delegate a distinct, well-scoped task to one local agent profile, then synthesize its findings. "
-                "This starts a bounded child model/tool loop. Available profiles:\\n"
-                + "\\n".join("- " + item.name + ": " + (item.description or "(no description)") for item in agents[:80])
+                "This starts a bounded child model/tool loop. Available profiles:\n"
+                + "\n".join("- " + item.name + ": " + (item.description or "(no description)") for item in agents[:80])
             )[:8000],
             "inputSchema": {
                 "type": "object",
