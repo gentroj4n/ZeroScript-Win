@@ -1657,11 +1657,12 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             "Interactive shortcuts:\n"
             "  /help /status /new /sessions /load RUN_ID /resume RUN_ID\n"
             "  /model [NAME] /tools [QUERY] /workspace [PATH] /compact\n"
+            "  /skills /commands /agents /skill NAME /agent NAME TASK /init\n"
             "  /takeover /stop /return-browser /quit\n\n"
             "Enter submits. Esc then Enter inserts a newline for multiline prompts."
         ),
     )
-    parser.add_argument("command_or_goal", nargs="?", help="status, takeover, resume RUN_ID, doctor, index, gallery, worktrees, snapshot, profiles, or a task description")
+    parser.add_argument("command_or_goal", nargs="?", help="status, takeover, resume RUN_ID, skills, commands, agents, skill, agent, doctor, index, gallery, worktrees, snapshot, profiles, or a task description")
     parser.add_argument("extra", nargs="*", help="Additional words in the task description or run ID")
     parser.add_argument("--version", action="version", version="ZeroScript Code " + __version__)
     parser.add_argument("--bridge-url", default=os.environ.get("ZS_BRIDGE_URL", DEFAULT_BRIDGE_URL))
