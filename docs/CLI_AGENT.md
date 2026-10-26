@@ -1,6 +1,6 @@
 # Independent ZeroScript CLI Agent
 
-ZeroScript Code is a local-first terminal coding agent. It has a styled terminal dashboard, persistent multiline input history, Markdown responses, progress indicators, saved conversations, context compaction, task-scoped tool access, and explicit permission modes. It uses a configured model API directly and reuses the existing bridge's workspace, Git, Roblox, Blender, and other MCP tool implementations. It does not read, scrape, or reuse authentication from a browser provider session.
+ZeroScript Code is a local-first terminal coding agent with a styled terminal dashboard, persistent multiline input history, Markdown responses, saved conversations, context compaction, task-scoped MCP tools, Claude-style project instructions, model-invoked skills, Markdown slash commands, and bounded subagents. It uses a configured OpenAI Chat Completions-compatible model API and reuses the existing bridge's workspace, Git, Roblox, Blender, and other MCP tool implementations. It does not read, scrape, or reuse authentication from a browser provider session.
 
 ## Requirements and setup
 
@@ -58,26 +58,30 @@ When a context limit is configured, the adapter estimates the request size and r
 - zeroscript status — show the active run, its owner, and workspace status.
 - zeroscript stop — request a cooperative stop at the next safe checkpoint.
 - zeroscript return-browser — explicitly yield an active CLI run back to the browser agent when no tool operation is in flight.
-- zeroscript --yes "Describe a task" — bypass CLI approval prompts. Use only when you intend to grant that broader autonomy.
 
-Inside the interactive prompt, use `/help` for the full command list. Core commands include `/status`, `/new`, `/sessions`, `/load RUN_ID`, `/resume RUN_ID`, `/continue`, `/compact`, `/model`, `/mode`, `/tools`, `/context`, `/workspace [PATH]`, `/takeover`, `/stop`, `/return-browser`, and `/quit`. Plain task prompts continue the same conversation in the current terminal; `/new` resets the active context without deleting saved sessions. Use `/load` to load a saved conversation, and `/resume` only to recover an interrupted run. Press Ctrl+C to interrupt a run; its transcript is saved for recovery.
+Inside the prompt, use /help for commands. Core commands include /status, /new, /sessions, /load RUN_ID, /resume RUN_ID, /continue, /compact, /model, /tools, /context, /workspace [PATH], /skills, /skill NAME [ARGS], /commands, /agents, /agent NAME TASK, /init, /takeover, /stop, /return-browser, and /quit. Plain task prompts continue the current conversation; /new resets active context without deleting saved sessions. Use /resume to recover an interrupted run. Press Ctrl+C to interrupt; the transcript is saved.
 
 The multiline prompt accepts Enter submits the prompt; Esc then Enter inserts a newline for multiline prompts. Prompt history is stored locally in `input-history.txt`.
 
-## Terminal UI, sessions, and permissions
+## Terminal UI, sessions, skills, and agents
 
 The interactive interface uses Rich for the dashboard, tables, Markdown rendering, tool panels, and progress indicators; prompt-toolkit provides multiline editing, persistent input history, and slash-command completion. The UI falls back to standard console output if these packages are unavailable.
 
 Each run saves its transcript below `%USERPROFILE%\\.zeroscript-win\\sessions` (unless `ZS_CLI_HOME` changes it). Transcripts may include project snippets, prompts, model replies, and tool output, but the API key is not included. `/sessions` shows recent saved runs, `/load RUN_ID` restores a saved conversation into the current prompt context, and `/compact` asks the configured model to create a carry-forward summary when history grows large. The current conversation persists while the terminal stays open; start a new one with `/new`.
 
-Permission modes:
+### Project instructions, skills, and commands
 
-- `default`: ordinary workspace edits can proceed; command/task execution and allowed consequential operations require confirmation. The hard-deny list is blocked without exception.
-- `plan`: the model only receives read-only tools, and the executor independently rejects any attempted non-read-only call.
-- `auto`: bypasses confirmation prompts for otherwise allowed operations, but cannot override the hard-deny list. Enabling auto mode does not authorize destructive filesystem operations, Git state changes, workspace switching/moves, package installation, publishing/deployment, external communications, purchases, or credential/security changes. The interactive prompt asks for confirmation before switching into this mode.
+Project instructions load from CLAUDE.md, AGENTS.md, ZEROSCRIPT.md, and .zeroscript/rules.md. User-wide instruction files are also supported at ~/.claude/CLAUDE.md and ~/.zeroscript-win/CLAUDE.md. Path-scoped Markdown rules under .claude/rules/ and .zeroscript/rules/ can use a paths frontmatter field, for example paths: [**/*.ts, **/*.tsx]. A path-scoped rule is included when the current task names a matching path.
 
-The tool catalogue is scoped to the current task to reduce unrelated schemas and improve tool calling with smaller local models. `/tools QUERY` searches the full bridge catalogue; `--all-tools` deliberately exposes the whole catalogue to the model. You can also start in a mode with `--mode plan` or `--mode auto`.
+Skills use .claude/skills/<name>/SKILL.md, .zeroscript/skills/<name>/SKILL.md, ~/.claude/skills/, or ~/.zeroscript-win/skills/. Custom slash commands use .claude/commands/<name>.md or .zeroscript/commands/<name>.md, with matching user-level folders. Definitions may provide name, description, argument-hint, user-invocable, and disable-model-invocation frontmatter. Skill and command bodies support $ARGUMENTS, $ARGS, and positional placeholders $1 through $9.
 
+Invoke a skill manually with /skill NAME [ARGS] or zeroscript skill NAME [ARGS]. Skills not marked disable-model-invocation: true are exposed through a local runtime tool so the model can load complete instructions on demand. Supporting files beside SKILL.md are listed for selective reading instead of being dumped wholesale into context.
+
+### Agent profiles and delegation
+
+Agent profiles are Markdown files under .claude/agents/, .zeroscript/agents/, ~/.claude/agents/, or ~/.zeroscript-win/agents/. Frontmatter supports name, description, tools, model, max-turns, and disable-model-invocation. Run a profile directly with /agent NAME TASK or zeroscript agent NAME TASK. When profiles are available, the model can delegate bounded subtasks through zeroscript_run_subagent; child runs have separate conversation context, a maximum of 20 turns by profile, and cannot recursively spawn more subagents.
+
+The bridge tool catalogue remains task-scoped to reduce unrelated schemas and improve tool calling with smaller local models. /tools QUERY searches the full bridge catalogue; --all-tools exposes the entire non-internal catalogue.
 For a local Ollama OpenAI-compatible endpoint, a typical Windows CMD setup is:
 
     set ZS_MODEL_BASE_URL=http://127.0.0.1:11434/v1
@@ -102,11 +106,11 @@ The CLI uses an explicit arm/disarm handshake. If no configured CLI is waiting, 
 
 The bridge keeps a single active owner. A claim is rejected while a browser tool call is still in flight. An active CLI lease is renewed with heartbeats; if the CLI process disappears without recording a result, the bridge marks the run interrupted after the six-minute stale-lease threshold. This is longer than the CLI's bounded tool-call timeout, reducing the chance of giving control back while a long-running tool is still executing. The saved transcript can then be resumed.
 
-## Execution and approvals
+## Tool execution and runtime boundaries
 
-The CLI uses the same workspace and MCP tool implementations as the bridge; it does not implement a parallel filesystem or Roblox/Blender backend. File reads, ordinary workspace edits, source searches, and inspection tools are available to the model. The default approval policy requests confirmation before command/task execution, applying broad replacements, and non-read-only Roblox/Blender or other MCP operations.
+The CLI uses the same workspace and MCP tool implementations as the bridge; it does not implement a parallel filesystem or Roblox/Blender backend. The CLI itself does not add a permission-mode or confirmation-prompt layer over tool calls. Actual tool availability and path constraints come from the bridge and tool implementations.
 
-The CLI is an autonomous software agent, not an OS sandbox. Existing path protections are still in force for workspace-scoped tools, but arbitrary native processes may access more than the selected folder. Select trusted workspaces, review tool approval prompts, and keep the bridge bound to loopback. A shared hard-deny fixture is tested by both the CLI and browser Autopilot policies. Destructive filesystem operations, Git state changes (including stage/unstage/commit/push/reset), workspace switching/moves, package install/uninstall, publishing/deployment, external communication, purchases, and credential/security changes are blocked in automated dispatch, including auto mode. The --yes option only bypasses ordinary confirmation prompts; it does not override this denylist.
+The CLI is an autonomous software agent, not an OS sandbox. Workspace tools apply their own path checks, but arbitrary native processes may access more than the selected folder. Use trusted workspaces and keep the bridge bound to loopback. Skills, agent profiles, project instructions, and tool results are local project context, not instructions that override the user's request.
 
 ## Current limitations
 
