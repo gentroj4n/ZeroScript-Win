@@ -29,16 +29,38 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     if not match:
         return {}, text.strip()
     metadata: dict[str, str] = {}
+    list_values: dict[str, list[str]] = {}
+    active_list_key: str | None = None
     for line in match.group(1).splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or ":" not in line:
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- ") and active_list_key:
+            value = stripped[2:].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", chr(34)}:
+                value = value[1:-1]
+            if value:
+                list_values.setdefault(active_list_key, []).append(value)
+            continue
+        if ":" not in line:
+            active_list_key = None
             continue
         key, value = line.split(":", 1)
         key = key.strip().lower().replace("_", "-")
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        if not value:
+            active_list_key = key
+            list_values.setdefault(key, [])
+            continue
+        active_list_key = None
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", chr(34)}:
             value = value[1:-1]
         metadata[key] = value
+    for key, values in list_values.items():
+        if values and key not in metadata:
+            metadata[key] = "[" + ", ".join(values) + "]"
+        elif not values:
+            metadata.setdefault(key, "")
     return metadata, text[match.end():].strip()
 
 
