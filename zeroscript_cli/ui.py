@@ -38,7 +38,7 @@ except ImportError:
 COMMANDS = [
     "/help", "/status", "/new", "/sessions", "/load", "/resume", "/continue",
     "/compact", "/clear", "/model", "/mode", "/tools", "/context", "/workspace", "/takeover",
-    "/stop", "/return-browser", "/quit",
+    "/skills", "/skill", "/commands", "/init", "/doctor", "/stop", "/return-browser", "/quit",
 ]
 
 
@@ -100,6 +100,17 @@ class TerminalUI:
     @property
     def rich_enabled(self) -> bool:
         return self.console is not None
+
+    def set_commands(self, commands: Iterable[str]) -> None:
+        """Update slash-command completion after project skills/commands are discovered."""
+        if not _PROMPT_TOOLKIT or self._session is None:
+            return
+        words = sorted({item for item in list(COMMANDS) + list(commands) if isinstance(item, str) and item.startswith("/")})
+        try:
+            self._session.completer = FuzzyCompleter(WordCompleter(words, sentence=True, match_middle=True))
+        except Exception:
+            # Completion is optional; the command dispatcher remains authoritative.
+            pass
 
     def print(self, message: Any = "", style: Optional[str] = None) -> None:
         if self.console:
@@ -240,6 +251,11 @@ class TerminalUI:
             ("/continue [message]", "Continue the current conversation"),
             ("/compact", "Ask the configured model to condense long conversation context"),
             ("/context", "Show active conversation and workspace context"),
+            ("/skills [QUERY]", "List project and user skills"),
+            ("/skill NAME [ARGS]", "Run a skill with optional arguments"),
+            ("/commands [QUERY]", "List custom Markdown slash commands"),
+            ("/init", "Create a starter CLAUDE.md in the selected project"),
+            ("/doctor", "Check local CLI and bridge prerequisites"),
             ("/workspace [PATH]", "Inspect or select the project workspace"),
             ("/model [NAME]", "Show or change the configured model name"),
             ("/mode default|plan|auto", "Choose normal, read-only planning, or explicitly autonomous permissions"),
