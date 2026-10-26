@@ -1079,18 +1079,6 @@ class IndependentAgent:
 
     async def run(self, resume_messages: Optional[List[Dict[str, Any]]] = None) -> str:
         self.messages = list(resume_messages) if resume_messages else self._build_messages()
-        hook_base = {
-            "session_id": self.session_id,
-            "run_id": self.run_id,
-            "cwd": str(self.run_record.get("workspace") or ""),
-            "source": "cli",
-        }
-        startup_context = await self._run_hooks("SessionStart", dict(hook_base))
-        prompt = str(next((item.get("content") for item in reversed(self.messages)
-                           if item.get("role") == "user" and isinstance(item.get("content"), str)), ""))
-        prompt_context = await self._run_hooks("UserPromptSubmit", {**hook_base, "prompt": prompt[:12000]})
-        self._append_hook_context(self.messages, "SessionStart", startup_context)
-        self._append_hook_context(self.messages, "UserPromptSubmit", prompt_context)
         if self.messages and self.messages[0].get("role") == "system":
             # Refresh project instructions and skills in loaded conversations.
             self.messages[0] = {"role": "system", "content": self._build_system_prompt()}
@@ -1112,6 +1100,21 @@ class IndependentAgent:
             # browser blocked until the stale-lease timeout.
             _write_session(self.run_id, session)
             self.heartbeat_task = asyncio.create_task(self._heartbeat())
+            hook_base = {
+                "session_id": self.session_id,
+                "run_id": self.run_id,
+                "cwd": str(self.run_record.get("workspace") or ""),
+                "source": "cli",
+            }
+            startup_context = await self._run_hooks("SessionStart", dict(hook_base))
+            prompt = str(next((item.get("content") for item in reversed(self.messages)
+                               if item.get("role") == "user" and isinstance(item.get("content"), str)), ""))
+            prompt_context = await self._run_hooks("UserPromptSubmit", {**hook_base, "prompt": prompt[:12000]})
+            self._append_hook_context(self.messages, "SessionStart", startup_context)
+            self._append_hook_context(self.messages, "UserPromptSubmit", prompt_context)
+            session["messages"] = self.messages
+            session["updated_at"] = time.time()
+            _write_session(self.run_id, session)
             catalogue = await self.bridge.list_tools()
             skill_tool = self.skill_catalog.model_tool()
             if skill_tool:
