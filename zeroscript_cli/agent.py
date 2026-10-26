@@ -1662,7 +1662,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             "Interactive shortcuts:\n"
             "  /help /status /new /sessions /load RUN_ID /resume RUN_ID\n"
             "  /model [NAME] /tools [QUERY] /workspace [PATH] /compact\n"
-            "  /skills /commands /agents /skill NAME /agent NAME TASK /init\n"
+            "  /skills /commands /agents /skill NAME /agent NAME TASK /reload /init\n"
             "  /takeover /stop /return-browser /quit\n\n"
             "Enter submits. Esc then Enter inserts a newline for multiline prompts."
         ),
@@ -1713,6 +1713,13 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             return 0
         if command == "agents":
             _show_definitions(skill_catalog, "agent", " ".join(extra))
+            return 0
+        if command == "reload":
+            skill_catalog.skills(refresh=True)
+            skill_catalog.commands(refresh=True)
+            skill_catalog.agents(refresh=True)
+            UI.set_commands(_available_slash_commands(skill_catalog))
+            UI.success("Reloaded skills, custom commands, and agent profiles.")
             return 0
         if command == "agent":
             if not extra:
@@ -1898,6 +1905,12 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     _show_definitions(skill_catalog, "command", argument)
                 elif slash == "/agents":
                     _show_definitions(skill_catalog, "agent", argument)
+                elif slash == "/reload":
+                    skill_catalog.skills(refresh=True)
+                    skill_catalog.commands(refresh=True)
+                    skill_catalog.agents(refresh=True)
+                    UI.set_commands(_available_slash_commands(skill_catalog))
+                    UI.success("Reloaded skills, custom commands, and agent profiles.")
                 elif slash == "/agent":
                     agent_name, _, agent_task = argument.partition(" ")
                     if not agent_name:
