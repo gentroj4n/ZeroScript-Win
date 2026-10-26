@@ -96,6 +96,19 @@ class CLIAgentUnitTests(unittest.TestCase):
         self.assertTrue(all("/" not in item["function"]["name"] for item in tools))
         self.assertNotIn("zeroscript_handoff_to_cli", aliases)
 
+    def test_runtime_skill_loader_is_available_to_model_tool_loop(self):
+        catalogue = [
+            {"name": "workspace_info", "server": "workspace", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "zeroscript_load_skill", "server": "zeroscript-runtime", "description": "Load relevant skill instructions",
+             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+            {"name": "zeroscript_handoff_to_cli", "server": "zeroscript-control", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        selected = _select_tools_for_task(catalogue, "fix a Python module")
+        self.assertIn("zeroscript_load_skill", {item["name"] for item in selected})
+        api_tools, aliases = _tool_aliases(selected)
+        self.assertIn("zeroscript_load_skill", aliases)
+        self.assertTrue(any(item["function"]["name"] == "zeroscript_load_skill" for item in api_tools))
+        self.assertNotIn("zeroscript_handoff_to_cli", aliases)
     def test_missing_tool_schemas_normalize_to_empty_arguments(self):
         catalogue = [
             {"name": "workspace_unknown", "server": "workspace", "description": "Undeclared schema"},
