@@ -118,7 +118,7 @@ class HookRunner:
             ])
         return paths
 
-    def specs(self, event: str, match_value: str = "") -> list[HookSpec]:
+    def specs(self, event: str, match_value: str | None = None) -> list[HookSpec]:
         if event not in HOOK_EVENTS:
             return []
         found: list[HookSpec] = []
@@ -132,7 +132,7 @@ class HookRunner:
                 if matcher is not None and not isinstance(matcher, str):
                     continue
                 matcher = matcher or ""
-                if matcher:
+                if matcher and match_value is not None:
                     try:
                         if re.search(matcher, match_value) is None:
                             continue
