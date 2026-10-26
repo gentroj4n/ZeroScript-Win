@@ -109,6 +109,19 @@ class CLIAgentUnitTests(unittest.TestCase):
         self.assertIn("zeroscript_load_skill", aliases)
         self.assertTrue(any(item["function"]["name"] == "zeroscript_load_skill" for item in api_tools))
         self.assertNotIn("zeroscript_handoff_to_cli", aliases)
+    def test_runtime_subagent_tool_is_available_when_agent_profiles_exist(self):
+        catalogue = [
+            {"name": "workspace_info", "server": "workspace", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "zeroscript_run_subagent", "server": "zeroscript-runtime", "description": "Delegate to a local agent profile",
+             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "task": {"type": "string"}}, "required": ["name", "task"]}},
+            {"name": "zeroscript_handoff_to_cli", "server": "zeroscript-control", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        selected = _select_tools_for_task(catalogue, "investigate a Python bug")
+        self.assertIn("zeroscript_run_subagent", {item["name"] for item in selected})
+        api_tools, aliases = _tool_aliases(selected)
+        self.assertIn("zeroscript_run_subagent", aliases)
+        self.assertTrue(any(item["function"]["name"] == "zeroscript_run_subagent" for item in api_tools))
+        self.assertNotIn("zeroscript_handoff_to_cli", aliases)
     def test_missing_tool_schemas_normalize_to_empty_arguments(self):
         catalogue = [
             {"name": "workspace_unknown", "server": "workspace", "description": "Undeclared schema"},
