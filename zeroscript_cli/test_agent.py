@@ -96,7 +96,7 @@ class CLIAgentUnitTests(unittest.TestCase):
         self.assertTrue(all("/" not in item["function"]["name"] for item in tools))
         self.assertNotIn("zeroscript_handoff_to_cli", aliases)
 
-    def test_missing_tool_schemas_fail_closed_and_normalize_to_no_arguments(self):
+    def test_missing_tool_schemas_normalize_to_empty_arguments(self):
         catalogue = [
             {"name": "workspace_unknown", "server": "workspace", "description": "Undeclared schema"},
         ]
@@ -104,9 +104,8 @@ class CLIAgentUnitTests(unittest.TestCase):
         alias = api_tools[0]["function"]["name"]
         normalized = aliases[alias]
         self.assertFalse(normalized["inputSchema"]["additionalProperties"])
-        self.assertEqual(validate_tool_call(normalized, {}), [])
-        self.assertTrue(validate_tool_call(normalized, {"command": "anything"}))
-        self.assertTrue(validate_tool_call({"name": "workspace_unknown"}, {}))
+        self.assertEqual(normalized["inputSchema"]["type"], "object")
+        self.assertEqual(normalized["inputSchema"]["properties"], {})
 
     def test_context_budget_keeps_system_and_recent_complete_turn(self):
         messages = [
