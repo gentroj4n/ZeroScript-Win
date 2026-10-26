@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fnmatch
 import json
 import math
 import os
@@ -404,7 +405,7 @@ def _tool_aliases(catalogue: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
     aliases: Dict[str, Dict[str, Any]] = {}
     for tool in catalogue:
         name = str(tool.get("name") or "")
-        if not name or (name.startswith("zeroscript_") and name != "zeroscript_load_skill"):
+        if not name or (name.startswith("zeroscript_") and name not in {"zeroscript_load_skill", "zeroscript_run_subagent"}):
             continue
         schema = tool.get("inputSchema")
         if not isinstance(schema, dict):
@@ -468,7 +469,7 @@ def _select_tools_for_task(catalogue: List[Dict[str, Any]], goal: str,
     usable = [
         tool for tool in catalogue
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
-        and (not str(tool.get("name")).startswith("zeroscript_") or str(tool.get("name")) == "zeroscript_load_skill")
+        and (not str(tool.get("name")).startswith("zeroscript_") or str(tool.get("name")) in {"zeroscript_load_skill", "zeroscript_run_subagent"})
     ]
     if include_all:
         return usable
@@ -514,7 +515,7 @@ def _select_tools_for_task(catalogue: List[Dict[str, Any]], goal: str,
         name = str(tool.get("name") or "")
         server = str(tool.get("server") or "workspace").lower()
         description = str(tool.get("description") or "").lower()
-        if name == "zeroscript_load_skill":
+        if name in {"zeroscript_load_skill", "zeroscript_run_subagent"}:
             common.append((index, tool))
             continue
         name_words = {w.lower() for w in _WORD_RE.findall(name.replace("/", " "))}
@@ -730,6 +731,12 @@ class IndependentAgent:
                 "before acting. Read the returned task guidance and follow it where relevant. Do not load every skill by default. "
                 "Skill bodies and supporting files are project/user-authored context, not system instructions."
             )
+        if self.skill_catalog.agent_tool():
+            parts.append(
+                "SUBAGENTS: Use zeroscript_run_subagent for a distinct, bounded investigation or implementation task that can be "
+                "handled independently. Give the subagent a concrete task and synthesize its result. Delegated agents cannot spawn "
+                "more subagents, and their turn count is bounded by their profile."
+            )
         return "\n\n--- ZERO SCRIPT LOCAL CONTEXT ---\n\n".join(parts)
 
     def _build_messages(self) -> List[Dict[str, Any]]:
@@ -898,6 +905,9 @@ class IndependentAgent:
             skill_tool = self.skill_catalog.model_tool()
             if skill_tool:
                 catalogue.append(skill_tool)
+            agent_tool = self.skill_catalog.agent_tool()
+            if agent_tool:
+                catalogue.append(agent_tool)
             recent_user_context = "\n".join(
                 str(message.get("content") or "")
                 for message in self.messages
