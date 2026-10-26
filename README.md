@@ -8,7 +8,7 @@ ArcScript is a GPL-3.0-or-later, local-first, VS Code-inspired development envir
 
 The extension preserves the existing browser-provider integrations and Roblox Studio capabilities. General project editing and Roblox Studio automation are separate domains: the local workspace layer works with Studio closed, while live Roblox tools use the explicit `roblox/` namespace.
 
-**Current extension development version: 1.13.1.** The independent CLI package is version 1.14.0. Includes the remastered ZeroScript Code terminal experience alongside the existing browser-provider and Roblox Studio workflows. The CLI has persistent sessions, task-scoped MCP tools, skills, custom slash commands, agent profiles, bounded subagent delegation, session recovery, and a Rich terminal UI.
+**Current extension development version: 1.13.1.** The independent CLI package is version 1.15.0. Includes the remastered ZeroScript Code terminal experience alongside the existing browser-provider and Roblox Studio workflows. The CLI has persistent sessions, task-scoped MCP tools, bundled and custom skills, custom slash commands, agent profiles, bounded subagent delegation, session recovery, and a Rich terminal UI.
 
 ## Independent CLI coding agent
 
@@ -23,7 +23,7 @@ From the repository root, start `start.bat` for the bridge, then configure the m
     set ZS_MODEL_API_KEY=ollama
     zeroscript.bat
 
-Use `/help` inside the prompt. Session commands include `/sessions`, `/load RUN_ID`, `/resume RUN_ID`, `/new`, and `/compact`. Skills live at `.claude/skills/<name>/SKILL.md` (or compatible `.zeroscript/skills` and user-level folders); invoke them with `/skill NAME [ARGS]`. Custom Markdown slash commands live in `.claude/commands/`. Agent profiles live in `.claude/agents/`; list them with `/agents`, run them with `/agent NAME TASK`, and the model can delegate bounded subtasks automatically. Project instructions load from `CLAUDE.md`, `AGENTS.md`, `ZEROSCRIPT.md`, and path-scoped `.claude/rules/*.md`. The browser and CLI remain separate runtimes: `/takeover` arms the CLI and waits for the browser agent to call `zeroscript_handoff_to_cli`.
+Use `/help` inside the prompt. Session commands include `/sessions`, `/load RUN_ID`, `/resume RUN_ID`, `/new`, and `/compact`. Bundled skills work immediately: `/code-review`, `/debugging`, `/test-and-verify`, `/exploration`, `/refactor`, and `/docs`; use `/skills` to list them and `/reload` after changing definitions. Project/user skills live at `.claude/skills/<name>/SKILL.md` (or compatible `.zeroscript/skills` and user-level folders). Custom Markdown commands live in `.claude/commands/`. Bundled agent profiles include `explorer`, `reviewer`, `test-runner`, `implementer`, `documenter`, and `planner`; custom profiles live in `.claude/agents/`. List profiles with `/agents`, run one with `/agent NAME TASK`, or let the model delegate bounded subtasks. Project instructions load from `CLAUDE.md`, `AGENTS.md`, `ZEROSCRIPT.md`, and path-scoped `.claude/rules/*.md`. The browser and CLI remain separate runtimes: `/takeover` arms the CLI and waits for the browser agent to call `zeroscript_handoff_to_cli`.
 
 See [docs/CLI_AGENT.md](docs/CLI_AGENT.md) for setup, skills, agent profiles, privacy, and runtime limitations.
 
