@@ -32,7 +32,7 @@ class HookRunnerTests(unittest.TestCase):
 
     def test_discovers_user_and_project_hooks_with_regex_matchers(self):
         self.write_settings(self.home, ".claude/settings.json", {
-            "hooks": {"PreToolUse": [{"matcher": "workspace_.*", "hooks": [{"type": "command", "command": "echo user-hook"}]}]}
+            "hooks": {"PreToolUse": [{"matcher": "workspace_read_file|workspace_info", "hooks": [{"type": "command", "command": "echo user-hook"}]}]}
         })
         self.write_settings(self.project, ".claude/settings.json", {
             "hooks": {"PreToolUse": [{"matcher": "workspace_read_file", "hooks": [{"type": "command", "command": "echo project-hook"}]}]}
