@@ -974,13 +974,16 @@ class IndependentAgent:
                 if not calls:
                     answer = str(message.get("content") or "").strip()
                     return answer or "Subagent completed without a text summary."
-                for index, call in enumerate(calls[:20], start=1):
+                for index, call in enumerate(calls, start=1):
                     function = call.get("function") or {}
                     alias = str(function.get("name") or "")
                     call_id = str(call.get("id") or ("subagent-tool-" + str(turn) + "-" + str(index)))
-                    result_text = await self._execute_tool(alias, function.get("arguments", "{}"))
+                    if index > 20:
+                        result_text = "Subagent tool-call batch exceeded the 20-call limit; this tool was not executed."
+                    else:
+                        result_text = await self._execute_tool(alias, function.get("arguments", "{}"))
                     child_messages.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
-                    if self._last_tool_images and self.provider.supports_vision:
+                    if index <= 20 and self._last_tool_images and self.provider.supports_vision:
                         image_content: List[Dict[str, Any]] = [
                             {"type": "text", "text": "Inspect the image attachment(s) returned by the delegated tool. Use only visible evidence."}
                         ]
