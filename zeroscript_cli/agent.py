@@ -1504,7 +1504,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         epilog=(
             "Interactive shortcuts:\n"
             "  /help /status /new /sessions /load RUN_ID /resume RUN_ID\n"
-            "  /model [NAME] /mode default|plan|auto /tools [QUERY] /workspace [PATH] /compact\n"
+            "  /model [NAME] /tools [QUERY] /workspace [PATH] /compact\n"
             "  /takeover /stop /return-browser /quit\n\n"
             "Enter submits. Esc then Enter inserts a newline for multiline prompts."
         ),
