@@ -151,7 +151,20 @@ class HookRunner:
         match_value = str(data.get("tool_name") or data.get("prompt") or data.get("source") or "")
         specs = self.specs(event, match_value)
         results: list[HookResult] = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + min(self.timeout * 2, 30.0)
         for spec in specs:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                results.append(HookResult(
+                    event=event,
+                    command="(remaining hooks skipped)",
+                    settings_path="",
+                    returncode=None,
+                    stderr="Event-wide hook time budget exhausted.",
+                    timed_out=True,
+                ))
+                break
             env = os.environ.copy()
             env.update({
                 "ZS_HOOK_EVENT": event,
@@ -176,7 +189,7 @@ class HookRunner:
                 try:
                     stdout, stderr = await asyncio.wait_for(
                         process.communicate(json.dumps(data, ensure_ascii=False).encode("utf-8")),
-                        timeout=self.timeout,
+                        timeout=min(self.timeout, remaining),
                     )
                 except asyncio.TimeoutError:
                     timed_out = True
