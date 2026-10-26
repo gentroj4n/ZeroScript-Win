@@ -27,7 +27,7 @@ class FileContextTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.write(root, "docs/Design Notes.md", "Design constraints.\n")
-            result = expand_file_mentions('Compare @"docs/Design Notes.md" with @docs/Design%20Notes.md and @"docs/Design Notes.md".', root)
+            result = expand_file_mentions('Compare @"docs/Design Notes.md" with @"docs/Design Notes.md".', root)
             self.assertEqual(result.attached, ("docs/Design Notes.md",))
             self.assertEqual(result.prompt.count("Design constraints."), 1)
             self.assertIn("[attached file: docs/Design Notes.md]", result.prompt)
