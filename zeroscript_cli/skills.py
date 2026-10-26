@@ -94,6 +94,8 @@ class Definition:
     disable_model_invocation: bool = False
     argument_hint: str = ""
     allowed_tools: tuple[str, ...] = ()
+    model: str = ""
+    max_turns: int = 8
 
     def render(self, arguments: str = "") -> str:
         """Expand supported argument placeholders; never evaluate definition content."""
@@ -121,6 +123,7 @@ class SkillCatalog:
         self.home = Path(home).expanduser() if home else Path.home()
         self._skills: list[Definition] = []
         self._commands: list[Definition] = []
+        self._agents: list[Definition] = []
 
     def _roots(self, category: str) -> list[tuple[Path, str]]:
         project, user = [], []
@@ -135,7 +138,7 @@ class SkillCatalog:
         ]
         return project + user
 
-    def _scan(self, category: str, *, skill: bool) -> list[Definition]:
+    def _scan(self, category: str, *, skill: bool, kind: str = "") -> list[Definition]:
         found: dict[str, Definition] = {}
         seen = 0
         for folder, source in self._roots(category):
@@ -176,11 +179,13 @@ class SkillCatalog:
                         body=body,
                         path=file,
                         source=source,
-                        kind="skill" if skill else "custom command",
+                        kind=kind or ("skill" if skill else "custom command"),
                         user_invocable=_truth(metadata.get("user-invocable"), True),
                         disable_model_invocation=_truth(metadata.get("disable-model-invocation"), False),
                         argument_hint=metadata.get("argument-hint", "")[:120],
-                        allowed_tools=_metadata_list(metadata.get("allowed-tools")),
+                        allowed_tools=_metadata_list(metadata.get("allowed-tools") or metadata.get("tools")),
+                        model=metadata.get("model", "")[:80],
+                        max_turns=max(1, min(20, int(metadata.get("max-turns", "8")))) if metadata.get("max-turns", "8").isdigit() else 8,
                     )
             except (OSError, ValueError, RuntimeError):
                 continue
@@ -203,6 +208,15 @@ class SkillCatalog:
     def find_command(self, name: str) -> Definition | None:
         needle = name.strip().lstrip("/").casefold()
         return next((item for item in self.commands() if item.name.casefold() == needle), None)
+
+    def agents(self, *, refresh: bool = False) -> list[Definition]:
+        if refresh or not self._agents:
+            self._agents = self._scan("agents", skill=False, kind="agent profile")
+        return list(self._agents)
+
+    def find_agent(self, name: str) -> Definition | None:
+        needle = name.strip().lstrip("/").casefold()
+        return next((item for item in self.agents() if item.name.casefold() == needle), None)
 
     def instructions(self) -> list[tuple[str, str]]:
         """Load repository guidance files, bounded by a combined character budget."""
@@ -228,8 +242,8 @@ class SkillCatalog:
 
     def catalog_prompt(self, *, limit_chars: int = 8000) -> str:
         """Compact metadata for model-driven skill selection; definition bodies are not auto-loaded."""
-        lines = ["Available project/user skills and custom commands (load only the relevant definition when needed):"]
-        for item in self.skills() + self.commands():
+        lines = ["Available project/user skills, custom commands, and agent profiles (load only relevant definitions when needed):"]
+        for item in self.skills() + self.commands() + self.agents():
             if item.disable_model_invocation:
                 continue
             lines.append(
@@ -242,6 +256,30 @@ class SkillCatalog:
         if len(result) > limit_chars:
             result = result[:limit_chars].rsplit("\n", 1)[0] + "\n- (catalog truncated)"
         return result
+    def agent_tool(self) -> dict[str, object] | None:
+        """Return a synthetic runtime tool for a bounded delegated agent run."""
+        agents = [item for item in self.agents() if not item.disable_model_invocation]
+        if not agents:
+            return None
+        return {
+            "name": "zeroscript_run_subagent",
+            "server": "zeroscript-runtime",
+            "description": (
+                "Delegate a distinct, well-scoped task to one local agent profile, then synthesize its findings. "
+                "This starts a bounded child model/tool loop. Available profiles:\\n"
+                + "\\n".join("- " + item.name + ": " + (item.description or "(no description)") for item in agents[:80])
+            )[:8000],
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": [item.name for item in agents[:_MAX_ITEMS]]},
+                    "task": {"type": "string", "minLength": 1, "maxLength": 8000},
+                },
+                "required": ["name", "task"],
+                "additionalProperties": False,
+            },
+        }
+
     def model_tool(self) -> dict[str, object] | None:
         """Return a synthetic function tool that lets the model explicitly load a skill."""
         skills = [item for item in self.skills() if not item.disable_model_invocation]
