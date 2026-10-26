@@ -2,19 +2,19 @@
 
 ## Remaster reliability utilities
 
-The CLI now exposes local diagnostics and project utilities: `zeroscript doctor`, `zeroscript index [PATH]`, `zeroscript gallery [PATH]`, `zeroscript worktrees [PATH]`, `zeroscript snapshot PATH FILE...`, and `zeroscript snapshot restore SNAPSHOT_DIR [ROOT] [--overwrite]`, `zeroscript profiles`, `zeroscript profiles set NAME BASE_URL MODEL`, `zeroscript --profile NAME`, `zeroscript events RUN_ID`, `zeroscript verify CRITERIA.json EVIDENCE.json`, `zeroscript worktrees create NAME [REPO_PATH] [BASE]`, and `zeroscript visual-diff BASELINE ACTUAL [THRESHOLD]`. Run `python -m unittest zeroscript_cli.test_remaster_services -v` to test the reliability primitives. These utilities do not require a model request; `doctor` reports bridge and local Ollama reachability. CLI tool dispatch validates MCP arguments and hard-denies irreversible or repository-state mutations in every permission mode; ordinary command execution remains confirmation-gated unless auto mode is explicitly enabled. Browser Autopilot applies its own role-aware policy against the same denylist fixture. Saved model profiles support vision input and approximate context-window limits. Autopilot chooses among dependency-ready tasks by bounded priority.
+The CLI now exposes local diagnostics and project utilities: `zeroscript doctor`, `zeroscript index [PATH]`, `zeroscript gallery [PATH]`, `zeroscript worktrees [PATH]`, `zeroscript snapshot PATH FILE...`, and `zeroscript snapshot restore SNAPSHOT_DIR [ROOT] [--overwrite]`, `zeroscript profiles`, `zeroscript profiles set NAME BASE_URL MODEL`, `zeroscript --profile NAME`, `zeroscript events RUN_ID`, `zeroscript verify CRITERIA.json EVIDENCE.json`, `zeroscript worktrees create NAME [REPO_PATH] [BASE]`, and `zeroscript visual-diff BASELINE ACTUAL [THRESHOLD]`. Run `python -m unittest zeroscript_cli.test_remaster_services -v` to test the reliability primitives. These utilities do not require a model request; `doctor` reports bridge and local Ollama reachability. CLI dispatch validates tool argument schemas, while permission-mode and approval-prompt UI have been removed from the CLI. Browser Autopilot retains its separate role-aware policy. Saved model profiles support vision input and approximate context-window limits. Autopilot chooses among dependency-ready tasks by bounded priority.
 
 ArcScript is a GPL-3.0-or-later, local-first, VS Code-inspired development environment powered through supported AI chat sites.
 
 The extension preserves the existing browser-provider integrations and Roblox Studio capabilities. General project editing and Roblox Studio automation are separate domains: the local workspace layer works with Studio closed, while live Roblox tools use the explicit `roblox/` namespace.
 
-**Current extension development version: 1.13.1.** The independent CLI package is version 1.14.0. Includes the remastered ZeroScript Code terminal experience alongside the existing browser-provider and Roblox Studio workflows. The CLI now has a persistent multi-turn session, task-scoped tools, permission modes, session recovery, and a Rich terminal UI.
+**Current extension development version: 1.13.1.** The independent CLI package is version 1.14.0. Includes the remastered ZeroScript Code terminal experience alongside the existing browser-provider and Roblox Studio workflows. The CLI has persistent sessions, task-scoped MCP tools, skills, custom slash commands, agent profiles, bounded subagent delegation, session recovery, and a Rich terminal UI.
 
 ## Independent CLI coding agent
 
 ZeroScript Code is an independent terminal coding runtime for local-first development. It reuses the existing workspace/Git/Roblox/Blender/MCP bridge while driving the model directly from the terminal instead of relying on a browser chat for every next step.
 
-Features include a polished terminal dashboard, multiline prompt editor with history and completion, Markdown-rendered answers, model/tool progress indicators, persistent multi-turn conversations, local session browsing/loading, context compaction, task-scoped tool schemas, read-only planning mode, and explicit approval modes. The Windows `zeroscript.bat` wrapper bootstraps the CLI's terminal UI dependencies. An Ollama-compatible endpoint can run on loopback without a hosted per-token API.
+Features include a polished terminal dashboard, multiline prompt editor with history and completion, Markdown-rendered answers, model/tool progress indicators, persistent multi-turn conversations, local session browsing/loading, context compaction, task-scoped MCP tools, Claude-style project instructions and path-scoped rules, model-invoked skills, custom Markdown slash commands, agent profiles, and bounded subagent delegation. The Windows `zeroscript.bat` wrapper bootstraps the CLI's terminal UI dependencies. An Ollama-compatible endpoint can run on loopback without a hosted per-token API.
 
 From the repository root, start `start.bat` for the bridge, then configure the model and run `zeroscript.bat`:
 
@@ -23,9 +23,9 @@ From the repository root, start `start.bat` for the bridge, then configure the m
     set ZS_MODEL_API_KEY=ollama
     zeroscript.bat
 
-Use `/help` inside the prompt. For session management, see `/sessions`, `/load RUN_ID`, `/resume RUN_ID`, `/new`, and `/compact`. Permission modes are `default`, read-only `plan`, and explicit `auto`. The browser and CLI remain separate runtimes: `/takeover` arms the CLI and waits for the browser agent to call `zeroscript_handoff_to_cli`.
+Use `/help` inside the prompt. Session commands include `/sessions`, `/load RUN_ID`, `/resume RUN_ID`, `/new`, and `/compact`. Skills live at `.claude/skills/<name>/SKILL.md` (or compatible `.zeroscript/skills` and user-level folders); invoke them with `/skill NAME [ARGS]`. Custom Markdown slash commands live in `.claude/commands/`. Agent profiles live in `.claude/agents/`; list them with `/agents`, run them with `/agent NAME TASK`, and the model can delegate bounded subtasks automatically. Project instructions load from `CLAUDE.md`, `AGENTS.md`, `ZEROSCRIPT.md`, and path-scoped `.claude/rules/*.md`. The browser and CLI remain separate runtimes: `/takeover` arms the CLI and waits for the browser agent to call `zeroscript_handoff_to_cli`.
 
-See [docs/CLI_AGENT.md](docs/CLI_AGENT.md) for setup, commands, permission behavior, privacy, and limitations.
+See [docs/CLI_AGENT.md](docs/CLI_AGENT.md) for setup, skills, agent profiles, privacy, and runtime limitations.
 
 ## Autopilot
 
