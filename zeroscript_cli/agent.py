@@ -25,6 +25,7 @@ from . import __version__
 from .remaster_services import AgentFlightRecorder, ArtifactGallery, IntegrationHealth, ModelProfiles, ProjectIntelligenceIndex, TaskVerificationGate, WorkspaceSnapshot, WorktreeManager
 from .visual_regression import compare_images
 from .skills import SkillCatalog
+from .file_context import expand_file_mentions
 
 
 UI = TerminalUI()
@@ -1611,6 +1612,17 @@ async def _direct_run(bridge: BridgeClient, provider: OpenAICompatibleProvider, 
                       conversation_state: Optional[Dict[str, Any]] = None,
                       resume_messages: Optional[List[Dict[str, Any]]] = None) -> int:
     _require_provider(provider)
+    workspace_data = bridge.initial_status.get("workspace") or {}
+    workspace_root = str(
+        workspace_data.get("root") or (conversation_state or {}).get("workspace") or ""
+    ).strip()
+    file_context = expand_file_mentions(goal, workspace_root or None)
+    goal = file_context.prompt
+    if file_context.attached:
+        UI.info("Attached workspace files: " + ", ".join(file_context.attached))
+    if file_context.skipped:
+        UI.warning("Some file references were left unattached because the file/count limit was reached: "
+                   + ", ".join(file_context.skipped))
     session_id = uuid.uuid4().hex
     response = await bridge.control(
         "start",
