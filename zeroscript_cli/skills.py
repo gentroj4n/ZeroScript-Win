@@ -159,6 +159,9 @@ class SkillCatalog:
             (self.home / ".claude" / category, "user:.claude"),
             (self.home / ".zeroscript-win" / category, "user:.zeroscript-win"),
         ]
+        bundled = {"skills": "builtin_skills", "agents": "builtin_agents"}.get(category)
+        if bundled:
+            user.append((Path(__file__).resolve().parent / bundled, "builtin"))
         return project + user
 
     def _scan(self, category: str, *, skill: bool, kind: str = "") -> list[Definition]:
