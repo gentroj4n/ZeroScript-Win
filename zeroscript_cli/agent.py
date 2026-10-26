@@ -936,6 +936,7 @@ class IndependentAgent:
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.stop_notice_shown = False
         self._last_tool_images: List[Dict[str, str]] = []
+        self._last_response_streamed = False
         self.recorder = AgentFlightRecorder(_session_dir() / (self.run_id + ".events.jsonl"))
         project_root = str(run_record.get("workspace") or "").strip()
         self.skill_catalog = SkillCatalog(project_root or None)
@@ -1080,8 +1081,20 @@ class IndependentAgent:
 
     async def _call_model(self) -> Dict[str, Any]:
         self.recorder.record("model.request", model=self.provider.model, message_count=len(self.messages), tool_count=len(self.tool_defs))
-        with UI.status("[bold bright_cyan]Thinking[/bold bright_cyan] · " + self.provider.model):
-            response = await self.provider.complete(self.messages, self.tool_defs)
+        streamed_parts: List[str] = []
+        self._last_response_streamed = False
+
+        def on_text(chunk: str) -> None:
+            streamed_parts.append(chunk)
+            UI.stream_text(chunk)
+
+        UI.info("Thinking · " + self.provider.model)
+        try:
+            response = await self.provider.complete(self.messages, self.tool_defs, on_text=on_text)
+        finally:
+            if streamed_parts:
+                UI.stream_end()
+        self._last_response_streamed = bool(streamed_parts)
         self.recorder.record("model.response", model=self.provider.model, choice_count=len(response.get("choices") or []))
         choices = response.get("choices") or []
         message = choices[0].get("message") if choices else None
@@ -1402,7 +1415,8 @@ class IndependentAgent:
                         final_text = "The model ended without a final text response."
                     if message.get("refusal"):
                         status = "blocked"
-                    UI.markdown(final_text)
+                    if not self._last_response_streamed:
+                        UI.markdown(final_text)
                     break
 
                 for index, call in enumerate(tool_calls, start=1):
