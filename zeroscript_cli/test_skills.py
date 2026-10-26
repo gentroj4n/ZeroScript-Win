@@ -113,7 +113,7 @@ class SkillCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
             self.write(base, "repo/.claude/agents/reviewer.md",
-                       "---\\nname: reviewer\\ndescription: Review code independently\\ntools:\\n  - Read\\n  - Grep\\n  - Bash\\nmodel: inherit\\nmax-turns: 12\\n---\\nReview the task and return evidence.")
+                       "---\nname: reviewer\ndescription: Review code independently\ntools:\n  - Read\n  - Grep\n  - Bash\nmodel: inherit\nmax-turns: 12\n---\nReview the task and return evidence.")
             catalog = SkillCatalog(base / "repo", base / "home")
             profile = catalog.find_agent("reviewer")
             self.assertIsNotNone(profile)
@@ -128,7 +128,7 @@ class SkillCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"
             self.write(root, ".claude/rules/typescript.md",
-                       "---\\npaths:\\n  - \\\"**/*.ts\\\"\\n  - \\\"**/*.tsx\\\"\\n---\\nUse TypeScript strict mode.")
+                       "---\npaths:\n  - \"**/*.ts\"\n  - \"**/*.tsx\"\n---\nUse TypeScript strict mode.")
             self.write(root, ".claude/rules/python.md",
                        "---\npaths: [\"**/*.py\"]\n---\nUse type hints.")
             self.write(root, ".claude/rules/global.md",
