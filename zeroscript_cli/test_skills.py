@@ -58,7 +58,9 @@ class SkillCatalogTests(unittest.TestCase):
             huge = "x" * (96 * 1024 + 1)
             self.write(base, "repo/.claude/skills/huge/SKILL.md", huge)
             catalog = SkillCatalog(base / "repo", base / "home")
-            self.assertEqual(catalog.skills(), [])
+            discovered = {item.name for item in catalog.skills()}
+            self.assertNotIn("escape", discovered)
+            self.assertNotIn("huge", discovered)
 
     def test_catalog_prompt_omits_model_disabled_skills(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -84,7 +86,9 @@ class SkillCatalogTests(unittest.TestCase):
             self.assertIsNotNone(tool)
             self.assertEqual(tool["name"], "zeroscript_load_skill")
             self.assertEqual(tool["server"], "zeroscript-runtime")
-            self.assertEqual(tool["inputSchema"]["properties"]["name"]["enum"], ["review"])
+            available = set(tool["inputSchema"]["properties"]["name"]["enum"])
+            self.assertIn("review", available)
+            self.assertNotIn("manual", available)
             self.assertIn("Review code", tool["description"])
 
     def test_model_skill_loader_expands_arguments_and_lists_supporting_files(self):
@@ -122,7 +126,7 @@ class SkillCatalogTests(unittest.TestCase):
             self.assertEqual(profile.max_turns, 12)
             tool = catalog.agent_tool()
             self.assertEqual(tool["name"], "zeroscript_run_subagent")
-            self.assertEqual(tool["inputSchema"]["properties"]["name"]["enum"], ["reviewer"])
+            self.assertIn("reviewer", tool["inputSchema"]["properties"]["name"]["enum"])
 
     def test_loads_path_scoped_rules_only_for_matching_files(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -138,6 +142,14 @@ class SkillCatalogTests(unittest.TestCase):
             self.assertNotIn("project:.claude/rules/python.md", loaded)
             self.assertIn("Prefer small focused changes.", loaded["project:.claude/rules/global.md"])
 
+    def test_bundled_skills_and_agent_profiles_are_available_by_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            catalog = SkillCatalog(base / "repo", base / "home")
+            self.assertIsNotNone(catalog.find_skill("code-review"))
+            self.assertIsNotNone(catalog.find_skill("debugging"))
+            self.assertIsNotNone(catalog.find_agent("explorer"))
+            self.assertIsNotNone(catalog.find_agent("reviewer"))
     def test_loads_user_global_claude_instructions(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
