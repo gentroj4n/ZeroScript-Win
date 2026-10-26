@@ -166,15 +166,21 @@ class HookRunner:
                 ))
                 break
             env = os.environ.copy()
+            project_dir = str(self.project_root or "")
             env.update({
                 "ZS_HOOK_EVENT": event,
-                "ZS_PROJECT_ROOT": str(self.project_root or ""),
+                "ZS_PROJECT_ROOT": project_dir,
                 "ZS_HOOK_SETTINGS": spec.settings_path,
+                "CLAUDE_PROJECT_DIR": project_dir,
+                "CLAUDE_HOOK_EVENT": event,
+                "CLAUDE_SETTINGS_PATH": spec.settings_path,
             })
             if data.get("session_id") is not None:
                 env["ZS_SESSION_ID"] = str(data["session_id"])
+                env["CLAUDE_SESSION_ID"] = str(data["session_id"])
             if data.get("tool_name") is not None:
                 env["ZS_TOOL_NAME"] = str(data["tool_name"])
+                env["CLAUDE_TOOL_NAME"] = str(data["tool_name"])
             process = None
             try:
                 process = await asyncio.create_subprocess_shell(
