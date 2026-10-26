@@ -685,18 +685,13 @@ Use concise progress updates in the terminal. Respect stop requests at checkpoin
 
 class IndependentAgent:
     def __init__(self, bridge: BridgeClient, provider: OpenAICompatibleProvider,
-                 run_record: Dict[str, Any], auto_approve: bool = False,
-                 max_turns: int = MAX_TURNS, permission_mode: str = "default",
+                 run_record: Dict[str, Any], max_turns: int = MAX_TURNS,
                  all_tools: bool = False):
         self.bridge = bridge
         self.provider = provider
         self.run_record = run_record
         self.run_id = str(run_record["run_id"])
         self.session_id = str(run_record["session_id"])
-        self.auto_approve = auto_approve
-        self.permission_mode = "auto" if auto_approve else permission_mode
-        if self.permission_mode not in {"default", "plan", "auto"}:
-            self.permission_mode = "default"
         self.all_tools = bool(all_tools)
         self.max_turns = max(1, min(int(max_turns), 100))
         self.progress = "Starting model runtime"
@@ -710,7 +705,7 @@ class IndependentAgent:
         self.recorder = AgentFlightRecorder(_session_dir() / (self.run_id + ".events.jsonl"))
         project_root = str(run_record.get("workspace") or "").strip()
         self.skill_catalog = SkillCatalog(project_root or None)
-        self.recorder.record("run.started", run_id=self.run_id, model=self.provider.model, permission_mode=self.permission_mode)
+        self.recorder.record("run.started", run_id=self.run_id, model=self.provider.model)
 
     def _build_system_prompt(self) -> str:
         parts = [_SYSTEM_PROMPT]
@@ -886,16 +881,12 @@ class IndependentAgent:
             selected = _select_tools_for_task(
                 catalogue,
                 recent_user_context or str(self.run_record.get("goal") or ""),
-                permission_mode=self.permission_mode,
                 include_all=self.all_tools,
             )
             self.tool_defs, self.aliases = _tool_aliases(selected)
             if not self.tool_defs:
                 raise RuntimeError("No usable tools remain after applying the current task scope and permission mode.")
-            UI.info(
-                f"Loaded {len(self.tool_defs)} task-relevant tools from {len(catalogue)} available"
-                + (" · read-only plan mode" if self.permission_mode == "plan" else "")
-            )
+            UI.info(f"Loaded {len(self.tool_defs)} task-relevant tools from {len(catalogue)} available")
             for turn in range(1, self.max_turns + 1):
                 if await self._check_stop():
                     status = "cancelled"
@@ -1090,7 +1081,7 @@ def _show_sessions() -> None:
 
 
 def _show_context(conversation_state: Dict[str, Any], provider: OpenAICompatibleProvider,
-                  bridge: BridgeClient, permission_mode: str) -> None:
+                  bridge: BridgeClient) -> None:
     messages = conversation_state.get("messages") or []
     total_chars = 0
     for message in messages:
@@ -1102,7 +1093,6 @@ def _show_context(conversation_state: Dict[str, Any], provider: OpenAICompatible
     rows = [
         ("Model", provider.model or "(not configured)"),
         ("Endpoint", provider.base_url),
-        ("Mode", permission_mode),
         ("Workspace", str(workspace.get("root") or "(not selected)")),
         ("Conversation", str(len(messages)) + " messages"),
         ("Context size", f"~{max(1, total_chars // 4):,} estimated tokens / {total_chars:,} characters"),
@@ -1111,7 +1101,7 @@ def _show_context(conversation_state: Dict[str, Any], provider: OpenAICompatible
     UI.table("Active context", ("Setting", "Value"), rows)
 
 
-async def _show_tools(bridge: BridgeClient, goal: str, permission_mode: str, query: str = "") -> None:
+async def _show_tools(bridge: BridgeClient, goal: str, query: str = "") -> None:
     catalogue = await bridge.list_tools()
     if query:
         needle = query.lower()
@@ -1126,7 +1116,7 @@ async def _show_tools(bridge: BridgeClient, goal: str, permission_mode: str, que
         ]
         title = "Tool search · " + query
     else:
-        selected = _select_tools_for_task(catalogue, goal, permission_mode=permission_mode)
+        selected = _select_tools_for_task(catalogue, goal)
         title = "Tools available to the current task"
     rows = []
     for tool in selected[:100]:
@@ -1135,15 +1125,12 @@ async def _show_tools(bridge: BridgeClient, goal: str, permission_mode: str, que
         description = " ".join(str(tool.get("description") or "").split())
         if len(description) > 130:
             description = description[:127] + "..."
-        if permission_mode == "plan" and not is_read_only_tool(tool):
-            continue
         rows.append((name, server, description))
     UI.table(title, ("Tool", "Integration", "Purpose"), rows)
     UI.info(f"Showing {len(rows)} of {len(catalogue)} bridge tools. Use /tools QUERY to search the full catalogue.")
 
 
-async def _workspace_command(bridge: BridgeClient, path: str = "",
-                             permission_mode: str = "default") -> int:
+async def _workspace_command(bridge: BridgeClient, path: str = "") -> int:
     """Inspect or explicitly select the local project workspace without asking the model."""
     if not path.strip():
         response = await bridge.call_tool("workspace_info", {})
