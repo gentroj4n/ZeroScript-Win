@@ -237,9 +237,6 @@ class TerminalUI:
         else:
             print(content)
 
-    def approval(self, name: str, arguments: str) -> None:
-        self.panel("Approval required · " + name, arguments, "yellow")
-
     def help(self) -> None:
         rows = [
             ("/help", "Show commands and keyboard shortcuts"),
