@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zeroscript-win-cli"
-version = "1.14.0"
+version = "1.15.0"
 description = "Independent local CLI agent for ZeroScript-Win"
 readme = "docs/CLI_AGENT.md"
 requires-python = ">=3.9"
@@ -18,3 +18,6 @@ zeroscript = "zeroscript_cli.agent:main"
 
 [tool.setuptools]
 packages = ["zeroscript_cli"]
+
+[tool.setuptools.package-data]
+zeroscript_cli = ["builtin_skills/**/*.md", "builtin_agents/**/*.md"]
