@@ -72,5 +72,42 @@ class SkillCatalogTests(unittest.TestCase):
             self.assertNotIn("/private", prompt)
 
 
+    def test_model_skill_tool_lists_only_model_invocable_skills(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            self.write(base, "repo/.claude/skills/review/SKILL.md",
+                       "---\nname: review\ndescription: Review code\n---\nReview the requested files.")
+            self.write(base, "repo/.claude/skills/manual/SKILL.md",
+                       "---\nname: manual\ndescription: User-only workflow\ndisable-model-invocation: true\n---\nOnly invoke manually.")
+            catalog = SkillCatalog(base / "repo", base / "home")
+            tool = catalog.model_tool()
+            self.assertIsNotNone(tool)
+            self.assertEqual(tool["name"], "zeroscript_load_skill")
+            self.assertEqual(tool["server"], "zeroscript-runtime")
+            self.assertEqual(tool["inputSchema"]["properties"]["name"]["enum"], ["review"])
+            self.assertIn("Review code", tool["description"])
+
+    def test_model_skill_loader_expands_arguments_and_lists_supporting_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            self.write(base, "repo/.claude/skills/review/SKILL.md",
+                       "---\nname: review\ndescription: Review code\n---\nReview $ARGUMENTS and focus on $1.")
+            self.write(base, "repo/.claude/skills/review/references/checklist.md", "Checklist")
+            catalog = SkillCatalog(base / "repo", base / "home")
+            result = catalog.load_for_model("review", "src/main.py")
+            self.assertIn("Review src/main.py", result)
+            self.assertIn("focus on src/main.py", result)
+            self.assertIn("references/checklist.md", result)
+
+    def test_model_skill_loader_rejects_model_disabled_skill(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            self.write(base, "repo/.claude/skills/private/SKILL.md",
+                       "---\nname: private\ndisable-model-invocation: true\n---\nPrivate instructions.")
+            catalog = SkillCatalog(base / "repo", base / "home")
+            with self.assertRaises(ValueError):
+                catalog.load_for_model("private")
+
+
 if __name__ == "__main__":
     unittest.main()
