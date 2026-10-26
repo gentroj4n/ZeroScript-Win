@@ -11,10 +11,22 @@ from zeroscript_cli.agent import (
     fit_messages_to_context,
     _estimated_tokens,
     _parse_vision_option,
+    IndependentAgent,
 )
 
 
 class CLIAgentUnitTests(unittest.TestCase):
+    def test_hook_context_is_appended_as_untrusted_data(self):
+        messages = [
+            {"role": "system", "content": "system instructions"},
+            {"role": "user", "content": "Fix the bug"},
+        ]
+        IndependentAgent._append_hook_context(messages, "UserPromptSubmit", "workspace facts")
+        self.assertEqual(messages[0]["content"], "system instructions")
+        self.assertIn("Fix the bug", messages[1]["content"])
+        self.assertIn("Untrusted output from configured UserPromptSubmit hook", messages[1]["content"])
+        self.assertIn("workspace facts", messages[1]["content"])
+
     def test_terminal_prompt_uses_async_prompt_toolkit_api(self):
         class FakePromptSession:
             async def prompt_async(self, *args, **kwargs):
