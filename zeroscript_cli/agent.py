@@ -1235,9 +1235,9 @@ async def _compact_conversation(provider: OpenAICompatibleProvider,
 
 
 
-async def _takeover_command(bridge: BridgeClient, provider: OpenAICompatibleProvider, auto_approve: bool,
+async def _takeover_command(bridge: BridgeClient, provider: OpenAICompatibleProvider,
                             max_turns: int, run_id: Optional[str] = None,
-                            permission_mode: str = "default", all_tools: bool = False) -> int:
+                            all_tools: bool = False) -> int:
     try:
         _require_provider(provider)
     except RuntimeError as exc:
@@ -1277,15 +1277,15 @@ async def _takeover_command(bridge: BridgeClient, provider: OpenAICompatibleProv
                 claimed = claim.get("control") or {}
                 _print_control(claimed)
                 agent = IndependentAgent(
-                    bridge, provider, claimed, auto_approve, max_turns,
-                    permission_mode=permission_mode, all_tools=all_tools,
+                    bridge, provider, claimed, max_turns,
+                    all_tools=all_tools,
                 )
                 await agent.run()
                 return 0
             if control.get("state") == "interrupted" and run_id == control.get("run_id"):
                 return await _resume_command(
-                    bridge, provider, auto_approve, max_turns, str(control.get("run_id")),
-                    permission_mode=permission_mode, all_tools=all_tools,
+                    bridge, provider, max_turns, str(control.get("run_id")),
+                    all_tools=all_tools,
                 )
             if run_id and control.get("run_id") and control.get("run_id") != run_id:
                 raise RuntimeError("Requested handoff run ID does not match the current control record.")
@@ -1302,9 +1302,8 @@ async def _takeover_command(bridge: BridgeClient, provider: OpenAICompatibleProv
             pass
 
 
-async def _resume_command(bridge: BridgeClient, provider: OpenAICompatibleProvider, auto_approve: bool,
-                          max_turns: int, run_id: str, permission_mode: str = "default",
-                          all_tools: bool = False) -> int:
+async def _resume_command(bridge: BridgeClient, provider: OpenAICompatibleProvider,
+                          max_turns: int, run_id: str, all_tools: bool = False) -> int:
     _require_provider(provider)
     session = _read_session(run_id)
     messages = session.get("messages")
@@ -1329,16 +1328,16 @@ async def _resume_command(bridge: BridgeClient, provider: OpenAICompatibleProvid
     session["updated_at"] = time.time()
     _write_session(run_id, session)
     agent = IndependentAgent(
-        bridge, provider, record, auto_approve, max_turns,
-        permission_mode=permission_mode, all_tools=all_tools,
+        bridge, provider, record, max_turns,
+        all_tools=all_tools,
     )
     await agent.run(resume_messages=messages)
     return 0
 
 
 async def _direct_run(bridge: BridgeClient, provider: OpenAICompatibleProvider, goal: str,
-                      auto_approve: bool, max_turns: int, permission_mode: str = "default",
-                      all_tools: bool = False, conversation_state: Optional[Dict[str, Any]] = None,
+                      max_turns: int, all_tools: bool = False,
+                      conversation_state: Optional[Dict[str, Any]] = None,
                       resume_messages: Optional[List[Dict[str, Any]]] = None) -> int:
     _require_provider(provider)
     session_id = uuid.uuid4().hex
@@ -1354,8 +1353,8 @@ async def _direct_run(bridge: BridgeClient, provider: OpenAICompatibleProvider, 
     record = response.get("control") or {}
     _print_control(record)
     agent = IndependentAgent(
-        bridge, provider, record, auto_approve, max_turns,
-        permission_mode=permission_mode, all_tools=all_tools,
+        bridge, provider, record, max_turns,
+        all_tools=all_tools,
     )
     if resume_messages is None and conversation_state and isinstance(conversation_state.get("messages"), list):
         resume_messages = list(conversation_state["messages"]) + [{"role": "user", "content": goal}]
