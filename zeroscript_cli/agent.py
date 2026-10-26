@@ -622,6 +622,84 @@ def _session_summaries(limit: int = 20) -> List[Dict[str, Any]]:
     return records
 
 
+def _show_definitions(catalog: SkillCatalog, kind: str, query: str = "") -> None:
+    items = catalog.skills() if kind == "skill" else catalog.commands()
+    needle = query.strip().casefold()
+    if needle:
+        items = [
+            item for item in items
+            if needle in item.name.casefold() or needle in item.description.casefold()
+        ]
+    if not items:
+        UI.info("No " + ("skills" if kind == "skill" else "custom commands") + " found.")
+        UI.print(
+            "Skills: .claude/skills/<name>/SKILL.md or .zeroscript/skills/<name>/SKILL.md; "
+            "global skills: ~/.claude/skills/<name>/SKILL.md.",
+            "muted" if UI.rich_enabled else None,
+        )
+        UI.print(
+            "Commands: .claude/commands/<name>.md or .zeroscript/commands/<name>.md; "
+            "global commands: ~/.claude/commands/<name>.md.",
+            "muted" if UI.rich_enabled else None,
+        )
+        return
+    rows = []
+    for item in items:
+        hint = (" " + item.argument_hint) if item.argument_hint else ""
+        rows.append(("/" + item.name + hint, item.source, item.description or "(no description)"))
+    UI.table("Project/user " + ("skills" if kind == "skill" else "custom commands"),
+             ("Invocation", "Source", "Description"), rows)
+
+
+def _available_slash_commands(catalog: SkillCatalog) -> list[str]:
+    names = []
+    names.extend("/" + item.name for item in catalog.skills() if item.user_invocable)
+    names.extend("/" + item.name for item in catalog.commands() if item.user_invocable)
+    return names
+
+
+async def _init_project(bridge: BridgeClient) -> int:
+    response = await bridge.call_tool("workspace_info", {})
+    if not response.get("ok"):
+        raise RuntimeError(str(response.get("error") or "Could not inspect the selected workspace."))
+    try:
+        info = json.loads(response.get("text") or "{}")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Workspace information was not valid JSON.") from exc
+    root = str(info.get("root") or "").strip()
+    if not root or info.get("configured") is False:
+        raise RuntimeError("Select a project first with /workspace PATH, then run /init.")
+    workspace = Path(root).expanduser()
+    target = workspace / "CLAUDE.md"
+    if target.exists() or target.is_symlink():
+        UI.warning("CLAUDE.md already exists; preserving it. Add or edit instructions manually.")
+        return 0
+    catalogue = await bridge.list_tools()
+    write_tool = next(
+        (item.get("name") for item in catalogue
+         if item.get("name") in {"workspace_write_file", "workspace_create_file"}),
+        None,
+    )
+    if not write_tool:
+        raise RuntimeError("The bridge does not expose a workspace file-creation tool.")
+    template = (
+        "# Project Instructions\n\n"
+        "## Project conventions\n"
+        "- Prefer focused changes that preserve existing architecture and public APIs.\n"
+        "- Inspect relevant code and tests before changing files.\n"
+        "- Add or update regression tests for behavior changes.\n"
+        "- Run relevant tests and report actual results; never claim unverified success.\n\n"
+        "## Commands\n"
+        "- Document the project's build, test, lint, and formatting commands here.\n"
+    )
+    result = await bridge.call_tool(write_tool, {"path": "CLAUDE.md", "content": template})
+    if not result.get("ok"):
+        raise RuntimeError(str(result.get("error") or result.get("text") or "Could not create CLAUDE.md."))
+    UI.success("Created CLAUDE.md in " + root)
+    UI.info("Edit it to record project-specific architecture, commands, style, and verification rules.")
+    return 0
+
+
 def needs_approval(tool: Dict[str, Any], arguments: Dict[str, Any]) -> bool:
     """Classify consequential actions; workspace code edits are normal agent work."""
     name = str(tool.get("name") or "")
