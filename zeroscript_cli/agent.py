@@ -444,19 +444,6 @@ _CORE_TOOLS = {
     "workspace_replace_in_files", "workspace_run_task", "workspace_run_command",
     "workspace_preview_image", "workspace_recent_roots", "workspace_git_status",
 }
-_READ_ONLY_EXACT = {
-    "workspace_info", "workspace_tree", "workspace_list_files", "workspace_read_file",
-    "workspace_search", "workspace_symbols", "workspace_file_outline",
-    "workspace_git_changed_files", "workspace_git_diff", "workspace_preview_image",
-    "workspace_recent_roots", "workspace_git_status",
-}
-_READ_PREFIXES = (
-    "workspace_read_", "workspace_list_", "workspace_search", "workspace_tree",
-    "workspace_info", "workspace_symbols", "workspace_file_outline",
-    "workspace_git_changed_files", "workspace_git_diff", "workspace_preview_image",
-    "workspace_inspect_", "workspace_find_", "workspace_recent_roots",
-    "workspace_get_", "workspace_describe_", "workspace_tooling",
-)
 _WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_+#.-]{1,}")
 _STOP_WORDS = {
     "workspace", "agent", "tool", "task",
@@ -471,26 +458,8 @@ _STOP_WORDS = {
 }
 
 
-def is_read_only_tool(tool: Dict[str, Any]) -> bool:
-    """Return whether a tool is safe for a read-only planning session."""
-    name = str(tool.get("name") or "").lower()
-    server = str(tool.get("server") or "workspace").lower()
-    if name.startswith("zeroscript_"):
-        return True
-    if name.startswith("workspace_"):
-        return name in _READ_ONLY_EXACT or name.startswith(_READ_PREFIXES)
-    if server == "workspace":
-        return name.startswith(_READ_PREFIXES)
-    leaf = name.rsplit("/", 1)[-1]
-    return leaf.startswith((
-        "get_", "list_", "read_", "search_", "find_", "inspect_", "describe_",
-        "status", "outline", "capture_", "screenshot", "show_", "query_",
-    ))
-
-
 def _select_tools_for_task(catalogue: List[Dict[str, Any]], goal: str,
-                           permission_mode: str = "default", include_all: bool = False,
-                           max_tools: int = 40) -> List[Dict[str, Any]]:
+                           include_all: bool = False, max_tools: int = 40) -> List[Dict[str, Any]]:
     """Reduce tool-schema noise for small local models while preserving task coverage.
 
     Common workspace tools are always available. Domain-specific MCP tools are included
@@ -700,44 +669,10 @@ async def _init_project(bridge: BridgeClient) -> int:
     return 0
 
 
-def needs_approval(tool: Dict[str, Any], arguments: Dict[str, Any]) -> bool:
-    """Classify consequential actions; workspace code edits are normal agent work."""
-    name = str(tool.get("name") or "")
-    server = str(tool.get("server") or "")
-    if server != "workspace" and not name.startswith("workspace_"):
-        lowered = name.rsplit("/", 1)[-1].lower()
-        safe_reads = ("get_", "list_", "read_", "search_", "find_", "inspect_", "describe_", "status", "outline", "capture_", "screenshot")
-        return not lowered.startswith(safe_reads)
-    if name in {
-        "workspace_run_command", "workspace_run_task",
-        "workspace_delete_file", "workspace_move_path",
-        "workspace_set_root", "workspace_open_recent",
-        "workspace_git_stage_file", "workspace_git_unstage_file", "workspace_git_commit", "workspace_git_push",
-        "cancel_assetripper_job", "stop_browser_server",
-    }:
-        return True
-    if name == "workspace_replace_in_files" and arguments.get("apply") is True:
-        return True
-    if name == "workspace_write_files" and arguments.get("overwrite") is True:
-        return True
-    if name == "roblox_export_tree" and arguments.get("overwrite") is True:
-        return True
-    return False
-
-
-def validate_tool_call(tool: Dict[str, Any], arguments: Dict[str, Any], permission_mode: str = "default") -> List[str]:
-    """Compatibility shim; tool dispatch is no longer permission-gated."""
-    return []
-
-
 def _format_tool_args(arguments: Dict[str, Any]) -> str:
     raw = json.dumps(arguments, ensure_ascii=False, indent=2, default=str)
     return _clip(raw, 3000)
 
-
-async def _approve(tool: Dict[str, Any], arguments: Dict[str, Any], auto_approve: bool) -> bool:
-    """Compatibility shim; do not gate tool execution on local approval prompts."""
-    return True
 
 _SYSTEM_PROMPT = """You are the independent ZeroScript CLI coding agent running locally for the user.
 Operate as a careful coding agent: inspect before editing; form a short plan; make focused changes; run relevant checks; inspect the final diff; and report what was actually verified. Use the provided workspace and MCP tools rather than inventing command output.
@@ -886,13 +821,6 @@ class IndependentAgent:
         if not isinstance(arguments, dict):
             return "ERROR: Tool arguments must be a JSON object."
         self.recorder.record("tool.request", tool=name, argument_keys=sorted(str(k) for k in arguments))
-        validation_errors = validate_tool_call(tool, arguments, self.permission_mode)
-        if validation_errors:
-            reason = "; ".join(validation_errors[:8])
-            self.recorder.record("tool.blocked", tool=name, reason=reason)
-            return "BLOCKED: " + reason
-        if not await _approve(tool, arguments, self.auto_approve or self.permission_mode == "auto"):
-            return "Approval denied by the user. Do not retry the same operation unless the user explicitly asks."
         if await self._check_stop():
             return "ERROR: Stop requested or control was released before this tool could run. Do not execute it."
         UI.tool_start(name, _clip(json.dumps(arguments, ensure_ascii=False, indent=2), 1800))
