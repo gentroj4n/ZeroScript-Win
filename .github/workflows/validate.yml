@@ -25,7 +25,7 @@ jobs:
       - name: Test workspace tools and bridge
         shell: pwsh
         run: |
-          python -m unittest workspace_agent.test_tools workspace_agent.test_bridge workspace_agent.test_agent_control workspace_agent.test_unity_recovery workspace_agent.test_code_intelligence workspace_agent.test_browser_qa workspace_agent.test_browser_server workspace_agent.test_assetripper_jobs workspace_agent.test_unity_asset_inspector workspace_agent.test_reconstruction_tracker zeroscript_cli.test_agent zeroscript_cli.test_remaster_services -v 2>&1 | Tee-Object -FilePath workspace-test-results.txt
+          python -m unittest workspace_agent.test_tools workspace_agent.test_bridge workspace_agent.test_agent_control workspace_agent.test_unity_recovery workspace_agent.test_code_intelligence workspace_agent.test_browser_qa workspace_agent.test_browser_server workspace_agent.test_assetripper_jobs workspace_agent.test_unity_asset_inspector workspace_agent.test_reconstruction_tracker zeroscript_cli.test_agent zeroscript_cli.test_remaster_services zeroscript_cli.test_skills -v 2>&1 | Tee-Object -FilePath workspace-test-results.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile Python
         shell: pwsh
