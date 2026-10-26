@@ -38,7 +38,7 @@ except ImportError:
 COMMANDS = [
     "/help", "/status", "/new", "/sessions", "/load", "/resume", "/continue",
     "/compact", "/clear", "/model", "/tools", "/context", "/workspace", "/takeover",
-    "/skills", "/skill", "/commands", "/agents", "/agent", "/reload", "/init", "/doctor", "/stop", "/return-browser", "/quit",
+    "/skills", "/skill", "/commands", "/agents", "/agent", "/hooks", "/reload", "/init", "/doctor", "/stop", "/return-browser", "/quit",
 ]
 
 
@@ -253,7 +253,8 @@ class TerminalUI:
             ("/commands [QUERY]", "List custom Markdown slash commands"),
             ("/agents [QUERY]", "List project and user agent profiles"),
             ("/agent NAME TASK", "Run a task using a named agent profile"),
-            ("/reload", "Rescan built-in, project, and user skills/commands/agents"),
+            ("/hooks", "List configured command hooks and their matchers"),
+            ("/reload", "Rescan skills, commands, agents, and hook settings"),
             ("/init", "Create a starter CLAUDE.md in the selected project"),
             ("/doctor", "Check local CLI and bridge prerequisites"),
             ("/workspace [PATH]", "Inspect or select the project workspace"),
