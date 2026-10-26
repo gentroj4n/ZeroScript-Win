@@ -130,6 +130,24 @@ class TerminalUI:
     def warning(self, message: str) -> None:
         self.print("! " + message, "warning" if self.console else None)
 
+    def stream_text(self, chunk: str) -> None:
+        """Write incremental model text without Rich markup interpretation."""
+        if not chunk:
+            return
+        value = str(chunk)
+        if self.console:
+            self.console.print(Text(value, overflow="fold"), end="", soft_wrap=True)
+        else:
+            sys.stdout.write(value)
+            sys.stdout.flush()
+
+    def stream_end(self) -> None:
+        """Terminate an incremental response line before the next UI panel."""
+        if self.console:
+            self.console.print()
+        else:
+            print()
+
     def rule(self, title: str = "") -> None:
         if self.console:
             self.console.rule(title, style="bright_black")
