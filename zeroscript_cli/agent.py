@@ -1798,6 +1798,9 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     await _workspace_command(bridge, argument, permission_mode)
                     workspace = bridge.initial_status.get("workspace") or {}
                     conversation_state["workspace"] = str(workspace.get("root") or "")
+                    workspace_root = str(workspace.get("root") or "").strip()
+                    skill_catalog = SkillCatalog(workspace_root or None)
+                    UI.set_commands(_available_slash_commands(skill_catalog))
                 elif slash == "/model":
                     if argument:
                         provider.model = argument
@@ -1832,6 +1835,33 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                         bridge, str(conversation_state.get("goal") or ""),
                         permission_mode, query=argument,
                     )
+                elif slash == "/skills":
+                    _show_definitions(skill_catalog, "skill", argument)
+                elif slash == "/commands":
+                    _show_definitions(skill_catalog, "command", argument)
+                elif slash == "/skill":
+                    skill_name, _, skill_args = argument.partition(" ")
+                    if not skill_name:
+                        _show_definitions(skill_catalog, "skill")
+                        continue
+                    definition = skill_catalog.find_skill(skill_name)
+                    if not definition or not definition.user_invocable:
+                        UI.error("Unknown or non-invocable skill: " + skill_name)
+                        continue
+                    goal = definition.render(skill_args)
+                    await _direct_run(
+                        bridge, provider, goal, auto_approve, args.max_turns,
+                        permission_mode=permission_mode, all_tools=args.all_tools,
+                        conversation_state=conversation_state,
+                    )
+                elif slash == "/init":
+                    await _init_project(bridge)
+                    latest = bridge.initial_status.get("workspace") or {}
+                    workspace_root = str(latest.get("root") or "").strip()
+                    skill_catalog = SkillCatalog(workspace_root or None)
+                    UI.set_commands(_available_slash_commands(skill_catalog))
+                elif slash == "/doctor":
+                    _remaster_command("doctor", [])
                 elif slash == "/takeover":
                     await _takeover_command(
                         bridge, provider, auto_approve, args.max_turns,
@@ -1858,7 +1888,18 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     permission_mode = "plan"
                     UI.success("Read-only plan mode enabled.")
                 elif slash.startswith("/"):
-                    UI.error("Unknown command: " + slash + ". Type /help to see available commands.")
+                    definition = skill_catalog.find_skill(slash.lstrip("/"))
+                    if definition is None:
+                        definition = skill_catalog.find_command(slash.lstrip("/"))
+                    if definition and definition.user_invocable:
+                        goal = definition.render(argument)
+                        await _direct_run(
+                            bridge, provider, goal, auto_approve, args.max_turns,
+                            permission_mode=permission_mode, all_tools=args.all_tools,
+                            conversation_state=conversation_state,
+                        )
+                    else:
+                        UI.error("Unknown command: " + slash + ". Type /help, /skills, or /commands.")
                 else:
                     await _direct_run(
                         bridge, provider, line, auto_approve, args.max_turns,
