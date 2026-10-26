@@ -1642,6 +1642,26 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         workspace_root = str(active_workspace.get("root") or "").strip()
         skill_catalog = SkillCatalog(workspace_root or None)
         UI.set_commands(_available_slash_commands(skill_catalog))
+        if command == "skills":
+            _show_definitions(skill_catalog, "skill", " ".join(extra))
+            return 0
+        if command == "commands":
+            _show_definitions(skill_catalog, "command", " ".join(extra))
+            return 0
+        if command == "init":
+            return await _init_project(bridge)
+        if command == "skill":
+            if not extra:
+                _show_definitions(skill_catalog, "skill")
+                return 0
+            definition = skill_catalog.find_skill(extra[0])
+            if not definition or not definition.user_invocable:
+                raise RuntimeError("Unknown or non-invocable skill: " + extra[0] + ". Use `zeroscript skills` to list skills.")
+            goal = definition.render(" ".join(extra[1:]))
+            return await _direct_run(
+                bridge, provider, goal, auto_approve, args.max_turns,
+                permission_mode=permission_mode, all_tools=args.all_tools,
+            )
         if command == "status":
             return await _status_command(bridge)
         if command == "stop":
@@ -1660,6 +1680,17 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                 bridge, provider, auto_approve, args.max_turns, extra[0],
                 permission_mode=permission_mode, all_tools=args.all_tools,
             )
+        # Direct invocation of a discovered skill/custom command: zeroscript review src/
+        if command:
+            definition = skill_catalog.find_skill(command.lstrip("/"))
+            if definition is None:
+                definition = skill_catalog.find_command(command.lstrip("/"))
+            if definition and definition.user_invocable:
+                goal = definition.render(" ".join(extra))
+                return await _direct_run(
+                    bridge, provider, goal, auto_approve, args.max_turns,
+                    permission_mode=permission_mode, all_tools=args.all_tools,
+                )
         if command:
             goal = " ".join([command] + extra).strip()
             if not goal:
