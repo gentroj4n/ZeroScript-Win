@@ -60,7 +60,7 @@ def _metadata_list(value: str | None) -> tuple[str, ...]:
     raw = value.strip()
     if raw.startswith("[") and raw.endswith("]"):
         raw = raw[1:-1]
-    return tuple(part.strip().strip("'""") for part in raw.split(",") if part.strip())
+    return tuple(part.strip().strip(chr(39) + chr(34)) for part in raw.split(",") if part.strip())
 
 
 def _valid_name(name: str) -> bool:
