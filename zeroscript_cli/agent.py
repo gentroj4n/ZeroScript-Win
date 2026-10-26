@@ -22,6 +22,7 @@ from .ui import TerminalUI
 from . import __version__
 from .remaster_services import AgentFlightRecorder, ArtifactGallery, IntegrationHealth, ModelProfiles, ProjectIntelligenceIndex, TaskVerificationGate, WorkspaceSnapshot, WorktreeManager
 from .visual_regression import compare_images
+from .skills import SkillCatalog
 
 
 UI = TerminalUI()
@@ -694,6 +695,8 @@ class IndependentAgent:
         self.stop_notice_shown = False
         self._last_tool_images: List[Dict[str, str]] = []
         self.recorder = AgentFlightRecorder(_session_dir() / (self.run_id + ".events.jsonl"))
+        project_root = str(run_record.get("workspace") or "").strip()
+        self.skill_catalog = SkillCatalog(project_root or None)
         self.recorder.record("run.started", run_id=self.run_id, model=self.provider.model, permission_mode=self.permission_mode)
 
     def _build_messages(self) -> List[Dict[str, Any]]:
