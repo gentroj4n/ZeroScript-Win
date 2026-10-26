@@ -73,6 +73,8 @@ Each run saves its transcript below `%USERPROFILE%\\.zeroscript-win\\sessions` (
 
 Project instructions load from CLAUDE.md, AGENTS.md, ZEROSCRIPT.md, and .zeroscript/rules.md. User-wide instruction files are also supported at ~/.claude/CLAUDE.md and ~/.zeroscript-win/CLAUDE.md. Path-scoped Markdown rules under .claude/rules/ and .zeroscript/rules/ can use a paths frontmatter field, for example paths: [**/*.ts, **/*.tsx]. A path-scoped rule is included when the current task names a matching path.
 
+Bundled skills are available out of the box: /code-review, /debugging, /test-and-verify, /exploration, /refactor, and /docs. Bundled agent profiles include explorer, reviewer, test-runner, implementer, documenter, and planner. A project or user definition with the same name takes precedence over the bundled definition. Run /reload after adding or changing definitions while the CLI is open.
+
 Skills use .claude/skills/<name>/SKILL.md, .zeroscript/skills/<name>/SKILL.md, ~/.claude/skills/, or ~/.zeroscript-win/skills/. Custom slash commands use .claude/commands/<name>.md or .zeroscript/commands/<name>.md, with matching user-level folders. Definitions may provide name, description, argument-hint, user-invocable, and disable-model-invocation frontmatter. Skill and command bodies support $ARGUMENTS, $ARGS, and positional placeholders $1 through $9.
 
 Invoke a skill manually with /skill NAME [ARGS] or zeroscript skill NAME [ARGS]. Skills not marked disable-model-invocation: true are exposed through a local runtime tool so the model can load complete instructions on demand. Supporting files beside SKILL.md are listed for selective reading instead of being dumped wholesale into context.
