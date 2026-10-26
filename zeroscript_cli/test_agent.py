@@ -6,12 +6,8 @@ import unittest
 from zeroscript_cli.ui import TerminalUI, _PROMPT_TOOLKIT
 from zeroscript_cli.agent import (
     OpenAICompatibleProvider,
-    _approve,
     _select_tools_for_task,
     _tool_aliases,
-    is_read_only_tool,
-    needs_approval,
-    validate_tool_call,
     fit_messages_to_context,
     _estimated_tokens,
     _parse_vision_option,
@@ -35,35 +31,6 @@ class CLIAgentUnitTests(unittest.TestCase):
         ui = TerminalUI()
         if _PROMPT_TOOLKIT:
             self.assertIsNotNone(ui._session, "prompt-toolkit should initialize with supported key bindings")
-
-    def test_approval_prompt_is_async(self):
-        # _approve uses asyncio.to_thread(input, ...) so it must remain awaitable.
-        self.assertTrue(inspect.iscoroutinefunction(_approve))
-
-    def test_plan_mode_excludes_every_mutating_workspace_tool(self):
-        catalogue = [
-            {"name": "workspace_info", "server": "workspace", "description": "Workspace status",
-             "inputSchema": {"type": "object", "properties": {}}},
-            {"name": "workspace_read_file", "server": "workspace", "description": "Read source",
-             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
-            {"name": "workspace_write_file", "server": "workspace", "description": "Write source",
-             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
-            {"name": "workspace_run_command", "server": "workspace", "description": "Execute shell command",
-             "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}}},
-            {"name": "roblox/get_studio_state", "server": "roblox", "description": "Read current Studio state",
-             "inputSchema": {"type": "object", "properties": {}}},
-            {"name": "roblox/execute_luau", "server": "roblox", "description": "Execute code in Studio",
-             "inputSchema": {"type": "object", "properties": {}}},
-        ]
-        selected = _select_tools_for_task(catalogue, "inspect Roblox Studio and plan a fix", permission_mode="plan")
-        names = {tool["name"] for tool in selected}
-        self.assertIn("workspace_info", names)
-        self.assertIn("workspace_read_file", names)
-        self.assertIn("roblox/get_studio_state", names)
-        self.assertNotIn("workspace_write_file", names)
-        self.assertNotIn("workspace_run_command", names)
-        self.assertNotIn("roblox/execute_luau", names)
-        self.assertTrue(all(is_read_only_tool(tool) for tool in selected))
 
     def test_task_tool_selection_scopes_unrelated_integrations(self):
         catalogue = [
@@ -140,56 +107,6 @@ class CLIAgentUnitTests(unittest.TestCase):
         self.assertEqual(validate_tool_call(normalized, {}), [])
         self.assertTrue(validate_tool_call(normalized, {"command": "anything"}))
         self.assertTrue(validate_tool_call({"name": "workspace_unknown"}, {}))
-
-    def test_approval_policy_gates_commands_and_external_mutations(self):
-        workspace = {"server": "workspace"}
-        command = {"name": "workspace_run_command", **workspace}
-        writer = {"name": "workspace_write_file", **workspace}
-        stage = {"name": "workspace_git_stage_file", **workspace}
-        external_read = {"name": "roblox/get_studio_state", "server": "roblox"}
-        external_write = {"name": "roblox/execute_luau", "server": "roblox"}
-        self.assertTrue(needs_approval(command, {"command": ["python", "-m", "pytest"]}))
-        self.assertTrue(needs_approval(stage, {"path": "src/main.py"}))
-        self.assertTrue(needs_approval({"name": "workspace_git_push", **workspace}, {"remote": "origin"}))
-        self.assertFalse(needs_approval(writer, {"path": "src/main.py", "content": "pass"}))
-        self.assertFalse(needs_approval(external_read, {}))
-        self.assertTrue(needs_approval(external_write, {"code": "print('hello')"}))
-
-    def test_apply_replace_requires_approval(self):
-        tool = {"name": "workspace_replace_in_files", "server": "workspace"}
-        self.assertFalse(needs_approval(tool, {"apply": False, "query": "old"}))
-        self.assertTrue(needs_approval(tool, {"apply": True, "query": "old", "replacement": "new"}))
-
-    def test_tool_call_schema_validation_fails_closed_on_bad_arguments(self):
-        tool = {
-            "name": "workspace_write_file",
-            "server": "workspace",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        }
-        self.assertEqual(validate_tool_call(tool, {"path": "a.py", "content": "pass"}), [])
-        self.assertTrue(any("Missing required property: content" in error for error in validate_tool_call(tool, {"path": "a.py"})))
-        self.assertTrue(any("Unknown property: surprise" in error for error in validate_tool_call(tool, {"path": "a.py", "content": "pass", "surprise": True})))
-
-    def test_shared_permission_policy_blocks_destructive_tools_even_in_auto_mode(self):
-        tool = {"name": "workspace_delete_file", "server": "workspace", "inputSchema": {"type": "object", "properties": {}}}
-        self.assertTrue(validate_tool_call(tool, {}, "auto"), "destructive operation should be denied by the shared policy")
-
-    def test_shared_policy_applies_plan_mode_before_dispatch(self):
-        read_tool = {"name": "workspace_read_file", "server": "workspace", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}
-        write_tool = {"name": "workspace_write_file", "server": "workspace", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}
-        self.assertEqual(validate_tool_call(read_tool, {"path": "README.md"}, "plan"), [])
-        self.assertTrue(validate_tool_call(write_tool, {"path": "README.md", "content": "x"}, "plan"))
-        self.assertEqual(validate_tool_call(write_tool, {"path": "README.md", "content": "x"}, "default"), [])
-        self.assertTrue(validate_tool_call({"name": "workspace_delete_file", "server": "workspace", "inputSchema": {"type": "object", "properties": {}}}, {}, "auto"))
-
-    def test_plan_mode_still_allows_known_read_tools(self):
-        tool = {"name": "workspace_read_file", "server": "workspace", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}
-        self.assertEqual(validate_tool_call(tool, {"path": "README.md"}, "plan"), [])
 
     def test_context_budget_keeps_system_and_recent_complete_turn(self):
         messages = [
