@@ -596,7 +596,18 @@ def _session_summaries(limit: int = 20) -> List[Dict[str, Any]]:
 
 
 def _show_definitions(catalog: SkillCatalog, kind: str, query: str = "") -> None:
-    items = catalog.skills() if kind == "skill" else catalog.commands()
+    if kind == "skill":
+        items = catalog.skills()
+        label = "skills"
+        location_help = "Skills: .claude/skills/<name>/SKILL.md; .zeroscript/skills/<name>/SKILL.md; user ~/.claude/skills/."
+    elif kind == "agent":
+        items = catalog.agents()
+        label = "agent profiles"
+        location_help = "Agents: .claude/agents/<name>.md; .zeroscript/agents/<name>.md; user ~/.claude/agents/."
+    else:
+        items = catalog.commands()
+        label = "custom commands"
+        location_help = "Commands: .claude/commands/<name>.md; .zeroscript/commands/<name>.md; user ~/.claude/commands/."
     needle = query.strip().casefold()
     if needle:
         items = [
@@ -604,24 +615,15 @@ def _show_definitions(catalog: SkillCatalog, kind: str, query: str = "") -> None
             if needle in item.name.casefold() or needle in item.description.casefold()
         ]
     if not items:
-        UI.info("No " + ("skills" if kind == "skill" else "custom commands") + " found.")
-        UI.print(
-            "Skills: .claude/skills/<name>/SKILL.md or .zeroscript/skills/<name>/SKILL.md; "
-            "global skills: ~/.claude/skills/<name>/SKILL.md.",
-            "muted" if UI.rich_enabled else None,
-        )
-        UI.print(
-            "Commands: .claude/commands/<name>.md or .zeroscript/commands/<name>.md; "
-            "global commands: ~/.claude/commands/<name>.md.",
-            "muted" if UI.rich_enabled else None,
-        )
+        UI.info("No " + label + " found.")
+        UI.print(location_help, "muted" if UI.rich_enabled else None)
         return
     rows = []
     for item in items:
         hint = (" " + item.argument_hint) if item.argument_hint else ""
-        rows.append(("/" + item.name + hint, item.source, item.description or "(no description)"))
-    UI.table("Project/user " + ("skills" if kind == "skill" else "custom commands"),
-             ("Invocation", "Source", "Description"), rows)
+        profile_meta = (" · model=" + item.model if kind == "agent" and item.model else "")
+        rows.append(("/" + item.name + hint, item.source, (item.description or "(no description)") + profile_meta))
+    UI.table("Project/user " + label, ("Name / Invocation", "Source", "Description"), rows)
 
 
 def _available_slash_commands(catalog: SkillCatalog) -> list[str]:
@@ -1703,6 +1705,20 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         if command == "commands":
             _show_definitions(skill_catalog, "command", " ".join(extra))
             return 0
+        if command == "agents":
+            _show_definitions(skill_catalog, "agent", " ".join(extra))
+            return 0
+        if command == "agent":
+            if not extra:
+                _show_definitions(skill_catalog, "agent")
+                return 0
+            definition = skill_catalog.find_agent(extra[0])
+            if definition is None:
+                raise RuntimeError("Unknown agent profile: " + extra[0] + ". Use `zeroscript agents` to list profiles.")
+            task = " ".join(extra[1:]).strip()
+            if not task:
+                raise RuntimeError("Usage: zeroscript agent PROFILE TASK")
+            return await _direct_run(bridge, provider, definition.render(task), args.max_turns, all_tools=args.all_tools)
         if command == "init":
             return await _init_project(bridge)
         if command == "skill":
@@ -1874,6 +1890,25 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                     _show_definitions(skill_catalog, "skill", argument)
                 elif slash == "/commands":
                     _show_definitions(skill_catalog, "command", argument)
+                elif slash == "/agents":
+                    _show_definitions(skill_catalog, "agent", argument)
+                elif slash == "/agent":
+                    agent_name, _, agent_task = argument.partition(" ")
+                    if not agent_name:
+                        _show_definitions(skill_catalog, "agent")
+                        continue
+                    definition = skill_catalog.find_agent(agent_name)
+                    if definition is None:
+                        UI.error("Unknown agent profile: " + agent_name + ". Use /agents to list profiles.")
+                        continue
+                    if not agent_task.strip():
+                        UI.error("Usage: /agent PROFILE TASK")
+                        continue
+                    await _direct_run(
+                        bridge, provider, definition.render(agent_task),
+                        args.max_turns, all_tools=args.all_tools,
+                        conversation_state=conversation_state,
+                    )
                 elif slash == "/skill":
                     skill_name, _, skill_args = argument.partition(" ")
                     if not skill_name:
