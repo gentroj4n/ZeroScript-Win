@@ -22,6 +22,7 @@ import asyncio
 import base64
 import json
 import os
+import hashlib
 from pathlib import Path
 import queue
 import re
@@ -1255,8 +1256,10 @@ class MCPManager:
              "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_open_recent", "description": "Activate a folder only if it is present in workspace_recent_roots. This switches the active local project and persists the choice; ask the user to confirm which project they want before calling.",
              "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
-            {"name": "workspace_set_root", "description": "Set and persist the user's explicitly provided local project folder. Use only a path the user supplied or confirmed.",
-             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_set_root", "description": "Set the active workspace root. Use persist=false for temporary conversation-scoped activation so the general workspace setting is preserved.",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "persist": {"type": "boolean", "default": True}}, "required": ["path"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_create_conversation_root", "description": "Create or return an isolated temporary workspace directory for a conversation without changing the general workspace setting.",
+             "inputSchema": {"type": "object", "properties": {"conversation_id": {"type": "string"}}, "required": ["conversation_id"], "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_browse", "description": "Open a native folder picker and return the selected_path without changing the active workspace. After the user chooses the folder, call workspace_set_root with that exact selected_path to activate it.",
              "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_project_info", "description": "Inspect common project manifests, framework/language hints, Git presence, source-file counts, and package scripts.",
@@ -1504,7 +1507,19 @@ class MCPManager:
                 })
             return {"recent_roots": roots[:10]}
         if name == "workspace_set_root":
-            return self._set_workspace(args.get("path", ""))
+            return self._set_workspace(args.get("path", ""), persist=args.get("persist", True))
+        if name == "workspace_create_conversation_root":
+            conversation_id = str(args.get("conversation_id", "")).strip()
+            if not conversation_id:
+                raise RuntimeError("A conversation ID is required for an isolated workspace.")
+            digest = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:24]
+            local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            root = Path(local_app_data) / "ZeroScript-Win" / "ConversationWorkspaces" / digest
+            root.mkdir(parents=True, exist_ok=True)
+            candidate = Workspace(str(root))
+            return {"root": str(candidate.root), "name": root.name, "configured": True,
+                    "temporary": True, "conversation_id_hash": digest,
+                    "message": "Isolated conversation workspace ready; the general workspace setting was not changed."}
         if name == "workspace_browse":
             return self._browse_workspace()
         if name == "workspace_open_recent":
