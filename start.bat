@@ -39,9 +39,11 @@ if /i not "%~1"=="--zs-updated" (
             REM Only tracked edits should block an update. Ignore untracked and
             REM ignored local files (logs, caches, credentials, generated data).
             REM The fast-forward merge below remains the final safety check.
-            git diff --quiet --ignore-submodules --
+            REM Ignore CRLF/LF-only differences from Windows Git settings.
+            REM They are not real local edits and must not block startup updates.
+            git diff --quiet --ignore-submodules --ignore-cr-at-eol --
             if errorlevel 1 set "ZS_DIRTY=1"
-            git diff --cached --quiet --ignore-submodules --
+            git diff --cached --quiet --ignore-submodules --ignore-cr-at-eol --
             if errorlevel 1 set "ZS_DIRTY=1"
 
             echo(!ZS_ORIGIN!| findstr /i /c:"robby-gridpoint/ZeroScript-Win" >nul
