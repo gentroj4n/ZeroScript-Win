@@ -3024,6 +3024,8 @@
     try { chrome.storage.local.set({ [PROJECT_MAP_KEY]: conversationProjects }); } catch {}
   }
   async function workspaceCall(name, args = {}, projectPath = "") {
+    // Internal selector/bootstrap calls execute directly; actual model workspace
+    // operations pass their conversation's pinned path to the atomic queue.
     const response = await bg({
       type: "call_tool", name, arguments: args, timeout: 30000,
       projectPath: String(name || "").includes("workspace_") ? projectPath : ""
