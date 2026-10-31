@@ -131,32 +131,18 @@ async function activateWorkspaceRoot(projectPath) {
   return actualRoot;
 }
 async function callToolInProject(projectPath, name, args, timeout) {
-  return queueWorkspaceDispatch(async () => {
-    // The bridge exposes a single active root. Treat a conversation assignment as
-    // a temporary execution context: remember the shared root, run exactly one
-    // operation in the assigned project, then restore the shared root before
-    // releasing the queue. This prevents a chat-specific project from replacing
-    // the user's general workspace or racing another conversation.
-    const beforeResponse = await sendWorkspaceTool("workspace_info", {}, 30000);
-    const before = await parseWorkspaceResult(beforeResponse);
-    const previousRoot = before && (before.root || before.workspace_root) || "";
-    let result;
-    try {
-      await activateWorkspaceRoot(projectPath);
-      result = await sendWorkspaceTool(name, args || {}, timeout);
-      return result;
-    } finally {
-      if (previousRoot && normalizeWorkspacePath(previousRoot) !== normalizeWorkspacePath(projectPath)) {
-        try {
-          await activateWorkspaceRoot(previousRoot);
-          log("Restored shared workspace root after conversation-scoped tool:", previousRoot);
-        } catch (error) {
-          log("ERROR: Could not restore shared workspace root after conversation-scoped tool:",
-            previousRoot, String(error && error.message || error));
-        }
-      }
-    }
-  });
+  // Pass the conversation root as request metadata. The bridge creates a scoped
+  // manager view for this call, so parallel conversations never mutate or queue
+  // behind the shared global workspace root.
+  const duration = timeout || 120000;
+  const response = await send({
+    type: "call_tool", name, arguments: args || {}, timeout: duration,
+    workspace_root: projectPath
+  }, duration + 10000);
+  if (!response || !response.ok) {
+    throw new Error(response && response.error || "Workspace operation failed: " + name);
+  }
+  return response;
 }
 
 let ws = null;
