@@ -3019,15 +3019,27 @@
     if (!response || !response.ok) {
       throw new Error(response && response.error || "Workspace tool failed: " + name);
     }
-    const result = response.result && response.result.content ? response.result.content : response.result;
-    if (Array.isArray(result)) {
-      const part = result.find((item) => item && typeof item.text === "string");
-      if (part) {
-        try { return JSON.parse(part.text); } catch { return part.text; }
+    let result = response.result && response.result.content ? response.result.content : response.result;
+    // Bridge versions may return MCP content blocks, a JSON string, or the
+    // already-decoded tool object. Normalize all supported envelopes.
+    for (let depth = 0; depth < 4; depth++) {
+      if (Array.isArray(result)) {
+        const part = result.find((item) => item && typeof item.text === "string");
+        if (!part) break;
+        result = part.text;
+        continue;
       }
-    }
-    if (typeof result === "string") {
-      try { return JSON.parse(result); } catch { return result; }
+      if (result && typeof result === "object") {
+        if (typeof result.root === "string" || typeof result.path === "string") return result;
+        if (typeof result.text === "string") { result = result.text; continue; }
+        if (result.result !== undefined) { result = result.result; continue; }
+        if (result.content !== undefined) { result = result.content; continue; }
+        return result;
+      }
+      if (typeof result === "string") {
+        try { result = JSON.parse(result); continue; } catch { return result; }
+      }
+      break;
     }
     return result || {};
   }
@@ -3040,13 +3052,18 @@
     // New chats get an isolated scratch root keyed by provider + conversation ID.
     // This creates a directory only; it does not change the general workspace.
     const created = await workspaceCall("workspace_create_conversation_root", { conversation_id: id });
-    if (!created || !created.root) throw new Error("Bridge did not return an isolated conversation workspace.");
+    const createdRoot = created && (created.root || created.path);
+    if (!createdRoot) {
+      const detail = created && (created.message || created.error || created.text);
+      throw new Error("Bridge did not return an isolated conversation workspace" +
+        (detail ? ": " + String(detail).slice(0, 240) : "."));
+    }
     conversationProjects[id] = {
-      path: created.root, name: created.name || projectName(created.root),
+      path: createdRoot, name: created.name || projectName(createdRoot),
       temporary: true, updatedAt: Date.now()
     };
     saveConversationProjects();
-    diag("projectDirectory.temporaryCreated", { conversationId: id, root: created.root });
+    diag("projectDirectory.temporaryCreated", { conversationId: id, root: createdRoot });
     return conversationProjects[id];
   }
   async function selectConversationProject(path) {
