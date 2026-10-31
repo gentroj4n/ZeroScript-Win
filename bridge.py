@@ -23,6 +23,7 @@ import base64
 import json
 import os
 import hashlib
+import copy
 from pathlib import Path
 import queue
 import re
@@ -2030,18 +2031,26 @@ def probe_studio():
     return {"app": True, "place": place}
 
 
-def safe_call(name, arguments, timeout):
-    """Never raises. Always returns a dict the extension can feed back to DeepSeek."""
+def safe_call(name, arguments, timeout, workspace_root=None):
+    """Execute a tool in an optional per-call workspace without mutating global state."""
     try:
-        # Workspace introspection is local and must never wait behind an MCP
-        # server's call lock/restart. The extension uses this for connection and
-        # per-conversation workspace setup, so keep it on a direct fast path.
+        target = mgr
+        if workspace_root and (name.startswith("workspace_") or name == "workspace_preview_image" or name == "roblox_export_tree"):
+            if Workspace is None:
+                raise RuntimeError("Workspace tools could not be imported.")
+            scoped_workspace = Workspace(workspace_root)
+            target = copy.copy(mgr)
+            target.workspace = scoped_workspace
+            target.workspace_root = str(scoped_workspace.root)
+            target.workspace_configured = True
+            target.workspace_source = "conversation"
+            target.workspace_error = None
         if name == "workspace_info":
-            result = {"text": json.dumps(mgr._workspace_description(), ensure_ascii=False), "images": []}
+            result = {"text": json.dumps(target._workspace_description(), ensure_ascii=False), "images": []}
         elif name == "workspace_recent_roots":
-            result = {"text": json.dumps(mgr._call_workspace(name, arguments or {}), ensure_ascii=False), "images": []}
+            result = {"text": json.dumps(target._call_workspace(name, arguments or {}), ensure_ascii=False), "images": []}
         else:
-            result = mgr.call(name, arguments, timeout)
+            result = target.call(name, arguments, timeout)
         return {"ok": True, "text": result["text"], "images": result["images"]}
     except TimeoutError as e:
         return {"ok": False, "error": str(e), "kind": "timeout"}
@@ -2049,7 +2058,7 @@ def safe_call(name, arguments, timeout):
         return {"ok": False, "error": str(e), "kind": type(e).__name__}
 
 
-async def run_tool_task(ws, name, args, timeout, rid, role):
+async def run_tool_task(ws, name, args, timeout, rid, role, workspace_root=None):
     """Execute one tool off the socket read loop; always settle in-flight accounting."""
     t0 = time.monotonic()
     try:
@@ -2063,7 +2072,7 @@ async def run_tool_task(ws, name, args, timeout, rid, role):
                     for client in clients
                 )
                 if cli_ready:
-                    res = await asyncio.to_thread(safe_call, name, args, timeout)
+                    res = await asyncio.to_thread(safe_call, name, args, timeout, workspace_root)
                 else:
                     res = {
                         "ok": False,
@@ -2388,7 +2397,7 @@ async def handler(ws):
                 # The extension only ever has ONE call_tool in flight (its agent
                 # loop awaits each result before sending the next), so this never
                 # overlaps tool executions.
-                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid, role))
+                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid, role, msg.get("workspace_root")))
 
             elif mtype in ("add_server", "remove_server"):
                 # Adding/removing an addon MCP server rewrites config.json, which
