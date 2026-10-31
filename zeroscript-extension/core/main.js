@@ -1056,6 +1056,26 @@
   }
 
   async function runTool(call) {
+    let conversationProjectPath = "";
+    if (String(call && call.tool || "").includes("workspace_")) {
+      try {
+        await projectSwitchPromise.catch(() => {});
+        const navigationKey = P.conversationKey();
+        await loadConversationProjects();
+        if (navigationKey !== P.conversationKey()) {
+          return "ERROR: Conversation changed while resolving its project. Retry the tool in the destination chat.";
+        }
+        const assigned = conversationProjects[projectConversationId()];
+        if (assigned && assigned.path) {
+          conversationProjectPath = assigned.path;
+        } else {
+          return "ERROR: This conversation has no project directory assigned. Choose a project folder from the ArcScript options menu before using workspace tools.";
+        }
+      } catch (error) {
+        return "ERROR: Could not resolve this conversation's project directory: " +
+          String(error && error.message || error);
+      }
+    }
     if (isConversationDisabled()) {
       diag("tool.blockedConversationDisabled");
       return "ERROR: ZeroScript is disabled for this conversation; no further tool actions will be dispatched.";
@@ -1240,7 +1260,10 @@
     const stopWatch = new Promise((res) => {
       stopTimer = setInterval(() => { if (A.stop) res({ ok: false, kind: "stopped" }); }, 150);
     });
-    let r = await Promise.race([bg({ type: "call_tool", name, arguments: args, timeout }), hardCap, stopWatch]);
+    let r = await Promise.race([bg({
+      type: "call_tool", name, arguments: args, timeout,
+      projectPath: String(name || "").includes("workspace_") ? conversationProjectPath : "",
+    }), hardCap, stopWatch]);
     clearInterval(stopTimer);
     if (r && r.kind === "stopped") return "(stopped by user)";
     if (!r) return ZS.FEEDBACK.bridgeOffline;
@@ -2031,6 +2054,7 @@
       customPrompt: ui.getCustomPrompt(),
       providerNotes: P.promptExtra || "",
       tools: A.toolList || [],
+      projectContext: conversationProjectContext(),
     });
   }
 
@@ -2233,6 +2257,22 @@
     // Do not lock the native composer during bootstrap; users must retain normal\n    // editing keys (including Space and Delete) while ArcScript initializes.
     ui.inputCover(true);  // cover the composer ("Working…") for the WHOLE Starting Up
     try {
+      await loadConversationProjects();
+      if (!alive()) return;
+      const initialProjectId = projectConversationId();
+      if (initialProjectId && !conversationProjects[initialProjectId]) {
+        // A fresh conversation inherits the current bridge root once, then
+        // receives its own stable directory binding for subsequent navigation.
+        const workspace = await workspaceCall("workspace_info");
+        if (workspace && workspace.configured && workspace.root) {
+          conversationProjects[initialProjectId] = {
+            path: workspace.root, name: projectName(workspace.root), updatedAt: Date.now()
+          };
+          saveConversationProjects();
+        }
+      }
+      await ensureConversationProject();
+      if (!alive()) return;
       await ensureTools(true); // boot: always take a fresh catalogue (the TTL then
                                // covers the list_commands / list_mcp_servers calls
                                // the model makes seconds later)
@@ -2935,6 +2975,185 @@
   // ════════════════════════════════════════════════════════════════════════
   //  UI  (control panel, onboarding, stop button, banners, toast, input cover)
   // ════════════════════════════════════════════════════════════════════════
+  // Conversation-scoped project directory assignments.
+  // The local bridge has one active root, so re-apply this chat's directory
+  // before every workspace operation to prevent cross-project edits.
+  const PROJECT_MAP_KEY = "zsConversationProjectsV1";
+  let conversationProjects = {};
+  let projectMapReady = false;
+  let projectMapPromise = null;
+  let projectSwitchPromise = Promise.resolve();
+
+  const projectConversationId = () => {
+    const key = P.conversationKey();
+    return key ? P.id + ":" + key : "";
+  };
+  const projectName = (path) => {
+    const clean = String(path || "").replace(/[\\/]+$/, "");
+    return clean.split(/[\\/]/).filter(Boolean).pop() || clean || "No project";
+  };
+  async function loadConversationProjects() {
+    if (projectMapReady) return;
+    if (!projectMapPromise) {
+      projectMapPromise = new Promise((resolve, reject) => {
+        try {
+          chrome.storage.local.get(PROJECT_MAP_KEY, (values) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            if (values && values[PROJECT_MAP_KEY] && typeof values[PROJECT_MAP_KEY] === "object") {
+              conversationProjects = values[PROJECT_MAP_KEY];
+            }
+            projectMapReady = true;
+            resolve();
+          });
+        } catch (error) { reject(error); }
+      }).catch((error) => {
+        projectMapPromise = null;
+        throw error;
+      });
+    }
+    return projectMapPromise;
+  }
+  function saveConversationProjects() {
+    try { chrome.storage.local.set({ [PROJECT_MAP_KEY]: conversationProjects }); } catch {}
+  }
+  async function workspaceCall(name, args = {}, projectPath = "") {
+    // Internal selector/bootstrap calls execute directly; actual model workspace
+    // operations pass their conversation's pinned path to the atomic queue.
+    const response = await bg({
+      type: "call_tool", name, arguments: args, timeout: 30000,
+      projectPath: String(name || "").includes("workspace_") ? projectPath : ""
+    });
+    if (!response || !response.ok) {
+      throw new Error(response && response.error || "Workspace tool failed: " + name);
+    }
+    const result = response.result && response.result.content ? response.result.content : response.result;
+    if (Array.isArray(result)) {
+      const part = result.find((item) => item && typeof item.text === "string");
+      if (part) {
+        try { return JSON.parse(part.text); } catch { return part.text; }
+      }
+    }
+    if (typeof result === "string") {
+      try { return JSON.parse(result); } catch { return result; }
+    }
+    return result || {};
+  }
+  async function activateConversationProject() {
+    await loadConversationProjects();
+    const id = projectConversationId();
+    if (!id) return null;
+    const assigned = conversationProjects[id];
+    const current = await workspaceCall("workspace_info");
+    if (!assigned) {
+      // Pin the user's currently selected folder the first time this chat is seen.
+      if (current && current.configured && current.root) {
+        conversationProjects[id] = {
+          path: current.root, name: projectName(current.root), updatedAt: Date.now()
+        };
+        saveConversationProjects();
+      }
+      return current;
+    }
+    if (current && current.root &&
+        current.root.toLowerCase() === assigned.path.toLowerCase()) return current;
+    const opened = await workspaceCall("workspace_open_recent", { path: assigned.path }, "");
+    const root = opened && (opened.root || opened.workspace_root);
+    if (!root || opened.configured === false) {
+      throw new Error("This conversation's project directory is unavailable: " + assigned.path);
+    }
+    assigned.path = root;
+    assigned.name = projectName(root);
+    assigned.updatedAt = Date.now();
+    saveConversationProjects();
+    return opened;
+  }
+  async function selectConversationProject(path) {
+    const root = String(path || "").trim();
+    const id = projectConversationId();
+    if (!root) throw new Error("Enter a project directory.");
+    if (!id) throw new Error("Send a message in this chat first so it has a stable conversation ID.");
+    projectSwitchPromise = projectSwitchPromise.catch(() => {}).then(async () => {
+      const recentResult = await workspaceCall("workspace_recent_roots");
+      const recentRoots = recentResult && (recentResult.recent_roots || recentResult.roots) || [];
+      const known = recentRoots.some((item) => item && item.path &&
+        item.path.toLowerCase() === root.toLowerCase());
+      const current = await workspaceCall("workspace_info");
+      const isCurrent = current && current.root &&
+        current.root.toLowerCase() === root.toLowerCase();
+      const opened = known || isCurrent
+        ? await workspaceCall("workspace_open_recent", { path: root })
+        : await workspaceCall("workspace_set_root", { path: root });
+      const actualRoot = opened && (opened.root || opened.workspace_root);
+      if (!actualRoot || opened.configured === false) {
+        throw new Error("Could not open project directory: " + root);
+      }
+      conversationProjects[id] = {
+        path: actualRoot, name: projectName(actualRoot), updatedAt: Date.now()
+      };
+      saveConversationProjects();
+      diag("projectDirectory.assigned", { conversationId: id, root: actualRoot });
+      return actualRoot;
+    });
+    return projectSwitchPromise;
+  }
+  async function chooseConversationProject() {
+    await loadConversationProjects();
+    const current = await workspaceCall("workspace_info");
+    const recentResult = await workspaceCall("workspace_recent_roots");
+    const recent = Array.isArray(recentResult) ? recentResult :
+      (recentResult && (recentResult.recent_roots || recentResult.roots || recentResult.workspaces || recentResult.items)) || [];
+    const paths = recent.map((item) => typeof item === "string" ? item : item && item.path)
+      .filter(Boolean);
+    if (current && current.root && !paths.includes(current.root)) paths.unshift(current.root);
+    const uniquePaths = [...new Set(paths)];
+    const assigned = conversationProjects[projectConversationId()];
+    const prompt = "Project directory for this conversation:\n\n" +
+      (uniquePaths.length ? uniquePaths.map((path, index) => (index + 1) + ". " + path).join("\n") :
+        "No recent project folders yet.") +
+      "\n\nEnter a listed number, paste an absolute path, or leave blank to choose a folder:";
+    const entered = window.prompt(prompt, assigned && assigned.path || current.root || "");
+    if (entered == null) return null;
+    const selection = entered.trim();
+    if (!selection) {
+      const picked = await workspaceCall("workspace_browse");
+      if (!picked || picked.cancelled || !picked.selected_path) return null;
+      return { root: await selectConversationProject(picked.selected_path) };
+    }
+    const number = Number(selection);
+    const path = Number.isInteger(number) && number >= 1 && number <= uniquePaths.length
+      ? uniquePaths[number - 1] : selection;
+    return { root: await selectConversationProject(path) };
+  }
+  async function ensureConversationProject() {
+    if (!projectConversationId()) return;
+    await activateConversationProject();
+  }
+  function conversationProjectContext() {
+    const assigned = conversationProjects[projectConversationId()];
+    if (!assigned) return "";
+    return "\n\nACTIVE CONVERSATION PROJECT\nThis conversation is assigned to project " +
+      assigned.name + " at " + assigned.path +
+      ". All workspace_* file, search, Git, task, build and command operations MUST use this project only. Never use another conversation's project. Switch the project assignment before working in another directory.\n";
+  }
+  function projectDirectoryControlHtml() {
+    const assigned = conversationProjects[projectConversationId()];
+    const label = assigned ? assigned.name + " · " + assigned.path :
+      "No project assigned to this conversation";
+    const safe = String(label).replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[character]));
+    return '<section class="zs-menu-sec zs-project-directory">' +
+      '<div class="zs-sec-label"><span>Project for this conversation</span></div>' +
+      '<div class="zs-menu-note" id="zs-project-current">' + safe + '</div>' +
+      '<button id="zs-project-choose" class="zs-chat-control" type="button">Choose / switch project directory</button>' +
+      '<button id="zs-project-clear" class="zs-chat-control" type="button" ' +
+      (assigned ? "" : "disabled") + '>Use shared workspace instead</button>' +
+      '<div class="zs-menu-note">Saved independently per chat. Other conversations keep their own project folders.</div></section>';
+  }
+
   const ui = (() => {
     let root, bar, dot, brandEl, stateEl, actionBtn, stopBtn, switchBtn, menuEl, unstableEl;
     let cover, coverRaf, barRaf;
@@ -2999,6 +3218,9 @@
           // has arrived, so the very first render always shows an empty/stale
           // MCP servers section otherwise - nothing ever refreshed it after.
           buildMenu();
+          loadConversationProjects().then(() => {
+            if (!menuEl.hidden) buildMenu();
+          }).catch((error) => diag("projectDirectory.restoreFailed", { error: String(error && error.message || error) }));
           syncMenuPrompt();
           // Let placeBar establish the panel bounds before setting its initial scroll position.
           requestAnimationFrame(() => {
@@ -3159,6 +3381,7 @@
         const healthTitle = s.alive === true ? `${s.tools || 0} tools available` : s.alive === false ? "offline" : "status unknown";
         mcpList += `<div class="zs-mcp-item"><span class="zs-mcp-health zs-mcp-health-${healthClass}" title="${healthTitle}"></span><div class="zs-mcp-info"><span class="zs-mcp-name">${esc(s.name)}</span><span class="zs-mcp-url">${esc(s.command || s.id)}</span></div><button class="zs-mcp-remove" data-id="${esc(s.id)}" title="Remove">✕</button></div>`;
       });
+      const projectDirectoryControl = projectDirectoryControlHtml();
       const conversationControl = isConversationDisabled()
         ? `<section class="zs-menu-sec"><div class="zs-sec-label"><span>This conversation</span></div><div class="zs-menu-note">ZeroScript is off for this chat. Normal messages pass through without agent tools.</div><button id="zs-enable-chat" class="zs-chat-control zs-chat-control-enable" type="button">Enable ZeroScript in this chat</button></section>`
         : (A.started || A.starting || A.running)
@@ -3167,6 +3390,7 @@
       menuEl.innerHTML =
         `<div class="zs-menu-head"><span class="zs-menu-logo">ArcScript</span><span class="zs-menu-tag">v${EXT_VERSION}</span></div>
          ${conversationControl}
+         ${projectDirectoryControl}
          <section class="zs-menu-sec">
            <div class="zs-sec-label"><span>Switch AI</span></div>
            ${sites}
@@ -3196,6 +3420,33 @@
       if (enableChatBtn) enableChatBtn.addEventListener("click", () => {
         menuEl.hidden = true;
         enableCurrentConversation();
+      });
+      const chooseProjectButton = menuEl.querySelector("#zs-project-choose");
+      if (chooseProjectButton) chooseProjectButton.addEventListener("click", async () => {
+        chooseProjectButton.disabled = true;
+        chooseProjectButton.textContent = "Opening project…";
+        try {
+          const selected = await chooseConversationProject();
+          if (selected) {
+            ui.toast("Project assigned to this conversation: " + selected.root);
+          } else {
+            ui.toast("Project selection cancelled; this conversation was not changed.");
+          }
+          buildMenu();
+        } catch (error) {
+          ui.toast("Project switch failed: " + String(error && error.message || error));
+          buildMenu();
+        }
+      });
+      const clearProjectButton = menuEl.querySelector("#zs-project-clear");
+      if (clearProjectButton) clearProjectButton.addEventListener("click", async () => {
+        const id = projectConversationId();
+        if (!id || !conversationProjects[id]) return;
+        if (!window.confirm("Remove this conversation's project assignment? Workspace tools will stay blocked until you assign a directory again.")) return;
+        delete conversationProjects[id];
+        saveConversationProjects();
+        ui.toast("Project assignment removed for this conversation.");
+        buildMenu();
       });
       menuEl.querySelectorAll("button.zs-site-opt").forEach((b) =>
         b.addEventListener("click", () => open(b.dataset.u)));
@@ -5080,6 +5331,7 @@
     }
 
     syncSessionState();
+    ensureConversationProject().catch((error) => diag("projectDirectory.navigationActivationFailed", { error: String(error && error.message || error) }));
     decorateConversationIndicators();
     scheduleSweep();
   }

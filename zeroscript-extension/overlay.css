@@ -330,6 +330,26 @@ html.zs-light #zs-menu::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); b
   border-color: rgba(52, 211, 153, 0.3); color: #6ee7b7; background: rgba(6, 78, 59, 0.18);
 }
 .zs-chat-control-enable:hover { background: rgba(6, 78, 59, 0.28); }
+/* Project scope control in the conversation menu. */
+.zs-project-directory .zs-menu-note#zs-project-current {
+  color: #c6c6ce;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.zs-project-directory .zs-chat-control {
+  margin: 3px 0;
+  border-color: rgba(129, 140, 248, 0.26);
+  color: #c7d2fe;
+  background: rgba(49, 46, 129, 0.18);
+}
+.zs-project-directory .zs-chat-control:hover {
+  background: rgba(49, 46, 129, 0.30);
+}
+.zs-project-directory .zs-chat-control:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
 
 /* AI site rows: plain list, subtle surface on hover */
 .zs-site-opt {

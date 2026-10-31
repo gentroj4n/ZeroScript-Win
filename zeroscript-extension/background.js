@@ -68,6 +68,64 @@ const HEARTBEAT_MS = 10000;
 const STALE_SOCKET_MS = 25000;
 const REQUEST_TIMEOUT_DEFAULT = 130000; // a bit above the 120s tool timeout
 
+// Workspace tools share one bridge-wide active root. Serialize root activation
+// and the subsequent tool call in this worker so separate AI tabs cannot switch
+// the bridge between those two operations.
+let workspaceDispatchQueue = Promise.resolve();
+function queueWorkspaceDispatch(operation) {
+  const run = workspaceDispatchQueue.catch(() => {}).then(operation);
+  workspaceDispatchQueue = run.catch(() => {});
+  return run;
+}
+async function sendWorkspaceTool(name, args, timeout) {
+  const duration = timeout || 120000;
+  const response = await send({
+    type: "call_tool", name, arguments: args || {}, timeout: duration
+  }, duration + 10000);
+  if (!response || !response.ok) {
+    throw new Error(response && response.error || "Workspace operation failed: " + name);
+  }
+  return response;
+}
+async function callToolInProject(projectPath, name, args, timeout) {
+  return queueWorkspaceDispatch(async () => {
+    // Explicitly stored folders are user-approved local paths; register them
+    // through the bridge's workspace_set_root API when not yet in recents.
+    // The native folder picker is a bridge-side dialog. It returns the selected
+    // absolute path but deliberately does not change the active workspace.
+    const recentResponse = await sendWorkspaceTool("workspace_recent_roots", {}, 30000);
+    const rawRecent = recentResponse.result && recentResponse.result.content
+      ? recentResponse.result.content : recentResponse.result;
+    let recentData = rawRecent;
+    if (Array.isArray(rawRecent)) {
+      const part = rawRecent.find((item) => item && typeof item.text === "string");
+      if (part) { try { recentData = JSON.parse(part.text); } catch {} }
+    } else if (typeof rawRecent === "string") {
+      try { recentData = JSON.parse(rawRecent); } catch {}
+    }
+    const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
+    const isRecent = recentRoots.some((item) => item && item.path &&
+      String(item.path).toLowerCase() === String(projectPath).toLowerCase());
+    const activate = isRecent
+      ? await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000)
+      : await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
+    const payload = activate.result && activate.result.content ? activate.result.content : activate.result;
+    let opened = payload;
+    if (Array.isArray(payload)) {
+      const part = payload.find((item) => item && typeof item.text === "string");
+      if (part) { try { opened = JSON.parse(part.text); } catch {} }
+    } else if (typeof payload === "string") {
+      try { opened = JSON.parse(payload); } catch {}
+    }
+    const actualRoot = opened && (opened.root || opened.workspace_root);
+    if (!actualRoot || opened.configured === false ||
+        String(actualRoot).toLowerCase() !== String(projectPath).toLowerCase()) {
+      throw new Error("Could not activate the assigned project directory: " + projectPath);
+    }
+    return sendWorkspaceTool(name, args || {}, timeout);
+  });
+}
+
 let ws = null;
 let connected = false;
 let reconnectDelay = RECONNECT_MIN;
@@ -519,10 +577,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       case "call_tool": {
         const timeout = (msg.timeout || 120000) + 10000;
-        const r = await send(
-          { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
-          timeout
-        );
+        const isWorkspaceTool = String(msg.name || "").includes("workspace_");
+        const r = isWorkspaceTool && msg.projectPath
+          ? await callToolInProject(msg.projectPath, msg.name, msg.arguments, msg.timeout)
+          : await send(
+              { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
+              timeout
+            );
         sendResponse(r);
         break;
       }
