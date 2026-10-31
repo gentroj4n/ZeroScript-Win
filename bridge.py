@@ -2033,7 +2033,15 @@ def probe_studio():
 def safe_call(name, arguments, timeout):
     """Never raises. Always returns a dict the extension can feed back to DeepSeek."""
     try:
-        result = mgr.call(name, arguments, timeout)
+        # Workspace introspection is local and must never wait behind an MCP
+        # server's call lock/restart. The extension uses this for connection and
+        # per-conversation workspace setup, so keep it on a direct fast path.
+        if name == "workspace_info":
+            result = {"text": json.dumps(mgr._workspace_description(), ensure_ascii=False), "images": []}
+        elif name == "workspace_recent_roots":
+            result = {"text": json.dumps(mgr._call_workspace(name, arguments or {}), ensure_ascii=False), "images": []}
+        else:
+            result = mgr.call(name, arguments, timeout)
         return {"ok": True, "text": result["text"], "images": result["images"]}
     except TimeoutError as e:
         return {"ok": False, "error": str(e), "kind": "timeout"}
