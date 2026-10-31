@@ -91,6 +91,8 @@ async function callToolInProject(projectPath, name, args, timeout) {
   return queueWorkspaceDispatch(async () => {
     // Explicitly stored folders are user-approved local paths; register them
     // through the bridge's workspace_set_root API when not yet in recents.
+    // The native folder picker is a bridge-side dialog. It returns the selected
+    // absolute path but deliberately does not change the active workspace.
     const recentResponse = await sendWorkspaceTool("workspace_recent_roots", {}, 30000);
     const rawRecent = recentResponse.result && recentResponse.result.content
       ? recentResponse.result.content : recentResponse.result;
@@ -104,12 +106,9 @@ async function callToolInProject(projectPath, name, args, timeout) {
     const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
     const isRecent = recentRoots.some((item) => item && item.path &&
       String(item.path).toLowerCase() === String(projectPath).toLowerCase());
-    let activate;
-    if (isRecent) {
-      activate = await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000);
-    } else {
-      activate = await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
-    }
+    const activate = isRecent
+      ? await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000)
+      : await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
     const payload = activate.result && activate.result.content ? activate.result.content : activate.result;
     let opened = payload;
     if (Array.isArray(payload)) {
