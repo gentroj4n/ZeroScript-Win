@@ -1060,7 +1060,11 @@
     if (String(call && call.tool || "").includes("workspace_")) {
       try {
         await projectSwitchPromise.catch(() => {});
+        const navigationKey = P.conversationKey();
         await loadConversationProjects();
+        if (navigationKey !== P.conversationKey()) {
+          return "ERROR: Conversation changed while resolving its project. Retry the tool in the destination chat.";
+        }
         const assigned = conversationProjects[projectConversationId()];
         if (assigned && assigned.path) {
           conversationProjectPath = assigned.path;
