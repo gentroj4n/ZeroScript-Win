@@ -107,7 +107,7 @@ async function activateWorkspaceRoot(projectPath) {
   const recentData = await parseWorkspaceResult(recentResponse);
   const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
   const isRecent = recentRoots.some((item) => item && item.path &&
-    String(item.path).toLowerCase() === String(projectPath).toLowerCase());
+    normalizeWorkspacePath(item.path) === normalizeWorkspacePath(projectPath));
   const activate = isRecent
     ? await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000)
     : await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
