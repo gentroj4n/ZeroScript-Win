@@ -3442,17 +3442,10 @@
       if (clearProjectButton) clearProjectButton.addEventListener("click", async () => {
         const id = projectConversationId();
         if (!id || !conversationProjects[id]) return;
+        if (!window.confirm("Remove this conversation's project assignment? Workspace tools will stay blocked until you assign a directory again.")) return;
         delete conversationProjects[id];
         saveConversationProjects();
-        try {
-          const current = await workspaceCall("workspace_info");
-          if (current && current.configured && current.root) {
-            await workspaceCall("workspace_open_recent", { path: current.root });
-          }
-          ui.toast("This conversation now follows the shared workspace.");
-        } catch (error) {
-          ui.toast("Could not restore the shared workspace: " + String(error && error.message || error));
-        }
+        ui.toast("Project assignment removed for this conversation.");
         buildMenu();
       });
       menuEl.querySelectorAll("button.zs-site-opt").forEach((b) =>
