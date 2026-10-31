@@ -89,7 +89,27 @@ async function sendWorkspaceTool(name, args, timeout) {
 }
 async function callToolInProject(projectPath, name, args, timeout) {
   return queueWorkspaceDispatch(async () => {
-    const activate = await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000);
+    // Explicitly stored folders are user-approved local paths; register them
+    // through the bridge's workspace_set_root API when not yet in recents.
+    const recentResponse = await sendWorkspaceTool("workspace_recent_roots", {}, 30000);
+    const rawRecent = recentResponse.result && recentResponse.result.content
+      ? recentResponse.result.content : recentResponse.result;
+    let recentData = rawRecent;
+    if (Array.isArray(rawRecent)) {
+      const part = rawRecent.find((item) => item && typeof item.text === "string");
+      if (part) { try { recentData = JSON.parse(part.text); } catch {} }
+    } else if (typeof rawRecent === "string") {
+      try { recentData = JSON.parse(rawRecent); } catch {}
+    }
+    const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
+    const isRecent = recentRoots.some((item) => item && item.path &&
+      String(item.path).toLowerCase() === String(projectPath).toLowerCase());
+    let activate;
+    if (isRecent) {
+      activate = await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000);
+    } else {
+      activate = await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
+    }
     const payload = activate.result && activate.result.content ? activate.result.content : activate.result;
     let opened = payload;
     if (Array.isArray(payload)) {
