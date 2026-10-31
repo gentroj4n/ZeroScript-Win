@@ -3087,13 +3087,9 @@
       const current = await workspaceCall("workspace_info");
       const isCurrent = current && current.root &&
         current.root.toLowerCase() === root.toLowerCase();
-      let opened;
-      if (known || isCurrent) {
-        opened = await workspaceCall("workspace_open_recent", { path: root });
-      } else {
-        // The typed path is explicit user consent to register a new directory.
-        opened = await workspaceCall("workspace_set_root", { path: root });
-      }
+      const opened = known || isCurrent
+        ? await workspaceCall("workspace_open_recent", { path: root })
+        : await workspaceCall("workspace_set_root", { path: root });
       const actualRoot = opened && (opened.root || opened.workspace_root);
       if (!actualRoot || opened.configured === false) {
         throw new Error("Could not open project directory: " + root);
