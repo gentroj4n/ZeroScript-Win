@@ -52,7 +52,7 @@ if /i not "%~1"=="--zs-updated" (
             ) else (
                 echo   UPDATE: Checking GitHub for the latest main...
                 call :log "UPDATE: fetching origin/main."
-                git fetch origin main --prune
+                git fetch --prune origin main
                 if errorlevel 1 (
                     echo   WARNING: Could not fetch from GitHub. Starting current version.
                     echo            Check internet access and GitHub authentication.
@@ -69,7 +69,7 @@ if /i not "%~1"=="--zs-updated" (
                             echo   UPDATE: Updated successfully. Restarting with the new version...
                             call :log "UPDATE: advanced from !ZS_HEAD_BEFORE! to !ZS_HEAD_AFTER!; restarting."
                             call "%~f0" --zs-updated
-                            exit /b %errorlevel%
+                            exit /b !errorlevel!
                         ) else (
                             echo   UPDATE: Already up to date.
                             call :log "UPDATE: already up to date."
