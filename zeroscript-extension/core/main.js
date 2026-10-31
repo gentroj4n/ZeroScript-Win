@@ -3055,7 +3055,12 @@
         // is allowed; saved recent paths use the narrower open_recent operation.
         await workspaceCall("workspace_set_root", { path: root });
       }
-      const opened = await workspaceCall("workspace_open_recent", { path: root });
+      let opened;
+      if (known || isCurrent) {
+        opened = await workspaceCall("workspace_open_recent", { path: root });
+      } else {
+        opened = await workspaceCall("workspace_set_root", { path: root });
+      }
       const actualRoot = opened && (opened.root || opened.workspace_root);
       if (!actualRoot || opened.configured === false) {
         throw new Error("Could not open project directory: " + root);
