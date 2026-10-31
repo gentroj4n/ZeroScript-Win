@@ -1056,12 +1056,27 @@
   }
 
   async function runTool(call) {
+    let conversationProjectPath = "";
     if (String(call && call.tool || "").includes("workspace_")) {
       try {
         await projectSwitchPromise.catch(() => {});
-        await ensureConversationProject();
+        await loadConversationProjects();
+        const assigned = conversationProjects[projectConversationId()];
+        if (assigned && assigned.path) {
+          conversationProjectPath = assigned.path;
+        } else {
+          const current = await workspaceCall("workspace_info");
+          if (current && current.configured && current.root) {
+            const id = projectConversationId();
+            if (id) {
+              conversationProjects[id] = { path: current.root, name: projectName(current.root), updatedAt: Date.now() };
+              saveConversationProjects();
+              conversationProjectPath = current.root;
+            }
+          }
+        }
       } catch (error) {
-        return "ERROR: Could not activate this conversation's project directory: " +
+        return "ERROR: Could not resolve this conversation's project directory: " +
           String(error && error.message || error);
       }
     }
@@ -1249,7 +1264,10 @@
     const stopWatch = new Promise((res) => {
       stopTimer = setInterval(() => { if (A.stop) res({ ok: false, kind: "stopped" }); }, 150);
     });
-    let r = await Promise.race([bg({ type: "call_tool", name, arguments: args, timeout }), hardCap, stopWatch]);
+    let r = await Promise.race([bg({
+      type: "call_tool", name, arguments: args, timeout,
+      projectPath: String(name || "").includes("workspace_") ? conversationProjectPath : ""
+    }), hardCap, stopWatch]);
     clearInterval(stopTimer);
     if (r && r.kind === "stopped") return "(stopped by user)";
     if (!r) return ZS.FEEDBACK.bridgeOffline;
