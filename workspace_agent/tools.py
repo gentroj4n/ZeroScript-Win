@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -134,39 +135,45 @@ class Workspace:
         except re.error as exc:
             raise WorkspaceError(f"Invalid search regular expression: {exc}") from exc
         base = self._resolve(path)
-        if not base.is_dir():
-            raise WorkspaceError(f"Not a directory: {path}")
+        if not base.exists():
+            raise WorkspaceError(f"Path does not exist: {path}")
         limit = max(1, min(int(max_results), MAX_RESULTS))
         matches: list[dict[str, Any]] = []
         visited = 0
-        for current, dirs, names in os.walk(base):
-            dirs[:] = sorted(d for d in dirs if d not in DEFAULT_IGNORES and not d.startswith(".")
-                              and not (Path(current) / d).is_symlink())
-            for name in sorted(names):
-                if name.startswith("."):
-                    continue
-                candidate = Path(current) / name
-                if candidate.is_symlink():
-                    continue
-                try:
-                    if candidate.stat().st_size > MAX_READ_BYTES:
+        files: list[Path] = []
+        if base.is_file():
+            files.append(base)
+        else:
+            for current, dirs, names in os.walk(base):
+                dirs[:] = sorted(d for d in dirs if d not in DEFAULT_IGNORES and not d.startswith(".")
+                                  and not (Path(current) / d).is_symlink())
+                for name in sorted(names):
+                    if name.startswith("."):
                         continue
-                    content = candidate.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
+                    candidate = Path(current) / name
+                    if candidate.is_symlink():
+                        continue
+                    files.append(candidate)
+        for candidate in files:
+            try:
+                if candidate.stat().st_size > MAX_READ_BYTES:
                     continue
-                visited += 1
-                for line_number, line in enumerate(content.splitlines(), 1):
-                    found = expression.search(line)
-                    if found:
-                        matches.append({
-                            "path": candidate.relative_to(self.root).as_posix(),
-                            "line": line_number,
-                            "column": found.start() + 1,
-                            "text": line[:500],
-                        })
-                        if len(matches) >= limit:
-                            return {"query": query, "case_sensitive": case_sensitive, "regex": regex,
-                                    "matches": matches, "truncated": True, "files_scanned": visited}
+                content = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            visited += 1
+            for line_number, line in enumerate(content.splitlines(), 1):
+                found = expression.search(line)
+                if found:
+                    matches.append({
+                        "path": candidate.relative_to(self.root).as_posix(),
+                        "line": line_number,
+                        "column": found.start() + 1,
+                        "text": line[:500],
+                    })
+                    if len(matches) >= limit:
+                        return {"query": query, "case_sensitive": case_sensitive, "regex": regex,
+                                "matches": matches, "truncated": True, "files_scanned": visited}
         return {"query": query, "case_sensitive": case_sensitive, "regex": regex,
                 "matches": matches, "truncated": False, "files_scanned": visited}
 

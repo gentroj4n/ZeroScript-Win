@@ -705,6 +705,7 @@ def _select_tools_for_task(catalogue: List[Dict[str, Any]], goal: str,
         "neon": {"neon", "postgres", "postgresql", "database", "sql", "migration"},
         "resend": {"resend", "email", "mail", "newsletter", "campaign"},
         "calendly": {"calendly", "meeting", "schedule", "event"},
+        "memory": {"memory", "remember", "persist", "entity", "relation", "knowledge", "graph"},
     }
     # MCP server IDs are user-configurable, so support common aliases rather than
     # assuming the server field is exactly the product's canonical name.
@@ -720,6 +721,7 @@ def _select_tools_for_task(catalogue: List[Dict[str, Any]], goal: str,
         "neon": ("neon", "postgres"),
         "resend": ("resend",),
         "calendly": ("calendly",),
+        "memory": ("memory",),
     }
     enabled_domains = {
         domain for domain, terms in domain_terms.items()

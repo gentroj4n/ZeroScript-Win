@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="GameboyEmu MAX">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#18202F"/>
+      <stop offset="1" stop-color="#0A0E16"/>
+    </linearGradient>
+    <linearGradient id="pix" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8FF0DF"/>
+      <stop offset="1" stop-color="#3BB8A6"/>
+    </linearGradient>
+    <clipPath id="round">
+      <rect x="16" y="16" width="480" height="480" rx="108"/>
+    </clipPath>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bg2)"/>
+  <g clip-path="url(#round)">
+    <circle cx="120" cy="90" r="180" fill="#3BB8A6" opacity="0.10"/>
+    <circle cx="420" cy="440" r="200" fill="#FF696E" opacity="0.08"/>
+  </g>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2E3A4E" stroke-width="6"/>
+
+  <!-- pixel screen: 4x3 blocks, an abstract sprite, not a play button -->
+  <g fill="url(#pix)">
+    <rect x="112" y="104" width="72" height="72" rx="10"/>
+    <rect x="196" y="104" width="72" height="72" rx="10" opacity="0.45"/>
+    <rect x="280" y="104" width="72" height="72" rx="10"/>
+    <rect x="364" y="104" width="36" height="72" rx="10" opacity="0.25"/>
+
+    <rect x="112" y="188" width="72" height="72" rx="10" opacity="0.45"/>
+    <rect x="196" y="188" width="72" height="72" rx="10"/>
+    <rect x="280" y="188" width="72" height="72" rx="10" opacity="0.45"/>
+    <rect x="364" y="188" width="36" height="72" rx="10"/>
+
+    <rect x="112" y="272" width="72" height="72" rx="10"/>
+    <rect x="196" y="272" width="72" height="72" rx="10" opacity="0.45"/>
+    <rect x="280" y="272" width="72" height="72" rx="10"/>
+    <rect x="364" y="272" width="36" height="72" rx="10" opacity="0.25"/>
+  </g>
+
+  <!-- MAX badge, bottom-left, no full-width bar -->
+  <rect x="112" y="376" width="196" height="64" rx="16" fill="#FF696E"/>
+  <text x="210" y="422" font-family="Montserrat, 'Segoe UI', Verdana, sans-serif" font-size="42" font-weight="800" letter-spacing="4" text-anchor="middle" fill="#0C111B">MAX</text>
+
+  <text x="330" y="418" font-family="Montserrat, 'Segoe UI', Verdana, sans-serif" font-size="22" font-weight="700" letter-spacing="1" fill="#7E8EA6">EMU</text>
+</svg>

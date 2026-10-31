@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 500" width="1500" height="500" role="img" aria-label="GameboyEmu MAX">
+  <defs>
+    <linearGradient id="bbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151D2B"/>
+      <stop offset="1" stop-color="#080B12"/>
+    </linearGradient>
+    <linearGradient id="bpix" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#B4FBEE"/>
+      <stop offset="0.55" stop-color="#5BD9C6"/>
+      <stop offset="1" stop-color="#2FA593"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#3BB8A6" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#3BB8A6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FF696E" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#FF696E" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1500" height="500" fill="url(#bbg)"/>
+  <ellipse cx="300" cy="250" rx="440" ry="320" fill="url(#glow)"/>
+  <ellipse cx="1320" cy="260" rx="380" ry="300" fill="url(#glow2)"/>
+
+  <rect x="132" y="112" width="276" height="276" rx="26" fill="#04070C" stroke="#222C3C" stroke-width="4"/>
+  <g fill="url(#bpix)" transform="translate(132,112) scale(0.69)">
+    <rect x="56" y="40"  width="48" height="48"/>
+    <rect x="248" y="40" width="48" height="48"/>
+    <rect x="56" y="88"  width="48" height="48"/>
+    <rect x="104" y="88" width="48" height="48"/>
+    <rect x="200" y="88" width="48" height="48"/>
+    <rect x="248" y="88" width="48" height="48"/>
+    <rect x="56" y="136" width="48" height="48"/>
+    <rect x="152" y="136" width="48" height="48"/>
+    <rect x="248" y="136" width="48" height="48"/>
+    <rect x="56" y="184" width="48" height="48"/>
+    <rect x="248" y="184" width="48" height="48"/>
+    <rect x="56" y="232" width="48" height="48"/>
+    <rect x="248" y="232" width="48" height="48"/>
+  </g>
+
+  <text x="462" y="248" font-family="Montserrat, 'Segoe UI', Verdana, sans-serif" font-size="92" font-weight="800" letter-spacing="-1" fill="#F2F6FC">GameboyEmu</text>
+  <text x="458" y="352" font-family="Montserrat, 'Segoe UI', Verdana, sans-serif" font-size="108" font-weight="900" letter-spacing="6" fill="#FF696E">MAX</text>
+  <text x="464" y="408" font-family="Montserrat, 'Segoe UI', Verdana, sans-serif" font-size="28" font-weight="600" letter-spacing="2" fill="#7E8EA6">PASTE A LINK. PRESS PLAY.</text>
+</svg>

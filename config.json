@@ -22,6 +22,38 @@
         "dominus-cli@latest",
         "dominus-mcp"
       ]
+    },
+    "discord": {
+      "command": "launch_discord_mcp.py",
+      "args": [],
+      "env": {
+        "DISCORD_BOT_TOKEN": "MTU2NDQwNjQyMTM4MDkyNzU1OA.GuCKY5.XIYju5TNbosjWajTMTjy2FX01E2QdybvPhONV0",
+        "ZS_DISCORD_GUILD_IDS": "1320196253962866688"
+      }
+    },
+    "github": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "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"
+      }
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest"
+      ]
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ]
     }
   }
 }

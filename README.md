@@ -77,13 +77,13 @@ The bridge exposes an expanded, project-scoped toolset:
 - `roblox_export_tree` composite export: traverses the connected Studio DataModel, mirrors Script/LocalScript/ModuleScript source into hierarchy-preserving folders, and writes locally in bounded batches without sending the full source dump through the agent conversation.
   - Supports `exclude` hierarchy substrings and `max_script_bytes`; oversized scripts are skipped and reported instead of aborting the full export.
 - Git status, structured changed-file listing, staged/unstaged diffs, branch listing, recent history, single-file stage/unstage, and confirmed local commits (no automatic push).
-- A project-scoped workspace toolset exposed directly to the agent for file inspection/editing, search, project metadata, Git operations, task execution, and image preview. The standalone `/workspace.html` editor/page system is intentionally not part of the extension.
+- A project-scoped workspace toolset exposed directly to the agent for file inspection/editing, search, project metadata, Git operations, task execution, and image preview. The `/workspace.html` editor opens from the popup's **Open Roblox UI Workspace** button.
 - One-click project Test/Build/Lint/Check tasks discovered from package.json and package manager metadata, each with an explicit confirmation.
 - Bounded command execution from the selected project directory using an argument array and `shell=False`.
 
 ## Choose a workspace
 
-On a fresh install, the agent asks which project folder to use before inspecting or changing files. Provide an absolute folder path or ask the agent to open the native folder picker through the workspace tools. The extension popup displays the currently selected workspace; the standalone `/workspace.html` page and editor system have been removed. The choice is saved in a private local `.zs-workspace.json` file and reused on subsequent starts.
+On a fresh install, the agent asks which project folder to use before inspecting or changing files. Provide an absolute folder path or ask the agent to open the native folder picker through the workspace tools. The extension popup displays the currently selected workspace; the `/workspace.html` editor is reachable from the popup (Open Roblox UI Workspace). The choice is saved in a private local `.zs-workspace.json` file and reused on subsequent starts.
 
 An optional environment override is also supported:
 
@@ -103,12 +103,21 @@ The local workspace root and the open Roblox place are not interchangeable. Use 
 
 **Roblox MCP integrations are enabled by default.** The checked-in `config.json` keeps the existing `roblox` adapter and also registers **Dominus 2 / romcp** as `dominus` using `npx`. Dominus is a separate Studio plugin + local bridge: on first use, run `powershell -ExecutionPolicy Bypass -File .\\setup_dominus.ps1` from the repository root, follow its interactive setup, then open/reload Roblox Studio and verify the plugin reports connected. The installer uses the official `dominus-cli` npm package (now branded romcp) and its supported setup flow; it does not vendor or copy the closed-source implementation into this repository. The bridge launches configured MCP servers in parallel, so workspace tools and the existing Roblox adapter remain available independently. See [Dominus / romcp setup](docs/DOMINUS_MCP.md) for prerequisites, the 46-tool legacy catalog, current command names, and safety boundaries.
 
+## Discord server management
+
+The optional `discord` MCP server lets ZeroScript read and manage Discord guilds: channels, roles, permission overwrites, and member role assignments. It talks to the Discord REST API v10 directly over `urllib`, so it adds **no pip dependency**, and it is registered in `config.json` like any other MCP server.
+
+The bot token is read only from the `DISCORD_BOT_TOKEN` environment variable — `config.json` holds a `$DISCORD_BOT_TOKEN` reference, never the secret itself — and is scrubbed from every tool response. Set `ZS_DISCORD_GUILD_IDS` to restrict the integration to specific guilds. Deleting a channel or role, and denying `VIEW_CHANNEL`/`SEND_MESSAGES`, require an explicit `confirm=true`. The `@everyone` role is immutable.
+
+See [Discord MCP](docs/DISCORD_MCP.md) for bot setup, required permissions, the tool catalogue, and permission bitmasks.
+
 ## Run the workspace tests
 
 Requires Python 3.10 or later.
 
 ```powershell
 py -3 -m unittest workspace_agent.test_tools workspace_agent.test_bridge -v
+py -3 -m unittest zeroscript_discord.test_mcp_server -v
 node zeroscript-extension/core/config.test.cjs
 node zeroscript-extension/workspace-diagnostics.test.cjs
 node zeroscript-extension/workspace-editor-utils.test.cjs

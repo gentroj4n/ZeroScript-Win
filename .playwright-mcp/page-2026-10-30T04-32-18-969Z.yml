@@ -1,0 +1,27 @@
+- generic [ref=e6]:
+  - 'img "Project Cover: Spark - Gen Z mobile app design" [ref=e9]'
+  - generic [ref=e11]:
+    - link "View on Behance" [ref=e13] [cursor=pointer]:
+      - /url: /embed/h/project/199003113/L2dhbGxlcnkvMTk5MDAzMTEzL1NwYXJrLUdlbi1aLW1vYmlsZS1hcHAtZGVzaWdu/
+    - generic [ref=e16]:
+      - generic [ref=e17]:
+        - link [ref=e19] [cursor=pointer]:
+          - /url: /embed/h/project/199003113/L2dhbGxlcnkvMTk5MDAzMTEzL1NwYXJrLUdlbi1aLW1vYmlsZS1hcHAtZGVzaWdu/
+          - img "Damian Lipiński's profile" [ref=e20]
+          - img "Matesz Grądkowski's profile" [ref=e21]
+          - img "Katarzyna Smoleń-Drzazga's profile" [ref=e22]
+          - img "Pragmatic Coders Team's profile" [ref=e23]
+        - generic [ref=e24]:
+          - heading "Spark - Gen Z mobile app design opens in a new tab" [level=1] [ref=e25] [cursor=pointer]:
+            - text: Spark - Gen Z mobile app design
+            - generic [ref=e26]: opens in a new tab
+          - link "Multiple Owners opens in a new tab" [ref=e27] [cursor=pointer]:
+            - /url: /embed/h/project/199003113/L2dhbGxlcnkvMTk5MDAzMTEzL1NwYXJrLUdlbi1aLW1vYmlsZS1hcHAtZGVzaWdu/
+            - text: Multiple Owners
+            - generic [ref=e28]: opens in a new tab
+      - generic [ref=e29]:
+        - button "Open See More Panel" [ref=e32] [cursor=pointer]
+        - link "Behance opens in a new tab" [ref=e40] [cursor=pointer]:
+          - /url: /embed/h/project/199003113/Lw%3D%3D/
+          - img "Behance" [ref=e41]
+          - generic [ref=e44]: opens in a new tab

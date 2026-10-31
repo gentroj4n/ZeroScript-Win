@@ -20,6 +20,39 @@
   const P = ZSProvider;
   const T = P.timings;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Silent audio that keeps Chrome from applying intensive timer throttling
+  // (1 tick/min after 5 min hidden) to this tab. Chrome exempts tabs that are
+  // "playing audio" from that clamp. A generated silent buffer means no
+  // external asset is needed. Idempotent; safe to call repeatedly.
+  const BackgroundKeepAlive = (() => {
+    let ctx = null, node = null, playing = false;
+    return {
+      start() {
+        if (playing) return;
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) return;
+          ctx = ctx || new AC();
+          const buf = ctx.createBuffer(1, 1, 22050);
+          node = ctx.createBufferSource();
+          node.buffer = buf;
+          node.loop = true;
+          node.connect(ctx.destination);
+          node.start(0);
+          if (ctx.state === "suspended") ctx.resume().catch(() => {});
+          playing = true;
+        } catch {}
+      },
+      stop() {
+        if (!playing) return;
+        try { node.stop(0); } catch {}
+        try { node.disconnect(); } catch {}
+        node = null;
+        playing = false;
+      },
+    };
+  })();
   const log = (...a) => console.log("[arcscript]", ...a);
 
   // ── Anti-bot mitigation (EXPERIMENTAL) ──────────────────────────────────
@@ -109,6 +142,13 @@
   const A = {
     running: false,
     autopilotEnabled: false,
+    // When true, the agent loop keeps running while this tab is backgrounded
+    // or the window is minimized. Off by default — the historical behavior is
+    // to park until the tab returns, which is friendlier for single-agent use
+    // but blocks multi-agent workflows where several provider tabs run in
+    // parallel. Persisted via chrome.storage.local as `runInBackground` and
+    // broadcast through the `zs-background-mode` message.
+    runInBackground: false,
     workerTask: null,
     workerEvidence: [],
     stop: false,
@@ -216,6 +256,12 @@
   // long after they returned. visibilitychange fires immediately on unhide, so we
   // race it against a slow stop-poll (the stop path is not latency-critical).
   async function waitVisible() {
+    // Background mode: run straight through. The whole point of this gate was
+    // to prevent the agent from executing while the user was looking at another
+    // app; when the user has explicitly opted into running in the background
+    // (multi-agent use), that tradeoff is inverted and parking would silently
+    // stall parallel workers.
+    if (A.runInBackground) return !A.stop;
     if (!document.hidden || A.stop || A.workerTask) return !A.stop;
     A.parked = true;
     try { ui.setStarting(); } catch {}
@@ -246,6 +292,7 @@
   // Studio for 5 minutes" into "No response from <site>, the loop has stopped"
   // and left the pending command showing a grey "not run".
   async function parkHidden() {
+    if (A.runInBackground) return 0;
     if (!document.hidden || A.stop || A.workerTask) return 0;
     const t0 = Date.now();
     await waitVisible();
@@ -1391,6 +1438,7 @@
     }
     if (A.running) return;
     A.running = true;
+    if (A.runInBackground) BackgroundKeepAlive.start();
     A.resumeArmed = false; // loop now owns the turn; drop the regenerate grace
     A.stop = false;
     A.stopping = false; // clean slate: never inherit a stale "Stopping…" from a
@@ -1825,6 +1873,7 @@
       ui.banner("warn", "Internal loop error", String((e && e.message) || e));
     } finally {
       A.running = false;
+      BackgroundKeepAlive.stop();
       A.stop = false;
       // Keep the "Stopping…" state while the site's stream is still draining
       // after a user stop: the loop often ends BEFORE the native stop takes
@@ -4382,12 +4431,18 @@
   // ════════════════════════════════════════════════════════════════════════
 
   try {
-    chrome.storage.local.get({ autopilotEnabled: false }, (value) => {
+    chrome.storage.local.get({ autopilotEnabled: false, runInBackground: false }, (value) => {
       A.autopilotEnabled = value.autopilotEnabled === true;
+      A.runInBackground = value.runInBackground === true;
     });
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
       if (changes.autopilotEnabled) A.autopilotEnabled = changes.autopilotEnabled.newValue === true;
+      if (changes.runInBackground) {
+        A.runInBackground = changes.runInBackground.newValue === true;
+        if (!A.runInBackground) BackgroundKeepAlive.stop();
+        else if (A.running) BackgroundKeepAlive.start();
+      }
       const changedSessions = changes.zsDisabledConversations;
       if (!changedSessions) return;
       const beforeDisabled = isConversationDisabled();
@@ -4445,6 +4500,11 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg && msg.type === "zs-autopilot-setting") A.autopilotEnabled = msg.enabled === true;
+    if (msg && msg.type === "zs-background-mode") {
+      A.runInBackground = msg.enabled === true;
+      if (!A.runInBackground) BackgroundKeepAlive.stop();
+      else if (A.running) BackgroundKeepAlive.start();
+    }
     if (msg && msg.type === "zs-agent-control") {
       syncExternalControl(msg);
       return true;

@@ -34,6 +34,33 @@ function initAutopilot() {
   });
 }
 
+function initRunInBackground() {
+  const toggle = document.getElementById("runInBackgroundToggle");
+  const badge = document.getElementById("backgroundModeBadge");
+  if (!toggle || !badge) return;
+  const broadcast = (enabled) => {
+    chrome.tabs.query({}, (tabs) => {
+      for (const tab of tabs) {
+        if (!tab.id || !tab.url || !SUPPORTED_HOSTS.some((host) => tab.url.includes(host))) continue;
+        chrome.tabs.sendMessage(tab.id, { type: "zs-background-mode", enabled }, () => void chrome.runtime.lastError);
+      }
+    });
+  };
+  chrome.storage.local.get({ runInBackground: false }, (value) => {
+    toggle.checked = value.runInBackground === true;
+    badge.textContent = toggle.checked ? "On" : "Off";
+    badge.className = "badge" + (toggle.checked ? " ready" : "");
+  });
+  toggle.addEventListener("change", () => {
+    const enabled = toggle.checked;
+    chrome.storage.local.set({ runInBackground: enabled }, () => {
+      badge.textContent = enabled ? "On" : "Off";
+      badge.className = "badge" + (enabled ? " ready" : "");
+      broadcast(enabled);
+    });
+  });
+}
+
 
 
 function parseToolText(response) {
@@ -156,6 +183,21 @@ document.getElementById("restart").addEventListener("click", (event) => {
     setTimeout(refresh, 900);
   });
 });
+const openRobloxUiBtn = document.getElementById("openRobloxUi");
+if (openRobloxUiBtn) {
+  openRobloxUiBtn.addEventListener("click", () => {
+    const url = chrome.runtime.getURL("workspace.html");
+    chrome.tabs.query({}, (tabs) => {
+      const existing = tabs.find((t) => t.url && t.url.startsWith(url));
+      if (existing) {
+        chrome.tabs.update(existing.id, { active: true });
+        if (existing.windowId != null) chrome.windows.update(existing.windowId, { focused: true });
+      } else {
+        chrome.tabs.create({ url });
+      }
+    });
+  });
+}
 document.getElementById("settings").addEventListener("click", () => {
   chrome.tabs.query({}, (tabs) => {
     const active = tabs.find((t) => t.active && t.url && SUPPORTED_HOSTS.some((h) => t.url.includes(h)));
@@ -517,5 +559,6 @@ chrome.storage.local.get({ zsAutopilotActiveRunId: null }, async (saved) => {
 });
 
 initAutopilot();
+initRunInBackground();
 refresh();
 setInterval(() => { refresh(); refreshAutopilotRun(true); }, 2500);

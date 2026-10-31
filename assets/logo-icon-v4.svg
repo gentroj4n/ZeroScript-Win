@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="GameboyEmu MAX">
+  <defs>
+    <linearGradient id="bg4" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B2434"/>
+      <stop offset="1" stop-color="#080B12"/>
+    </linearGradient>
+    <linearGradient id="pixel4" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#B4FBEE"/>
+      <stop offset="0.55" stop-color="#5BD9C6"/>
+      <stop offset="1" stop-color="#2FA593"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bg4)"/>
+
+  <!-- near-black screen so the pixel M is the only bright thing -->
+  <rect x="92" y="76" width="328" height="264" rx="20" fill="#04070C" stroke="#222C3C" stroke-width="4"/>
+
+  <!-- Pixel M, 5 cols x 5 rows, blocks flush (64px each) -->
+  <g fill="url(#pixel4)">
+    <rect x="124" y="104" width="64" height="52"/>
+    <rect x="324" y="104" width="64" height="52"/>
+
+    <rect x="124" y="156" width="64" height="52"/>
+    <rect x="188" y="156" width="64" height="52"/>
+    <rect x="260" y="156" width="64" height="52"/>
+    <rect x="324" y="156" width="64" height="52"/>
+
+    <rect x="124" y="208" width="64" height="52"/>
+    <rect x="252" y="208" width="64" height="52"/>
+    <rect x="324" y="208" width="64" height="52"/>
+
+    <rect x="124" y="260" width="64" height="52"/>
+    <rect x="324" y="260" width="64" height="52"/>
+  </g>
+
+  <!-- MAX wordmark -->
+  <text x="256" y="438" font-family="Montserrat, 'Segoe UI', Verdana, sans-serif" font-size="90" font-weight="900" letter-spacing="3" text-anchor="middle" fill="#FF696E">MAX</text>
+</svg>

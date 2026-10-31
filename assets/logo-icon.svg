@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="GameboyEmu MAX">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1A2436"/>
+      <stop offset="1" stop-color="#0C111B"/>
+    </linearGradient>
+    <linearGradient id="scr" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9BF3E4"/>
+      <stop offset="1" stop-color="#3FBFAE"/>
+    </linearGradient>
+    <pattern id="scan" width="8" height="8" patternUnits="userSpaceOnUse">
+      <rect width="8" height="4" fill="#0C111B" opacity="0.08"/>
+    </pattern>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="none" stroke="#3A4A63" stroke-width="6"/>
+
+  <rect x="88" y="84" width="336" height="248" rx="28" fill="url(#scr)"/>
+  <rect x="88" y="84" width="336" height="248" rx="28" fill="url(#scan)"/>
+  <rect x="88" y="84" width="336" height="120" rx="28" fill="url(#gloss)"/>
+
+  <path d="M 238 156 L 338 208 L 238 260 Z" fill="#0C111B"/>
+
+  <rect x="88" y="364" width="336" height="68" rx="18" fill="#FF696E"/>
+  <text x="256" y="410" font-family="Montserrat, 'Segoe UI', Verdana, sans-serif" font-size="40" font-weight="800" letter-spacing="8" text-anchor="middle" fill="#0C111B">MAX</text>
+</svg>

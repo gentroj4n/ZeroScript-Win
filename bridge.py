@@ -67,6 +67,11 @@ except Exception:
     code_intelligence = None
 
 try:
+    from workspace_agent import http_client
+except Exception:
+    http_client = None
+
+try:
     from workspace_agent import browser_qa
 except Exception:
     browser_qa = None
@@ -80,6 +85,11 @@ try:
     from workspace_agent import assetripper_jobs
 except Exception:
     assetripper_jobs = None
+
+try:
+    from workspace_agent import job_manager
+except Exception:
+    job_manager = None
 
 try:
     # Sibling script (same folder as bridge.py, which Python puts on sys.path
@@ -1108,6 +1118,83 @@ class MCPClient:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Hot reload  - reimport workspace_agent modules in the LIVE bridge process.
+# ══════════════════════════════════════════════════════════════════════════
+_WORKSPACE_RELOAD_TARGETS = (
+    "workspace_agent",
+    "workspace_agent.tools",
+    "workspace_agent.http_client",
+    "workspace_agent.code_intelligence",
+    "workspace_agent.browser_qa",
+    "workspace_agent.browser_server",
+    "workspace_agent.assetripper_jobs",
+    "workspace_agent.job_manager",
+    "workspace_agent.unity_recovery",
+    "workspace_agent.unity_asset_inspector",
+    "workspace_agent.reconstruction_tracker",
+    "workspace_agent.roblox_export",
+    "workspace_agent.agent_control",
+)
+
+
+def _reload_workspace_modules():
+    """Reload workspace_agent submodules in the running bridge process.
+
+    Re-executes each module from disk (importlib.reload) and updates the
+    module-level helper globals that _call_workspace dispatches against, so
+    on-disk edits take effect without restarting the bridge or any MCP
+    server process. The Workspace instance and workspace selection are
+    preserved; only the code modules are replaced.
+
+    Returns the list of module names that were reloaded.
+    """
+    import importlib
+    reloaded = []
+    for mod_name in _WORKSPACE_RELOAD_TARGETS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            # Module was never imported (e.g. an optional helper whose import
+            # failed at startup). Attempt a fresh import so a newly-installed
+            # dependency can take effect without a restart.
+            try:
+                importlib.import_module(mod_name)
+                reloaded.append(mod_name)
+            except Exception:
+                pass
+            continue
+        importlib.reload(mod)
+        reloaded.append(mod_name)
+    # Refresh the module-level globals used by _call_workspace dispatch.
+    g = globals()
+    try:
+        from workspace_agent.tools import Workspace as _W, WorkspaceError as _WE
+        g["Workspace"] = _W
+        g["WorkspaceError"] = _WE
+    except Exception:
+        pass
+    for helper_name in (
+        "http_client", "browser_qa", "browser_server", "assetripper_jobs",
+        "job_manager", "unity_recovery", "unity_asset_inspector",
+        "reconstruction_tracker", "code_intelligence",
+    ):
+        mod = sys.modules.get(f"workspace_agent.{helper_name}")
+        if mod is not None:
+            g[helper_name] = mod
+    try:
+        from workspace_agent.agent_control import AgentControlStore as _ACS
+        g["AgentControlStore"] = _ACS
+    except Exception:
+        pass
+    try:
+        from workspace_agent.roblox_export import export_tree as _export
+        g["export_roblox_tree"] = _export
+    except Exception:
+        pass
+    log(f"workspace modules reloaded: {len(reloaded)}", "cy")
+    return reloaded
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  MANAGER  - aggregates every MCP server, routes by tool name.
 # ══════════════════════════════════════════════════════════════════════════
 class MCPManager:
@@ -1228,6 +1315,8 @@ class MCPManager:
              "inputSchema": {"type": "object", "properties": {"task": {"type": "string", "minLength": 1}, "timeout": {"type": "integer", "minimum": 1, "maximum": 300, "default": 300}}, "required": ["task"], "additionalProperties": False}, "server": "workspace"},
             {"name": "workspace_run_command", "description": "Run a command as an argument array from the selected project directory. Shell expansion is disabled. Use only commands required for the requested development task.",
              "inputSchema": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100}, "timeout": {"type": "integer", "minimum": 1, "maximum": 300}}, "required": ["command"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_http_request", "description": "Perform one bounded HTTP request (GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS) to http or https URLs. Body is capped at max_bytes; secrets can be supplied via header values of the form 'env:VARIABLE_NAME' so the token never appears in this conversation. Loopback/private/link-local destinations are refused unless allow_local=true. Redirects are re-validated per hop.",
+             "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "minLength": 1}, "method": {"type": "string", "enum": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], "default": "GET"}, "headers": {"type": "object", "additionalProperties": {"type": "string"}}, "body": {"type": ["string", "null"]}, "timeout": {"type": "number", "minimum": 0.1, "maximum": 60, "default": 20}, "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 2000000, "default": 2000000}, "allow_local": {"type": "boolean", "default": False}}, "required": ["url"], "additionalProperties": False}, "server": "workspace"},
             {"name": "scan_unity_installation", "description": "Inspect an installed Unity player without modifying it. Reports Unity version when detectable, Mono vs IL2CPP evidence, managed assemblies, large asset files, and whether a full editable project exists. Defaults to the selected workspace; pass install_path only when the installation is elsewhere.",
              "inputSchema": {"type": "object", "properties": {"install_path": {"type": "string", "default": ""}}, "additionalProperties": False}, "server": "workspace"},
             {"name": "catalog_unity_assets", "description": "Create or resume a deterministic, file-level Unity asset catalog. Writes only under the selected workspace; never extracts or modifies original assets. Re-call until status=complete. Serialized Unity object dependencies are not parsed.",
@@ -1264,6 +1353,18 @@ class MCPManager:
              "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"], "additionalProperties": False}, "server": "workspace"},
             {"name": "cancel_assetripper_job", "description": "Cancel an AssetRipper job only if this bridge instance spawned and still tracks the process. It will not kill an unverified PID after a bridge restart.",
              "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_job_start", "description": "Start an argv command as a background job scoped to this workspace. Combined stdout+stderr go to a log file; use workspace_job_status to poll, workspace_job_logs to tail, workspace_job_stop to terminate. cwd must resolve inside the workspace. Use this for dev servers, watchers, test runners, and build jobs that must outlive a single tool call.",
+             "inputSchema": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 100}, "cwd": {"type": "string", "default": "."}, "label": {"type": "string", "maxLength": 120}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "timeout_minutes": {"type": "integer", "minimum": 1, "maximum": 1440, "default": 60}}, "required": ["command"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_job_status", "description": "Poll one background job by its job_id and report the settled status (running, succeeded, failed, cancelled, interrupted, untracked_running). Enforces the deadline on a running job and honours the never-terminate-an-unverified-PID rule across bridge restarts.",
+             "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_job_logs", "description": "Return a bounded tail of one job's combined stdout+stderr log. The leading partial line is dropped when the tail starts mid-file; max_bytes caps the returned content.",
+             "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}, "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536}}, "required": ["job_id"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_job_list", "description": "List every background job recorded for this workspace, newest first, with the current status and active count against the concurrency limit.",
+             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_job_stop", "description": "Terminate one background job started by THIS bridge instance. Refuses to kill an untracked PID after a bridge restart because the process cannot be verified as the one recorded here.",
+             "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"], "additionalProperties": False}, "server": "workspace"},
+            {"name": "workspace_wait_port", "description": "Block until a TCP port accepts a connection, or the timeout elapses. TCP connect only; no data is sent. Defaults to 127.0.0.1. Pair with workspace_job_start to wait for a dev server before opening a browser.",
+             "inputSchema": {"type": "object", "properties": {"port": {"type": "integer", "minimum": 1, "maximum": 65535}, "host": {"type": "string", "default": "127.0.0.1"}, "timeout_seconds": {"type": "number", "minimum": 0.1, "maximum": 300, "default": 30}, "interval_ms": {"type": "integer", "minimum": 50, "maximum": 5000, "default": 200}}, "required": ["port"], "additionalProperties": False}, "server": "workspace"},
         ]
         tools.append({
             "name": "roblox_export_tree",
@@ -1496,6 +1597,34 @@ class MCPManager:
             return self.workspace.run_task(args["task"], args.get("timeout", 300))
         if name == "workspace_run_command":
             return self.workspace.run_command(args["command"], args.get("timeout", 60))
+        if name == "workspace_http_request":
+            if http_client is None:
+                raise RuntimeError("workspace_http_request helper could not be imported.")
+            return http_client.http_request(
+                args["url"], args.get("method", "GET"), args.get("headers"),
+                args.get("body"), args.get("timeout"), args.get("max_bytes"),
+                bool(args.get("allow_local", False)),
+            )
+        if name in {"workspace_job_start", "workspace_job_status", "workspace_job_logs", "workspace_job_list", "workspace_job_stop", "workspace_wait_port"}:
+            if job_manager is None:
+                raise RuntimeError("Job manager helper could not be imported.")
+            if name == "workspace_job_start":
+                return job_manager.start_job(
+                    self.workspace_root, args["command"], args.get("cwd", "."),
+                    args.get("label"), args.get("env"), args.get("timeout_minutes"),
+                )
+            if name == "workspace_job_status":
+                return job_manager.job_status(self.workspace_root, args["job_id"])
+            if name == "workspace_job_logs":
+                return job_manager.job_logs(self.workspace_root, args["job_id"], args.get("max_bytes", 65536))
+            if name == "workspace_job_list":
+                return job_manager.job_list(self.workspace_root)
+            if name == "workspace_job_stop":
+                return job_manager.stop_job(self.workspace_root, args["job_id"])
+            return job_manager.wait_port(
+                self.workspace_root, args["port"], args.get("host", "127.0.0.1"),
+                args.get("timeout_seconds", 30), args.get("interval_ms", 200),
+            )
         if name in {"start_assetripper_export", "assetripper_job_status", "cancel_assetripper_job"}:
             if assetripper_jobs is None:
                 raise RuntimeError("AssetRipper job helpers could not be imported.")
@@ -2171,7 +2300,31 @@ async def handler(ws):
 
             elif mtype == "call_tool":
                 name = msg.get("name", "")
-                args = msg.get("arguments") or {}
+                raw_args = msg.get("arguments")
+                # Tool arguments MUST be a JSON object. A model occasionally
+                # emits an array (e.g. [{"url": ...}]) or a bare string when
+                # its function-call decoder misfires; treating that as a dict
+                # crashed the WebSocket handler at `args.keys()` below and
+                # dropped the client (reported live 2026-10-27 with a list
+                # argument). Reject malformed shapes with a clean tool_result
+                # the model can correct, instead of tearing down the socket.
+                if raw_args is None:
+                    args = {}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = None
+                if args is None:
+                    await ws.send(json.dumps({
+                        "type": "tool_result", "id": rid, "ok": False,
+                        "kind": "invalid_arguments",
+                        "error": (
+                            f"Tool '{name}' arguments must be a JSON object, "
+                            f"not {type(raw_args).__name__}. Send an object "
+                            f"like {{\"arg\": \"value\"}} and retry."
+                        ),
+                    }))
+                    continue
                 role = client_roles.get(ws, "browser")
                 blocked_reason = None
                 async with agent_control_lock:
@@ -2237,6 +2390,38 @@ async def handler(ws):
                         await asyncio.sleep(0.4)
                         restart_self()
                     asyncio.create_task(_do_restart())
+
+            elif mtype == "bridge_reload":
+                # Hot-reload the workspace tool layer without dropping the
+                # WebSocket or restarting any MCP server process. Reloads the
+                # workspace_agent package modules and re-imports the optional
+                # helpers (http_client, browser_qa, ...) so edits on disk become
+                # live. Workspace selection and the running MCP child processes
+                # are untouched.
+                try:
+                    reloaded = await asyncio.to_thread(_reload_workspace_modules)
+                    payload = {"ok": True, "reloaded": reloaded}
+                except Exception as exc:
+                    payload = {"ok": False, "error": str(exc)}
+                if payload.get("ok"):
+                    # Push an updated catalogue so connected clients refresh
+                    # their cached tool list without a manual reconnect.
+                    try:
+                        tools_now = await asyncio.to_thread(mgr.list_tools, True)
+                    except Exception:
+                        tools_now = mgr.list_tools()
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "tools", "id": rid,
+                            "tools": tools_now, "mcp_alive": mgr.any_alive(),
+                            "workspace": mgr._workspace_description(),
+                            "agent_control": agent_control.status() if agent_control is not None else {},
+                            "reloaded": payload.get("reloaded", []),
+                        }))
+                    except Exception:
+                        await ws.send(json.dumps({"type": "bridge_reload_result", "id": rid, **payload}))
+                else:
+                    await ws.send(json.dumps({"type": "bridge_reload_result", "id": rid, **payload}))
 
             elif mtype == "restart_mcp":
                 sid = msg.get("server")

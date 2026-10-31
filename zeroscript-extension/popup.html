@@ -139,6 +139,20 @@
       </label>
       <div class="hint">Legacy single-session mode only. The independent coordinator below handles worker sessions and acceptance-criterion gating. Neither mode can authorize publishing, deployment, destructive actions, spending, or security changes.</div>
     </section>
+
+    <section class="card" id="backgroundModeCard">
+      <div class="card-heading">
+        <div class="card-title">Run while tab is backgrounded</div>
+        <span id="backgroundModeBadge" class="badge">Off</span>
+      </div>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+        <input id="runInBackgroundToggle" type="checkbox" style="margin-top:3px;accent-color:#7193ef;width:16px;height:16px" />
+        <span>
+          <span style="display:block;font-size:11px;font-weight:650">Keep the agent running when this tab is hidden</span>
+          <span style="display:block;margin-top:4px;color:#8c9ab0;font-size:10px;line-height:1.5">Off by default — the agent pauses while the tab is in the background and resumes when you return. Enable this for multi-agent workflows where several provider tabs should keep processing in parallel. A silent audio keep-alive prevents Chrome from throttling the tab's timers.</span>
+        </span>
+      </label>
+    </section>
     </details>
 
     <details class="advanced-section">
@@ -178,6 +192,7 @@
         <div class="integration-title">Roblox Studio adapter</div>
         <div class="integration-sub">A separate <code>roblox/</code> tool namespace for live Studio/DataModel operations. It is optional and never treated as the local filesystem.</div>
         <div id="robloxStatus" class="integration-status">Studio connection not checked</div>
+        <button id="openRobloxUi" class="secondary" style="margin-top:10px;width:100%">▦ Open Roblox UI Workspace</button>
       </div>
       <span id="robloxBadge" class="badge">Optional</span>
     </section>

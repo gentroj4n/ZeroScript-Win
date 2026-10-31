@@ -1,0 +1,63 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Roblox UI Workspace styles. Namespaced with .zr- to avoid clashing with the
+   host workspace shell. */
+
+.roblox-ui-host { position: fixed; inset: 0; z-index: 900; display: flex; flex-direction: column; background: #0c1017; color: #d7e0ee; font-family: system-ui, 'Segoe UI', sans-serif; }
+.roblox-ui-host.hidden { display: none; }
+
+.zr-workspace { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+.zr-toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #121a26; border-bottom: 1px solid #202b3d; flex-wrap: wrap; }
+.zr-toolbar-sep { width: 1px; height: 20px; background: #2a3548; margin: 0 4px; }
+.zr-btn { background: #1b2534; color: #cfd9e8; border: 1px solid #2a3548; border-radius: 6px; padding: 6px 11px; font-size: 12.5px; cursor: pointer; }
+.zr-btn:hover { background: #243044; border-color: #35507a; }
+.zr-btn-accent { background: #2f6fdb; border-color: #2f6fdb; color: #fff; }
+.zr-btn-accent:hover { background: #3d7ff0; }
+.zr-btn-small { padding: 4px 8px; font-size: 11.5px; }
+.zr-select { background: #0f1621; color: #cfd9e8; border: 1px solid #2a3548; border-radius: 6px; padding: 5px 8px; font-size: 12.5px; }
+
+.zr-main { flex: 1; display: grid; grid-template-columns: 260px 1fr 320px; min-height: 0; }
+.zr-tree-pane, .zr-inspect-pane { background: #0f1621; overflow: auto; border-right: 1px solid #1c2534; padding: 10px; }
+.zr-inspect-pane { border-right: 0; border-left: 1px solid #1c2534; }
+.zr-preview-pane { overflow: auto; padding: 14px; background: #080b11; display: flex; flex-direction: column; }
+
+.zr-pane-title { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #7f8ea6; margin-bottom: 8px; display: flex; gap: 6px; }
+.zr-muted { color: #6d7c92; font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+.zr-tree { display: flex; flex-direction: column; gap: 1px; }
+.zr-tree-row { display: flex; gap: 8px; align-items: center; padding: 4px 8px; border-radius: 5px; cursor: pointer; font-size: 12.5px; }
+.zr-tree-row:hover { background: #182231; }
+.zr-tree-row.active { background: #1d3357; }
+.zr-tree-row.modifier .zr-tree-class { color: #8a7fd0; }
+.zr-tree-class { color: #5b8dd6; font-size: 11px; min-width: 78px; }
+.zr-tree-name { color: #cfd9e8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.zr-add-wrap { display: flex; gap: 6px; margin-top: 10px; }
+.zr-tree-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+
+.zr-stage { flex: 1; display: flex; align-items: flex-start; justify-content: center; }
+.zr-canvas { box-shadow: 0 0 0 1px #2a3548, 0 12px 40px rgba(0,0,0,.5); transform-origin: top center; max-width: 100%; overflow: hidden; }
+.zr-node { box-sizing: border-box; }
+.zr-selected { outline: 1.5px dashed #4C8DFF; outline-offset: 1px; }
+.zr-screengui { cursor: default; }
+.zr-empty { color: #6d7c92; padding: 20px; font-size: 13px; }
+.zr-error { color: #E5484D; padding: 16px; }
+.zr-image-placeholder { background: repeating-linear-gradient(45deg, #1a2330, #1a2330 8px, #202b3d 8px, #202b3d 16px); border: 1px dashed #35507a; }
+
+.zr-inspect-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 10px; }
+.zr-props { display: flex; flex-direction: column; gap: 7px; }
+.zr-prop { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.zr-prop-name { color: #8a97ad; }
+.zr-prop input[type=text], .zr-prop input[type=number], .zr-prop select { background: #0b111a; color: #d7e0ee; border: 1px solid #27354a; border-radius: 5px; padding: 5px 7px; font-size: 12px; width: 100%; box-sizing: border-box; }
+.zr-prop input[type=color] { width: 44px; height: 26px; padding: 0; border: 1px solid #27354a; border-radius: 5px; background: #0b111a; }
+.zr-udim, .zr-udim2 { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.zr-udim input, .zr-udim2 input { width: 62px !important; }
+.zr-luau { background: #080d14; border: 1px solid #1c2534; border-radius: 6px; padding: 10px; font-family: 'Cascadia Code', Consolas, monospace; font-size: 12px; color: #b6d6a8; white-space: pre; overflow: auto; max-height: calc(100vh - 220px); }
+
+.zr-prompt-bar { display: flex; gap: 8px; align-items: center; padding: 9px 12px; background: #121a26; border-top: 1px solid #202b3d; }
+.zr-prompt-input { flex: 1; background: #0b111a; color: #d7e0ee; border: 1px solid #27354a; border-radius: 6px; padding: 8px 11px; font-size: 13px; }
+.zr-prompt-note { color: #7f8ea6; font-size: 12px; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zr-prompt-note.zr-flash-error { color: #E5484D; }
+
+.zr-statusbar { display: flex; gap: 14px; align-items: center; padding: 5px 12px; background: #0b111a; color: #7f8ea6; font-size: 11.5px; border-top: 1px solid #1c2534; }
+.zr-status-spacer { flex: 1; }
