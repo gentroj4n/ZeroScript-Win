@@ -3117,12 +3117,18 @@
     const prompt = "Project directory for this conversation:\n\n" +
       (uniquePaths.length ? uniquePaths.map((path, index) => (index + 1) + ". " + path).join("\n") :
         "No recent project folders yet.") +
-      "\n\nEnter a listed number or paste an absolute folder path:";
+      "\n\nEnter a listed number, paste an absolute path, or leave blank to choose a folder:";
     const entered = window.prompt(prompt, assigned && assigned.path || current.root || "");
     if (entered == null) return null;
-    const number = Number(entered.trim());
-    const path = Number.isInteger(number) && number >= 1 && number <= uniquePaths.length ?
-      uniquePaths[number - 1] : entered.trim();
+    const selection = entered.trim();
+    if (!selection) {
+      const picked = await workspaceCall("workspace_browse");
+      if (!picked || picked.cancelled || !picked.selected_path) return null;
+      return { root: await selectConversationProject(picked.selected_path) };
+    }
+    const number = Number(selection);
+    const path = Number.isInteger(number) && number >= 1 && number <= uniquePaths.length
+      ? uniquePaths[number - 1] : selection;
     return { root: await selectConversationProject(path) };
   }
   async function ensureConversationProject() {
