@@ -25,6 +25,8 @@ if /i not "%~1"=="--zs-updated" (
         pause
         exit /b 1
     )
+    REM The temporary bootstrap has already launched the freshly synced copy.
+    exit /b 0
 )
 
 echo.
@@ -290,7 +292,7 @@ if errorlevel 1 (
 echo   UPDATE: GitHub sync complete.
 REM Start the newly synced launcher; this TEMP helper remains unchanged.
 call "%ZS_ROOT%start.bat" --zs-updated
-exit /b %errorlevel%
+exit /b 0
 
 REM --- Subroutine: verify %PY% is a real, usable Python ------------------------
 REM Returns 0 only if the interpreter runs, has a working pip, AND is Python 3.9
