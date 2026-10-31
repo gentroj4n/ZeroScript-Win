@@ -36,7 +36,13 @@ if /i not "%~1"=="--zs-updated" (
             for /f "delims=" %%B in ('git branch --show-current 2^>nul') do set "ZS_BRANCH=%%B"
             for /f "delims=" %%U in ('git remote get-url origin 2^>nul') do set "ZS_ORIGIN=%%U"
             for /f "delims=" %%H in ('git rev-parse HEAD 2^>nul') do set "ZS_HEAD_BEFORE=%%H"
-            for /f "delims=" %%D in ('git status --porcelain 2^>nul') do set "ZS_DIRTY=1"
+            REM Only tracked edits should block an update. Ignore untracked and
+            REM ignored local files (logs, caches, credentials, generated data).
+            REM The fast-forward merge below remains the final safety check.
+            git diff --quiet --ignore-submodules --
+            if errorlevel 1 set "ZS_DIRTY=1"
+            git diff --cached --quiet --ignore-submodules --
+            if errorlevel 1 set "ZS_DIRTY=1"
 
             echo(!ZS_ORIGIN!| findstr /i /c:"robby-gridpoint/ZeroScript-Win" >nul
             if errorlevel 1 (
