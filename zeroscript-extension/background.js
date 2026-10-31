@@ -88,14 +88,28 @@ async function sendWorkspaceTool(name, args, timeout) {
   return response;
 }
 async function parseWorkspaceResult(response) {
-  const raw = response && response.result && response.result.content
-    ? response.result.content : response && response.result;
-  let value = raw;
-  if (Array.isArray(raw)) {
-    const part = raw.find((item) => item && typeof item.text === "string");
-    if (part) { try { value = JSON.parse(part.text); } catch { value = part.text; } }
-  } else if (typeof raw === "string") {
-    try { value = JSON.parse(raw); } catch {}
+  let value = response && response.result !== undefined ? response.result : response;
+  // The bridge may return {text, images}, MCP content blocks, a JSON string,
+  // or nested {result/content} envelopes. Unwrap each form before inspecting it.
+  for (let depth = 0; depth < 6; depth++) {
+    if (Array.isArray(value)) {
+      const part = value.find((item) => item && typeof item.text === "string");
+      if (!part) return value;
+      value = part.text;
+      continue;
+    }
+    if (value && typeof value === "object") {
+      if (typeof value.root === "string" || typeof value.recent_roots !== "undefined" ||
+          typeof value.selected_path === "string" || typeof value.cancelled === "boolean") return value;
+      if (typeof value.text === "string") { value = value.text; continue; }
+      if (value.content !== undefined) { value = value.content; continue; }
+      if (value.result !== undefined) { value = value.result; continue; }
+      return value;
+    }
+    if (typeof value === "string") {
+      try { value = JSON.parse(value); continue; } catch { return value; }
+    }
+    return value;
   }
   return value;
 }
@@ -103,18 +117,16 @@ function normalizeWorkspacePath(value) {
   return String(value || "").trim().replace(/\//g, "\\").replace(/[\\]+$/, "").toLowerCase();
 }
 async function activateWorkspaceRoot(projectPath) {
-  const recentResponse = await sendWorkspaceTool("workspace_recent_roots", {}, 30000);
-  const recentData = await parseWorkspaceResult(recentResponse);
-  const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
-  const isRecent = recentRoots.some((item) => item && item.path &&
-    normalizeWorkspacePath(item.path) === normalizeWorkspacePath(projectPath));
-  // Conversation-scoped roots must never overwrite the persisted general root.
+  // Do not perform a recent-roots lookup for every operation: the selected path
+  // is already explicitly assigned to this conversation. Extra bridge round trips
+  // here were causing activation to stall on some response envelopes.
   const activate = await sendWorkspaceTool("workspace_set_root", { path: projectPath, persist: false }, 30000);
   const opened = await parseWorkspaceResult(activate);
   const actualRoot = opened && (opened.root || opened.workspace_root);
   if (!actualRoot || opened.configured === false ||
       normalizeWorkspacePath(actualRoot) !== normalizeWorkspacePath(projectPath)) {
-    throw new Error("Could not activate project directory: " + projectPath);
+    throw new Error("Could not activate project directory: " + projectPath +
+      (opened && (opened.error || opened.message) ? " (" + String(opened.error || opened.message) + ")" : ""));
   }
   return actualRoot;
 }
