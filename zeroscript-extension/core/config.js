@@ -177,7 +177,7 @@ var ZS = (() => {
   // every other provider is untouched by definition.
   function buildSystemPrompt(opts = {}) {
     if (typeof opts === "string") opts = { siteName: opts };
-    const { siteName = "this AI site", customPrompt = "", providerNotes = "", tools = [] } = opts;
+    const { siteName = "this AI site", customPrompt = "", providerNotes = "", tools = [], projectContext = "" } = opts;
 
     const toolsString = compactTools(tools);
 
@@ -205,6 +205,7 @@ WORKSPACE AND ROBLOX ARE SEPARATE DOMAINS
 - Never substitute one domain for the other because a tool name looks similar. Use Roblox Studio tools only when the task requires live Studio state, Instances, playtesting, or Studio automation. Use workspace tools for on-disk source files. A task may use both domains only when its requirements genuinely need both.
 - Treat each MCP server as its own integration. Do not mix their context, assume shared working directories, or call an unprefixed Roblox tool when its roblox/ name is present.
 
+${projectContext}
 WORKSPACE ONBOARDING
 - At the beginning of a session, use the workspace_info() tool description from the live catalogue to see whether the user has already selected a workspace.
 - If the user asks to switch projects, call workspace_recent_roots() and present the saved folders. Only call workspace_open_recent with a path from that list after the user explicitly selects that project.
