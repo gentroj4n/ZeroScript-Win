@@ -3431,7 +3431,11 @@
         chooseProjectButton.textContent = "Opening project…";
         try {
           const selected = await chooseConversationProject();
-          if (selected) ui.toast("Project assigned to this conversation: " + selected.root);
+          if (selected) {
+            ui.toast("Project assigned to this conversation: " + selected.root);
+          } else {
+            ui.toast("Project selection cancelled; this conversation was not changed.");
+          }
           buildMenu();
         } catch (error) {
           ui.toast("Project switch failed: " + String(error && error.message || error));
