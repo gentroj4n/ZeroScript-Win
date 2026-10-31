@@ -3409,10 +3409,13 @@
         delete conversationProjects[id];
         saveConversationProjects();
         try {
-          await workspaceCall("workspace_info");
+          const current = await workspaceCall("workspace_info");
+          if (current && current.configured && current.root) {
+            await workspaceCall("workspace_open_recent", { path: current.root });
+          }
           ui.toast("This conversation now follows the shared workspace.");
         } catch (error) {
-          ui.toast("Could not read shared workspace: " + String(error && error.message || error));
+          ui.toast("Could not restore the shared workspace: " + String(error && error.message || error));
         }
         buildMenu();
       });
