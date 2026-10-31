@@ -108,9 +108,8 @@ async function activateWorkspaceRoot(projectPath) {
   const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
   const isRecent = recentRoots.some((item) => item && item.path &&
     normalizeWorkspacePath(item.path) === normalizeWorkspacePath(projectPath));
-  const activate = isRecent
-    ? await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000)
-    : await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
+  // Conversation-scoped roots must never overwrite the persisted general root.
+  const activate = await sendWorkspaceTool("workspace_set_root", { path: projectPath, persist: false }, 30000);
   const opened = await parseWorkspaceResult(activate);
   const actualRoot = opened && (opened.root || opened.workspace_root);
   if (!actualRoot || opened.configured === false ||
