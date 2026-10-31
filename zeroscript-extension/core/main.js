@@ -3050,15 +3050,11 @@
       const current = await workspaceCall("workspace_info");
       const isCurrent = current && current.root &&
         current.root.toLowerCase() === root.toLowerCase();
-      if (!known && !isCurrent) {
-        // A typed path was explicitly supplied in this chat, so activating it
-        // is allowed; saved recent paths use the narrower open_recent operation.
-        await workspaceCall("workspace_set_root", { path: root });
-      }
       let opened;
       if (known || isCurrent) {
         opened = await workspaceCall("workspace_open_recent", { path: root });
       } else {
+        // The typed path is explicit user consent to register a new directory.
         opened = await workspaceCall("workspace_set_root", { path: root });
       }
       const actualRoot = opened && (opened.root || opened.workspace_root);
