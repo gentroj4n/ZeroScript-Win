@@ -3023,7 +3023,7 @@
     // operations pass their conversation's pinned path to the atomic queue.
     const response = await bg({
       type: "call_tool", name, arguments: args, timeout: 30000,
-      projectPath: String(name || "").includes("workspace_") ? projectPath : ""
+      projectPath: (String(name || "").includes("workspace_") || name === "roblox_export_tree") ? projectPath : ""
     });
     if (!response || !response.ok) {
       throw new Error(response && response.error || "Workspace tool failed: " + name);
