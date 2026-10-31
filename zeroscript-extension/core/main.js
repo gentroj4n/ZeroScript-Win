@@ -3046,29 +3046,18 @@
     const id = projectConversationId();
     if (!id) return null;
     const assigned = conversationProjects[id];
+    // Conversation assignment is metadata, not a command to change the bridge's
+    // global workspace. The background worker activates this path temporarily for
+    // each workspace tool and restores the shared root afterward.
+    if (assigned && assigned.path) return assigned;
     const current = await workspaceCall("workspace_info");
-    if (!assigned) {
-      // Pin the user's currently selected folder the first time this chat is seen.
-      if (current && current.configured && current.root) {
-        conversationProjects[id] = {
-          path: current.root, name: projectName(current.root), updatedAt: Date.now()
-        };
-        saveConversationProjects();
-      }
-      return current;
+    if (current && current.configured && current.root) {
+      conversationProjects[id] = {
+        path: current.root, name: projectName(current.root), updatedAt: Date.now()
+      };
+      saveConversationProjects();
     }
-    if (current && current.root &&
-        current.root.toLowerCase() === assigned.path.toLowerCase()) return current;
-    const opened = await workspaceCall("workspace_open_recent", { path: assigned.path }, "");
-    const root = opened && (opened.root || opened.workspace_root);
-    if (!root || opened.configured === false) {
-      throw new Error("This conversation's project directory is unavailable: " + assigned.path);
-    }
-    assigned.path = root;
-    assigned.name = projectName(root);
-    assigned.updatedAt = Date.now();
-    saveConversationProjects();
-    return opened;
+    return current;
   }
   async function selectConversationProject(path) {
     const root = String(path || "").trim();
@@ -3076,26 +3065,16 @@
     if (!root) throw new Error("Enter a project directory.");
     if (!id) throw new Error("Send a message in this chat first so it has a stable conversation ID.");
     projectSwitchPromise = projectSwitchPromise.catch(() => {}).then(async () => {
-      const recentResult = await workspaceCall("workspace_recent_roots");
-      const recentRoots = recentResult && (recentResult.recent_roots || recentResult.roots) || [];
-      const known = recentRoots.some((item) => item && item.path &&
-        item.path.toLowerCase() === root.toLowerCase());
-      const current = await workspaceCall("workspace_info");
-      const isCurrent = current && current.root &&
-        current.root.toLowerCase() === root.toLowerCase();
-      const opened = known || isCurrent
-        ? await workspaceCall("workspace_open_recent", { path: root })
-        : await workspaceCall("workspace_set_root", { path: root });
-      const actualRoot = opened && (opened.root || opened.workspace_root);
-      if (!actualRoot || opened.configured === false) {
-        throw new Error("Could not open project directory: " + root);
-      }
+      // Do not call workspace_set_root/workspace_open_recent here: both mutate the
+      // bridge-wide active root and would silently change the user's general project.
+      // Store the per-conversation path only. The background validates/activates it
+      // for a workspace operation and restores the shared root after that operation.
       conversationProjects[id] = {
-        path: actualRoot, name: projectName(actualRoot), updatedAt: Date.now()
+        path: root, name: projectName(root), updatedAt: Date.now()
       };
       saveConversationProjects();
-      diag("projectDirectory.assigned", { conversationId: id, root: actualRoot });
-      return actualRoot;
+      diag("projectDirectory.assigned", { conversationId: id, root });
+      return root;
     });
     return projectSwitchPromise;
   }

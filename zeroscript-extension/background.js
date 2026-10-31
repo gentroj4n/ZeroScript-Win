@@ -87,42 +87,61 @@ async function sendWorkspaceTool(name, args, timeout) {
   }
   return response;
 }
+async function parseWorkspaceResult(response) {
+  const raw = response && response.result && response.result.content
+    ? response.result.content : response && response.result;
+  let value = raw;
+  if (Array.isArray(raw)) {
+    const part = raw.find((item) => item && typeof item.text === "string");
+    if (part) { try { value = JSON.parse(part.text); } catch { value = part.text; } }
+  } else if (typeof raw === "string") {
+    try { value = JSON.parse(raw); } catch {}
+  }
+  return value;
+}
+async function activateWorkspaceRoot(projectPath) {
+  const recentResponse = await sendWorkspaceTool("workspace_recent_roots", {}, 30000);
+  const recentData = await parseWorkspaceResult(recentResponse);
+  const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
+  const isRecent = recentRoots.some((item) => item && item.path &&
+    String(item.path).toLowerCase() === String(projectPath).toLowerCase());
+  const activate = isRecent
+    ? await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000)
+    : await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
+  const opened = await parseWorkspaceResult(activate);
+  const actualRoot = opened && (opened.root || opened.workspace_root);
+  if (!actualRoot || opened.configured === false ||
+      String(actualRoot).toLowerCase() !== String(projectPath).toLowerCase()) {
+    throw new Error("Could not activate project directory: " + projectPath);
+  }
+  return actualRoot;
+}
 async function callToolInProject(projectPath, name, args, timeout) {
   return queueWorkspaceDispatch(async () => {
-    // Explicitly stored folders are user-approved local paths; register them
-    // through the bridge's workspace_set_root API when not yet in recents.
-    // The native folder picker is a bridge-side dialog. It returns the selected
-    // absolute path but deliberately does not change the active workspace.
-    const recentResponse = await sendWorkspaceTool("workspace_recent_roots", {}, 30000);
-    const rawRecent = recentResponse.result && recentResponse.result.content
-      ? recentResponse.result.content : recentResponse.result;
-    let recentData = rawRecent;
-    if (Array.isArray(rawRecent)) {
-      const part = rawRecent.find((item) => item && typeof item.text === "string");
-      if (part) { try { recentData = JSON.parse(part.text); } catch {} }
-    } else if (typeof rawRecent === "string") {
-      try { recentData = JSON.parse(rawRecent); } catch {}
+    // The bridge exposes a single active root. Treat a conversation assignment as
+    // a temporary execution context: remember the shared root, run exactly one
+    // operation in the assigned project, then restore the shared root before
+    // releasing the queue. This prevents a chat-specific project from replacing
+    // the user's general workspace or racing another conversation.
+    const beforeResponse = await sendWorkspaceTool("workspace_info", {}, 30000);
+    const before = await parseWorkspaceResult(beforeResponse);
+    const previousRoot = before && (before.root || before.workspace_root) || "";
+    let result;
+    try {
+      await activateWorkspaceRoot(projectPath);
+      result = await sendWorkspaceTool(name, args || {}, timeout);
+      return result;
+    } finally {
+      if (previousRoot && String(previousRoot).toLowerCase() !== String(projectPath).toLowerCase()) {
+        try {
+          await activateWorkspaceRoot(previousRoot);
+          log("Restored shared workspace root after conversation-scoped tool:", previousRoot);
+        } catch (error) {
+          log("ERROR: Could not restore shared workspace root after conversation-scoped tool:",
+            previousRoot, String(error && error.message || error));
+        }
+      }
     }
-    const recentRoots = recentData && (recentData.recent_roots || recentData.roots) || [];
-    const isRecent = recentRoots.some((item) => item && item.path &&
-      String(item.path).toLowerCase() === String(projectPath).toLowerCase());
-    const activate = isRecent
-      ? await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000)
-      : await sendWorkspaceTool("workspace_set_root", { path: projectPath }, 30000);
-    const payload = activate.result && activate.result.content ? activate.result.content : activate.result;
-    let opened = payload;
-    if (Array.isArray(payload)) {
-      const part = payload.find((item) => item && typeof item.text === "string");
-      if (part) { try { opened = JSON.parse(part.text); } catch {} }
-    } else if (typeof payload === "string") {
-      try { opened = JSON.parse(payload); } catch {}
-    }
-    const actualRoot = opened && (opened.root || opened.workspace_root);
-    if (!actualRoot || opened.configured === false ||
-        String(actualRoot).toLowerCase() !== String(projectPath).toLowerCase()) {
-      throw new Error("Could not activate the assigned project directory: " + projectPath);
-    }
-    return sendWorkspaceTool(name, args || {}, timeout);
   });
 }
 
