@@ -2259,18 +2259,8 @@
     try {
       await loadConversationProjects();
       if (!alive()) return;
-      const initialProjectId = projectConversationId();
-      if (initialProjectId && !conversationProjects[initialProjectId]) {
-        // A fresh conversation inherits the current bridge root once, then
-        // receives its own stable directory binding for subsequent navigation.
-        const workspace = await workspaceCall("workspace_info");
-        if (workspace && workspace.configured && workspace.root) {
-          conversationProjects[initialProjectId] = {
-            path: workspace.root, name: projectName(workspace.root), updatedAt: Date.now()
-          };
-          saveConversationProjects();
-        }
-      }
+      // Do not silently bind a new chat to the bridge-wide general workspace.
+      // ensureConversationProject provisions an isolated temporary root instead.
       await ensureConversationProject();
       if (!alive()) return;
       await ensureTools(true); // boot: always take a fresh catalogue (the TTL then
@@ -3046,18 +3036,18 @@
     const id = projectConversationId();
     if (!id) return null;
     const assigned = conversationProjects[id];
-    // Conversation assignment is metadata, not a command to change the bridge's
-    // global workspace. The background worker activates this path temporarily for
-    // each workspace tool and restores the shared root afterward.
     if (assigned && assigned.path) return assigned;
-    const current = await workspaceCall("workspace_info");
-    if (current && current.configured && current.root) {
-      conversationProjects[id] = {
-        path: current.root, name: projectName(current.root), updatedAt: Date.now()
-      };
-      saveConversationProjects();
-    }
-    return current;
+    // New chats get an isolated scratch root keyed by provider + conversation ID.
+    // This creates a directory only; it does not change the general workspace.
+    const created = await workspaceCall("workspace_create_conversation_root", { conversation_id: id });
+    if (!created || !created.root) throw new Error("Bridge did not return an isolated conversation workspace.");
+    conversationProjects[id] = {
+      path: created.root, name: created.name || projectName(created.root),
+      temporary: true, updatedAt: Date.now()
+    };
+    saveConversationProjects();
+    diag("projectDirectory.temporaryCreated", { conversationId: id, root: created.root });
+    return conversationProjects[id];
   }
   async function selectConversationProject(path) {
     const root = String(path || "").trim();
