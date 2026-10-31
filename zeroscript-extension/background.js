@@ -596,7 +596,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       case "call_tool": {
         const timeout = (msg.timeout || 120000) + 10000;
-        const isWorkspaceTool = String(msg.name || "").includes("workspace_");
+        const isWorkspaceTool = String(msg.name || "").includes("workspace_") || msg.name === "roblox_export_tree";
         const r = isWorkspaceTool && msg.projectPath
           ? await callToolInProject(msg.projectPath, msg.name, msg.arguments, msg.timeout)
           : await send(
