@@ -3023,8 +3023,11 @@
   function saveConversationProjects() {
     try { chrome.storage.local.set({ [PROJECT_MAP_KEY]: conversationProjects }); } catch {}
   }
-  async function workspaceCall(name, args = {}) {
-    const response = await bg({ type: "call_tool", name, arguments: args, timeout: 30000 });
+  async function workspaceCall(name, args = {}, projectPath = "") {
+    const response = await bg({
+      type: "call_tool", name, arguments: args, timeout: 30000,
+      projectPath: String(name || "").includes("workspace_") ? projectPath : ""
+    });
     if (!response || !response.ok) {
       throw new Error(response && response.error || "Workspace tool failed: " + name);
     }
