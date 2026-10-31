@@ -1065,15 +1065,7 @@
         if (assigned && assigned.path) {
           conversationProjectPath = assigned.path;
         } else {
-          const current = await workspaceCall("workspace_info");
-          if (current && current.configured && current.root) {
-            const id = projectConversationId();
-            if (id) {
-              conversationProjects[id] = { path: current.root, name: projectName(current.root), updatedAt: Date.now() };
-              saveConversationProjects();
-              conversationProjectPath = current.root;
-            }
-          }
+          return "ERROR: This conversation has no project directory assigned. Choose a project folder from the ArcScript options menu before using workspace tools.";
         }
       } catch (error) {
         return "ERROR: Could not resolve this conversation's project directory: " +
