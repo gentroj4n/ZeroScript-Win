@@ -89,38 +89,23 @@ async function sendWorkspaceTool(name, args, timeout) {
 }
 async function callToolInProject(projectPath, name, args, timeout) {
   return queueWorkspaceDispatch(async () => {
-    const infoResponse = await sendWorkspaceTool("workspace_info", {}, 30000);
-    const current = infoResponse.result && infoResponse.result.content
-      ? infoResponse.result.content : infoResponse.result;
-    let parsedCurrent = current;
-    if (Array.isArray(current)) {
-      const textPart = current.find((part) => part && typeof part.text === "string");
-      if (textPart) { try { parsedCurrent = JSON.parse(textPart.text); } catch {} }
-    } else if (typeof current === "string") {
-      try { parsedCurrent = JSON.parse(current); } catch {}
+    const activate = await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000);
+    const payload = activate.result && activate.result.content ? activate.result.content : activate.result;
+    let opened = payload;
+    if (Array.isArray(payload)) {
+      const part = payload.find((item) => item && typeof item.text === "string");
+      if (part) { try { opened = JSON.parse(part.text); } catch {} }
+    } else if (typeof payload === "string") {
+      try { opened = JSON.parse(payload); } catch {}
     }
-    if (!parsedCurrent || !parsedCurrent.root || !projectPath) {
-      throw new Error("No project directory is assigned to this conversation.");
-    }
-    if (String(parsedCurrent.root).toLowerCase() !== String(projectPath).toLowerCase()) {
-      const opened = await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000);
-      const payload = opened.result && opened.result.content ? opened.result.content : opened.result;
-      let value = payload;
-      if (Array.isArray(payload)) {
-        const part = payload.find((item) => item && typeof item.text === "string");
-        if (part) { try { value = JSON.parse(part.text); } catch {} }
-      } else if (typeof payload === "string") {
-        try { value = JSON.parse(payload); } catch {}
-      }
-      if (!value || value.configured === false ||
-          String(value.root || value.workspace_root || "").toLowerCase() !== String(projectPath).toLowerCase()) {
-        throw new Error("Could not activate the assigned project directory: " + projectPath);
-      }
+    const actualRoot = opened && (opened.root || opened.workspace_root);
+    if (!actualRoot || opened.configured === false ||
+        String(actualRoot).toLowerCase() !== String(projectPath).toLowerCase()) {
+      throw new Error("Could not activate the assigned project directory: " + projectPath);
     }
     return sendWorkspaceTool(name, args || {}, timeout);
   });
 }
-
 
 let ws = null;
 let connected = false;
