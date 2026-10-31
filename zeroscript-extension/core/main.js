@@ -2259,9 +2259,18 @@
     try {
       await loadConversationProjects();
       if (!alive()) return;
-      // Do not silently bind a new chat to the bridge-wide general workspace.
-      // ensureConversationProject provisions an isolated temporary root instead.
-      await ensureConversationProject();
+      // Project provisioning must not gate the agent controls themselves.
+      // If the bridge is temporarily unavailable, keep startup alive so the user
+      // can open settings/connect the bridge; workspace tools remain blocked until
+      // a conversation-specific project has been assigned.
+      try {
+        await ensureConversationProject();
+      } catch (projectError) {
+        diag("projectDirectory.bootstrapDeferred", {
+          conversationId: projectConversationId(),
+          error: String(projectError && projectError.message || projectError)
+        });
+      }
       if (!alive()) return;
       await ensureTools(true); // boot: always take a fresh catalogue (the TTL then
                                // covers the list_commands / list_mcp_servers calls
