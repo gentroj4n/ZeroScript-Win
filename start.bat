@@ -5,6 +5,9 @@ chcp 65001 >nul
 title ArcScript Bridge
 cd /d "%~dp0"
 
+REM A temporary copy handles updates so Git can replace this file safely.
+if /i "%~1"=="--zs-bootstrap" goto :bootstrap_update
+
 if not exist "%~dp0logs" mkdir "%~dp0logs" >nul 2>nul
 set "LOGFILE=%~dp0logs\start.log"
 call :log "===== %DATE% %TIME%  start.bat launched ====="
@@ -242,13 +245,11 @@ REM --- Subroutine: update from GitHub before startup --------------------------
 where git >nul 2>nul
 if errorlevel 1 (
     echo   ERROR: Git is not installed.
-    call :log "UPDATE ERROR: Git not installed."
     exit /b 1
 )
 git rev-parse --is-inside-work-tree >nul 2>nul
 if errorlevel 1 (
     echo   ERROR: This folder is not a Git checkout.
-    call :log "UPDATE ERROR: no Git worktree."
     exit /b 1
 )
 set "ZS_ORIGIN="
@@ -256,29 +257,40 @@ for /f "delims=" %%U in ('git remote get-url origin 2^>nul') do set "ZS_ORIGIN=%
 echo(!ZS_ORIGIN!| findstr /i /c:"robby-gridpoint/ZeroScript-Win" >nul
 if errorlevel 1 (
     echo   ERROR: Git origin is not robby-gridpoint/ZeroScript-Win.
-    call :log "UPDATE ERROR: unexpected origin '!ZS_ORIGIN!'."
     exit /b 1
 )
+set "ZS_BOOTSTRAP=%TEMP%\zs-bootstrap-%RANDOM%-%RANDOM%.bat"
+copy /y "%~f0" "!ZS_BOOTSTRAP!" >nul
+if errorlevel 1 (
+    echo   ERROR: Could not prepare the update helper.
+    exit /b 1
+)
+REM The helper is a TEMP copy, so resetting the checkout cannot alter the
+REM batch file currently being interpreted by cmd.exe.
+call "!ZS_BOOTSTRAP!" --zs-bootstrap "%~dp0"
+set "ZS_UPDATE_RESULT=!errorlevel!"
+del /q "!ZS_BOOTSTRAP!" >nul 2>nul
+exit /b !ZS_UPDATE_RESULT!
+
+:bootstrap_update
+set "ZS_ROOT=%~2"
+if not defined ZS_ROOT exit /b 1
+cd /d "%ZS_ROOT%" || exit /b 1
 echo   UPDATE: Fetching GitHub main...
-call :log "UPDATE: fetching origin/main."
 git fetch origin +main:refs/remotes/origin/main
 if errorlevel 1 (
     echo   ERROR: Could not fetch GitHub. Check internet/authentication.
-    call :log "UPDATE ERROR: fetch failed."
     exit /b 1
 )
-REM This launcher is intentionally GitHub-authoritative: discard local edits to
-REM tracked files so a fresh install cannot get stuck on line-ending or local
-REM modification noise. Untracked user files are left untouched.
 git reset --hard origin/main
 if errorlevel 1 (
     echo   ERROR: Could not sync tracked files to GitHub main.
-    call :log "UPDATE ERROR: hard reset failed."
     exit /b 1
 )
 echo   UPDATE: GitHub sync complete.
-call :log "UPDATE: GitHub sync complete."
-exit /b 0
+REM Start the newly synced launcher; this TEMP helper remains unchanged.
+call "%ZS_ROOT%start.bat" --zs-updated
+exit /b %errorlevel%
 
 REM --- Subroutine: verify %PY% is a real, usable Python ------------------------
 REM Returns 0 only if the interpreter runs, has a working pip, AND is Python 3.9
