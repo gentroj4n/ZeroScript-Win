@@ -3103,6 +3103,7 @@
     return projectSwitchPromise;
   }
   async function chooseConversationProject() {
+    await loadConversationProjects();
     const current = await workspaceCall("workspace_info");
     const recentResult = await workspaceCall("workspace_recent_roots");
     const recent = Array.isArray(recentResult) ? recentResult :
