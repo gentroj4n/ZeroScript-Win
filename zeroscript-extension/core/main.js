@@ -1266,7 +1266,7 @@
     });
     let r = await Promise.race([bg({
       type: "call_tool", name, arguments: args, timeout,
-      projectPath: String(name || "").includes("workspace_") ? conversationProjectPath : ""
+      projectPath: String(name || "").includes("workspace_") ? conversationProjectPath : "",
     }), hardCap, stopWatch]);
     clearInterval(stopTimer);
     if (r && r.kind === "stopped") return "(stopped by user)";
