@@ -14,63 +14,14 @@ REM environment must be either ON SCREEN or in this log.
 for /f "tokens=*" %%v in ('ver') do call :log "%%v"
 
 REM --- Update from GitHub before starting -----------------------------------
-REM Always synchronize the launcher to the repository's main branch first.
-REM This replaces tracked local files with the GitHub version. Untracked files
-REM are preserved. If GitHub cannot be reached, stop rather than launch stale code.
 if /i not "%~1"=="--zs-updated" (
-    where git >nul 2>nul
-    if errorlevel 1 goto :update_failed_git
-    git rev-parse --is-inside-work-tree >nul 2>nul
-    if errorlevel 1 goto :update_failed_repo
-
-    set "ZS_ORIGIN="
-    for /f "delims=" %%U in ('git remote get-url origin 2^>nul') do set "ZS_ORIGIN=%%U"
-    echo(!ZS_ORIGIN!| findstr /i /c:"robby-gridpoint/ZeroScript-Win" >nul
-    if errorlevel 1 goto :update_failed_origin
-
-    echo   UPDATE: Fetching latest version from GitHub...
-    call :log "UPDATE: fetching origin/main."
-    git fetch --prune origin main
-    if errorlevel 1 goto :update_failed_fetch
-
-    git checkout -f -B main origin/main
-    if errorlevel 1 goto :update_failed_sync
-
-    echo   UPDATE: Synchronized with GitHub. Starting...
-    call :log "UPDATE: synchronized local main with origin/main."
-    goto :update_done
-
-    :update_failed_git
-    echo   ERROR: Git is not installed. Cannot update before startup.
-    call :log "FATAL UPDATE: Git not installed."
-    pause
-    exit /b 1
-
-    :update_failed_repo
-    echo   ERROR: This folder is not a Git checkout.
-    call :log "FATAL UPDATE: no Git worktree."
-    pause
-    exit /b 1
-
-    :update_failed_origin
-    echo   ERROR: origin is not robby-gridpoint/ZeroScript-Win.
-    call :log "FATAL UPDATE: unexpected origin '!ZS_ORIGIN!'."
-    pause
-    exit /b 1
-
-    :update_failed_fetch
-    echo   ERROR: GitHub update failed. Check internet access and GitHub authentication.
-    call :log "FATAL UPDATE: fetch failed."
-    pause
-    exit /b 1
-
-    :update_failed_sync
-    echo   ERROR: Could not synchronize local files with GitHub main.
-    call :log "FATAL UPDATE: checkout failed."
-    pause
-    exit /b 1
-
-    :update_done
+    call :sync_github
+    if errorlevel 1 (
+        echo.
+        echo   Startup stopped because the GitHub update failed.
+        pause
+        exit /b 1
+    )
 )
 
 echo.
@@ -284,6 +235,47 @@ if not "%BRIDGE_EXIT%"=="0" (
 )
 echo   Press any key to close.
 pause >nul
+exit /b 0
+
+REM --- Subroutine: update from GitHub before startup ---------------------------
+:sync_github
+where git >nul 2>nul
+if errorlevel 1 (
+    echo   ERROR: Git is not installed.
+    call :log "UPDATE ERROR: Git not installed."
+    exit /b 1
+)
+git rev-parse --is-inside-work-tree >nul 2>nul
+if errorlevel 1 (
+    echo   ERROR: This folder is not a Git checkout.
+    call :log "UPDATE ERROR: no Git worktree."
+    exit /b 1
+)
+set "ZS_ORIGIN="
+for /f "delims=" %%U in ('git remote get-url origin 2^>nul') do set "ZS_ORIGIN=%%U"
+echo(!ZS_ORIGIN!| findstr /i /c:"robby-gridpoint/ZeroScript-Win" >nul
+if errorlevel 1 (
+    echo   ERROR: Git origin is not robby-gridpoint/ZeroScript-Win.
+    call :log "UPDATE ERROR: unexpected origin '!ZS_ORIGIN!'."
+    exit /b 1
+)
+echo   UPDATE: Fetching GitHub main...
+call :log "UPDATE: fetching origin/main."
+git fetch origin main
+if errorlevel 1 (
+    echo   ERROR: Could not fetch GitHub. Check internet/authentication.
+    call :log "UPDATE ERROR: fetch failed."
+    exit /b 1
+)
+git pull --ff-only origin main
+if errorlevel 1 (
+    echo   ERROR: Could not fast-forward to GitHub main.
+    echo           Check for local commits or tracked file changes.
+    call :log "UPDATE ERROR: fast-forward pull failed."
+    exit /b 1
+)
+echo   UPDATE: GitHub sync complete.
+call :log "UPDATE: GitHub sync complete."
 exit /b 0
 
 REM --- Subroutine: verify %PY% is a real, usable Python ------------------------
