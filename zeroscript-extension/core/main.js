@@ -2273,11 +2273,6 @@
             path: workspace.root, name: projectName(workspace.root), updatedAt: Date.now()
           };
           saveConversationProjects();
-        } else {
-          // First-time setup: only let the user pick a directory after explicit
-          // action in the project control; never inspect the bridge's default root.
-          ui.toast("Assign a project directory in the options menu before starting this chat.");
-          return;
         }
       }
       await ensureConversationProject();
