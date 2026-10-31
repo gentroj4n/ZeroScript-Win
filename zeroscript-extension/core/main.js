@@ -2261,6 +2261,20 @@
     // Do not lock the native composer during bootstrap; users must retain normal\n    // editing keys (including Space and Delete) while ArcScript initializes.
     ui.inputCover(true);  // cover the composer ("Working…") for the WHOLE Starting Up
     try {
+      await loadConversationProjects();
+      if (!alive()) return;
+      const initialProjectId = projectConversationId();
+      if (initialProjectId && !conversationProjects[initialProjectId]) {
+        // A fresh conversation inherits the current bridge root once, then
+        // receives its own stable directory binding for subsequent navigation.
+        const workspace = await workspaceCall("workspace_info");
+        if (workspace && workspace.configured && workspace.root) {
+          conversationProjects[initialProjectId] = {
+            path: workspace.root, name: projectName(workspace.root), updatedAt: Date.now()
+          };
+          saveConversationProjects();
+        }
+      }
       await ensureConversationProject();
       if (!alive()) return;
       await ensureTools(true); // boot: always take a fresh catalogue (the TTL then
