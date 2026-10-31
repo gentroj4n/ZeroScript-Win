@@ -261,17 +261,19 @@ if errorlevel 1 (
 )
 echo   UPDATE: Fetching GitHub main...
 call :log "UPDATE: fetching origin/main."
-git fetch origin main
+git fetch origin +main:refs/remotes/origin/main
 if errorlevel 1 (
     echo   ERROR: Could not fetch GitHub. Check internet/authentication.
     call :log "UPDATE ERROR: fetch failed."
     exit /b 1
 )
-git pull --ff-only origin main
+REM This launcher is intentionally GitHub-authoritative: discard local edits to
+REM tracked files so a fresh install cannot get stuck on line-ending or local
+REM modification noise. Untracked user files are left untouched.
+git reset --hard origin/main
 if errorlevel 1 (
-    echo   ERROR: Could not fast-forward to GitHub main.
-    echo           Check for local commits or tracked file changes.
-    call :log "UPDATE ERROR: fast-forward pull failed."
+    echo   ERROR: Could not sync tracked files to GitHub main.
+    call :log "UPDATE ERROR: hard reset failed."
     exit /b 1
 )
 echo   UPDATE: GitHub sync complete.
