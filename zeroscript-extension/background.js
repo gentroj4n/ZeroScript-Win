@@ -68,6 +68,60 @@ const HEARTBEAT_MS = 10000;
 const STALE_SOCKET_MS = 25000;
 const REQUEST_TIMEOUT_DEFAULT = 130000; // a bit above the 120s tool timeout
 
+// Workspace tools share one bridge-wide active root. Serialize root activation
+// and the subsequent tool call in this worker so separate AI tabs cannot switch
+// the bridge between those two operations.
+let workspaceDispatchQueue = Promise.resolve();
+function queueWorkspaceDispatch(operation) {
+  const run = workspaceDispatchQueue.catch(() => {}).then(operation);
+  workspaceDispatchQueue = run.catch(() => {});
+  return run;
+}
+async function sendWorkspaceTool(name, args, timeout) {
+  const duration = timeout || 120000;
+  const response = await send({
+    type: "call_tool", name, arguments: args || {}, timeout: duration
+  }, duration + 10000);
+  if (!response || !response.ok) {
+    throw new Error(response && response.error || "Workspace operation failed: " + name);
+  }
+  return response;
+}
+async function callToolInProject(projectPath, name, args, timeout) {
+  return queueWorkspaceDispatch(async () => {
+    const infoResponse = await sendWorkspaceTool("workspace_info", {}, 30000);
+    const current = infoResponse.result && infoResponse.result.content
+      ? infoResponse.result.content : infoResponse.result;
+    let parsedCurrent = current;
+    if (Array.isArray(current)) {
+      const textPart = current.find((part) => part && typeof part.text === "string");
+      if (textPart) { try { parsedCurrent = JSON.parse(textPart.text); } catch {} }
+    } else if (typeof current === "string") {
+      try { parsedCurrent = JSON.parse(current); } catch {}
+    }
+    if (!parsedCurrent || !parsedCurrent.root || !projectPath) {
+      throw new Error("No project directory is assigned to this conversation.");
+    }
+    if (String(parsedCurrent.root).toLowerCase() !== String(projectPath).toLowerCase()) {
+      const opened = await sendWorkspaceTool("workspace_open_recent", { path: projectPath }, 30000);
+      const payload = opened.result && opened.result.content ? opened.result.content : opened.result;
+      let value = payload;
+      if (Array.isArray(payload)) {
+        const part = payload.find((item) => item && typeof item.text === "string");
+        if (part) { try { value = JSON.parse(part.text); } catch {} }
+      } else if (typeof payload === "string") {
+        try { value = JSON.parse(payload); } catch {}
+      }
+      if (!value || value.configured === false ||
+          String(value.root || value.workspace_root || "").toLowerCase() !== String(projectPath).toLowerCase()) {
+        throw new Error("Could not activate the assigned project directory: " + projectPath);
+      }
+    }
+    return sendWorkspaceTool(name, args || {}, timeout);
+  });
+}
+
+
 let ws = null;
 let connected = false;
 let reconnectDelay = RECONNECT_MIN;
@@ -519,10 +573,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       case "call_tool": {
         const timeout = (msg.timeout || 120000) + 10000;
-        const r = await send(
-          { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
-          timeout
-        );
+        const isWorkspaceTool = String(msg.name || "").includes("workspace_");
+        const r = isWorkspaceTool && msg.projectPath
+          ? await callToolInProject(msg.projectPath, msg.name, msg.arguments, msg.timeout)
+          : await send(
+              { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
+              timeout
+            );
         sendResponse(r);
         break;
       }
