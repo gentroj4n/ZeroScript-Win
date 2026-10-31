@@ -99,6 +99,9 @@ async function parseWorkspaceResult(response) {
   }
   return value;
 }
+function normalizeWorkspacePath(value) {
+  return String(value || "").trim().replace(/\//g, "\\").replace(/[\\]+$/, "").toLowerCase();
+}
 async function activateWorkspaceRoot(projectPath) {
   const recentResponse = await sendWorkspaceTool("workspace_recent_roots", {}, 30000);
   const recentData = await parseWorkspaceResult(recentResponse);
@@ -111,7 +114,7 @@ async function activateWorkspaceRoot(projectPath) {
   const opened = await parseWorkspaceResult(activate);
   const actualRoot = opened && (opened.root || opened.workspace_root);
   if (!actualRoot || opened.configured === false ||
-      String(actualRoot).toLowerCase() !== String(projectPath).toLowerCase()) {
+      normalizeWorkspacePath(actualRoot) !== normalizeWorkspacePath(projectPath)) {
     throw new Error("Could not activate project directory: " + projectPath);
   }
   return actualRoot;
@@ -132,7 +135,7 @@ async function callToolInProject(projectPath, name, args, timeout) {
       result = await sendWorkspaceTool(name, args || {}, timeout);
       return result;
     } finally {
-      if (previousRoot && String(previousRoot).toLowerCase() !== String(projectPath).toLowerCase()) {
+      if (previousRoot && normalizeWorkspacePath(previousRoot) !== normalizeWorkspacePath(projectPath)) {
         try {
           await activateWorkspaceRoot(previousRoot);
           log("Restored shared workspace root after conversation-scoped tool:", previousRoot);
