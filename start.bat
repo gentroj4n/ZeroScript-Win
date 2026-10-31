@@ -13,6 +13,74 @@ REM single terminal screenshot, so anything that identifies the machine's
 REM environment must be either ON SCREEN or in this log.
 for /f "tokens=*" %%v in ('ver') do call :log "%%v"
 
+REM --- Update from GitHub before starting -------------------------------------
+REM Only auto-update a clean checkout of this project's main branch. Never
+REM overwrite local edits, switch branches, or pull from an unrelated origin.
+REM Private repositories require Git credentials already configured on this PC.
+if /i not "%~1"=="--zs-updated" (
+    where git >nul 2>nul
+    if errorlevel 1 (
+        echo   UPDATE: Git is not installed; starting the current local version.
+        call :log "UPDATE: Git not found; skipped automatic update."
+    ) else (
+        git rev-parse --is-inside-work-tree >nul 2>nul
+        if errorlevel 1 (
+            echo   UPDATE: This folder is not a Git checkout; starting local version.
+            echo           Clone the repository to enable automatic updates.
+            call :log "UPDATE: no Git worktree; skipped automatic update."
+        ) else (
+            set "ZS_BRANCH="
+            set "ZS_ORIGIN="
+            set "ZS_DIRTY="
+            set "ZS_HEAD_BEFORE="
+            for /f "delims=" %%B in ('git branch --show-current 2^>nul') do set "ZS_BRANCH=%%B"
+            for /f "delims=" %%U in ('git remote get-url origin 2^>nul') do set "ZS_ORIGIN=%%U"
+            for /f "delims=" %%H in ('git rev-parse HEAD 2^>nul') do set "ZS_HEAD_BEFORE=%%H"
+            for /f "delims=" %%D in ('git status --porcelain 2^>nul') do set "ZS_DIRTY=1"
+
+            echo(!ZS_ORIGIN!| findstr /i /c:"robby-gridpoint/ZeroScript-Win" >nul
+            if errorlevel 1 (
+                echo   UPDATE: origin is not robby-gridpoint/ZeroScript-Win; skipped.
+                call :log "UPDATE: unexpected origin '!ZS_ORIGIN!'; skipped."
+            ) else if /i not "!ZS_BRANCH!"=="main" (
+                echo   UPDATE: Current branch is "!ZS_BRANCH!". Auto-update runs on main only.
+                call :log "UPDATE: branch '!ZS_BRANCH!' is not main; skipped."
+            ) else if defined ZS_DIRTY (
+                echo   UPDATE: Local changes detected; refusing to overwrite them.
+                echo           Commit or stash changes, then launch again.
+                call :log "UPDATE: working tree has local changes; skipped."
+            ) else (
+                echo   UPDATE: Checking GitHub for the latest main...
+                call :log "UPDATE: fetching origin/main."
+                git fetch origin main --prune
+                if errorlevel 1 (
+                    echo   WARNING: Could not fetch from GitHub. Starting current version.
+                    echo            Check internet access and GitHub authentication.
+                    call :log "UPDATE WARNING: git fetch failed; starting current version."
+                ) else (
+                    git merge --ff-only origin/main
+                    if errorlevel 1 (
+                        echo   WARNING: Could not fast-forward to origin/main.
+                        echo            Resolve the local Git state before updating.
+                        call :log "UPDATE WARNING: fast-forward merge failed; starting current version."
+                    ) else (
+                        for /f "delims=" %%H in ('git rev-parse HEAD 2^>nul') do set "ZS_HEAD_AFTER=%%H"
+                        if not "!ZS_HEAD_BEFORE!"=="!ZS_HEAD_AFTER!" (
+                            echo   UPDATE: Updated successfully. Restarting with the new version...
+                            call :log "UPDATE: advanced from !ZS_HEAD_BEFORE! to !ZS_HEAD_AFTER!; restarting."
+                            call "%~f0" --zs-updated
+                            exit /b %errorlevel%
+                        ) else (
+                            echo   UPDATE: Already up to date.
+                            call :log "UPDATE: already up to date."
+                        )
+                    )
+                )
+            )
+        )
+    )
+)
+
 echo.
 echo   === ArcScript Bridge ===
 echo.
