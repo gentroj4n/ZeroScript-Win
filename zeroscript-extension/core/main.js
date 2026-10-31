@@ -3061,7 +3061,7 @@
     }
     if (current && current.root &&
         current.root.toLowerCase() === assigned.path.toLowerCase()) return current;
-    const opened = await workspaceCall("workspace_open_recent", { path: assigned.path });
+    const opened = await workspaceCall("workspace_open_recent", { path: assigned.path }, "");
     const root = opened && (opened.root || opened.workspace_root);
     if (!root || opened.configured === false) {
       throw new Error("This conversation's project directory is unavailable: " + assigned.path);
