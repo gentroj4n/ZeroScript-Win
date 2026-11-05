@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "roblox": {
+      "command": "py",
+      "args": ["-3", "launch_studio_mcp.py"]
+    },
+    "bpy": {
+      "command": ".venv-bpy\\Scripts\\python.exe",
+      "args": ["-m", "zeroscript_blender.mcp_server"]
+    },
+    "dominus": {
+      "command": "npx",
+      "args": ["-y", "-p", "dominus-cli@latest", "dominus-mcp"]
+    },
+    "discord": {
+      "command": "launch_discord_mcp.py",
+      "args": [],
+      "env": {
+        "DISCORD_BOT_TOKEN": "REPLACE_WITH_YOUR_DISCORD_BOT_TOKEN",
+        "ZS_DISCORD_GUILD_IDS": "REPLACE_WITH_YOUR_GUILD_ID"
+      }
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "REPLACE_WITH_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN"
+      }
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    },
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    }
+  }
+}
