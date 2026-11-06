@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Shared reliability primitives for the ZeroScript-Win remaster (stdlib only)."""
 from __future__ import annotations
-import hashlib, json, os, re, shutil, socket, subprocess, time
+import hashlib, json, os, re, shutil, socket, subprocess, threading, time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,15 +22,18 @@ class AgentFlightRecorder:
     """Append-only JSONL event log with redaction and one-generation rotation."""
     def __init__(self, path: str | Path, max_bytes: int = 8 * 1024 * 1024):
         self.path, self.max_bytes = Path(path), max(65536, int(max_bytes))
+        self._lock = threading.Lock()
     def record(self, event: str, **fields: Any) -> dict[str, Any]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         row = {"time": time.time(), "event": str(event)[:120], "fields": redact(fields)}
         data = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode()
-        if self.path.exists() and self.path.stat().st_size + len(data) > self.max_bytes:
-            rotated = self.path.with_suffix(self.path.suffix + ".1")
-            rotated.unlink(missing_ok=True)
-            self.path.replace(rotated)
-        with self.path.open("ab") as stream: stream.write(data)
+        # Rotate-then-append must be atomic: concurrent subagents/threads share one recorder.
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists() and self.path.stat().st_size + len(data) > self.max_bytes:
+                rotated = self.path.with_suffix(self.path.suffix + ".1")
+                rotated.unlink(missing_ok=True)
+                self.path.replace(rotated)
+            with self.path.open("ab") as stream: stream.write(data)
         return row
     def read(self, limit: int = 500) -> list[dict[str, Any]]:
         if not self.path.exists(): return []

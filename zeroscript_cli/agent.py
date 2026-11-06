@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fnmatch
+import inspect
 import json
 import math
 import os
@@ -15,6 +16,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import websockets
@@ -33,6 +36,11 @@ DEFAULT_BRIDGE_URL = "ws://127.0.0.1:17613"
 MAX_TURNS = 40
 MAX_TOOL_OUTPUT = 24000
 CONTROL_ACTIVE = {"active", "stop_requested"}
+PROTOCOL_VERSION = 2
+DEFAULT_MAX_PARALLEL_SUBAGENTS = 4
+_SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# Process-wide settings applied by async_main (CLI flag > environment > default).
+_RUNTIME_SETTINGS: Dict[str, Any] = {"max_parallel_subagents": None}
 
 
 def _session_dir() -> Path:
@@ -73,11 +81,122 @@ def _clip(value: Any, limit: int = MAX_TOOL_OUTPUT) -> str:
     return value[:limit] + "\n...[output truncated; original length " + str(len(value)) + " characters]"
 
 
-class BridgeClient:
-    """Multiplexed WebSocket client for the existing ZeroScript bridge protocol."""
+class ProtocolMismatchError(Exception):
+    """The bridge refused (or cannot speak) this CLI's protocol version. Never retried."""
 
-    def __init__(self, url: str = DEFAULT_BRIDGE_URL):
+
+def _new_session_id() -> str:
+    return "cli-" + uuid.uuid4().hex[:8]
+
+
+def _validate_session_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not _SESSION_ID_PATTERN.fullmatch(text):
+        raise ValueError("--session-id must be 1-64 characters from A-Z a-z 0-9 . _ -")
+    return text
+
+
+def resolve_max_parallel_subagents(value: Optional[Any] = None) -> int:
+    """Explicit value, then ZS_MAX_PARALLEL_SUBAGENTS, then 4. 0 means unlimited."""
+    for candidate in (value, os.environ.get("ZS_MAX_PARALLEL_SUBAGENTS")):
+        if candidate is None or str(candidate).strip() == "":
+            continue
+        try:
+            number = int(str(candidate).strip())
+        except ValueError:
+            continue
+        if number >= 0:
+            return number
+    return DEFAULT_MAX_PARALLEL_SUBAGENTS
+
+
+def _workspace_key(path: Any) -> Optional[str]:
+    text = str(path or "").strip()
+    return os.path.normcase(os.path.abspath(text)) if text else None
+
+
+def _control_runs(control: Any) -> List[Dict[str, Any]]:
+    """Run records from a protocol-2 control snapshot (empty for anything else)."""
+    runs = control.get("runs") if isinstance(control, dict) else None
+    return [run for run in runs if isinstance(run, dict)] if isinstance(runs, list) else []
+
+
+def _control_sessions(control: Any) -> List[Dict[str, Any]]:
+    sessions = control.get("sessions") if isinstance(control, dict) else None
+    return [item for item in sessions if isinstance(item, dict)] if isinstance(sessions, list) else []
+
+
+def _find_run(control: Any, run_id: Any) -> Optional[Dict[str, Any]]:
+    if not run_id:
+        return None
+    for run in _control_runs(control):
+        if run.get("run_id") == run_id:
+            return run
+    return None
+
+
+def _my_active_runs(control: Any, session_id: str) -> List[Dict[str, Any]]:
+    return [
+        run for run in _control_runs(control)
+        if run.get("target_session") == session_id and run.get("state") in CONTROL_ACTIVE
+    ]
+
+
+def _claimable_runs(control: Any, session_id: str, workspace_root: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Queued runs this session may claim: targeted at it first, then unassigned ones on its workspace."""
+    if workspace_root is None:
+        mine = next((s for s in _control_sessions(control) if s.get("session_id") == session_id), None)
+        workspace_root = mine.get("workspace") if mine else None
+    wanted = _workspace_key(workspace_root)
+    targeted: List[Dict[str, Any]] = []
+    unassigned: List[Dict[str, Any]] = []
+    for run in _control_runs(control):
+        if run.get("state") != "queued":
+            continue
+        target = run.get("target_session")
+        if target == session_id:
+            targeted.append(run)
+        elif not target and (wanted is None or _workspace_key(run.get("workspace")) == wanted):
+            unassigned.append(run)
+    return targeted + unassigned
+
+
+def _armed_cli_sessions(control: Any) -> List[Dict[str, Any]]:
+    return [s for s in _control_sessions(control) if s.get("role") == "cli" and s.get("armed")]
+
+
+def _response_run(response: Any, run_id: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Pull one run record out of a control reply (new 'run' field, a runs list, or a legacy flat record)."""
+    if not isinstance(response, dict):
+        return {}
+    run = response.get("run")
+    if isinstance(run, dict) and run.get("run_id"):
+        return run
+    control = response.get("control")
+    found = _find_run(control, run_id)
+    if found is None and not run_id and session_id:
+        mine = _my_active_runs(control, session_id)
+        found = mine[-1] if mine else None
+    if found is not None:
+        return found
+    if isinstance(control, dict) and control.get("run_id") and (not run_id or control.get("run_id") == run_id):
+        return control
+    return {}
+
+
+class BridgeClient:
+    """Multiplexed WebSocket client for the ZeroScript bridge (protocol version 2).
+
+    Every request gets its own id and future, so tool calls from the main agent
+    and from parallel subagents can be in flight on one socket.
+    """
+
+    def __init__(self, url: str = DEFAULT_BRIDGE_URL, session_id: Optional[str] = None):
         self.url = url
+        self.session_id = str(session_id).strip() if session_id else _new_session_id()
+        self.server_protocol_version: Optional[int] = None
+        self.fatal_error: Optional[Exception] = None
+        self._registration: Optional[asyncio.Future] = None
         self.ws = None
         self.reader_task = None
         self.pending: Dict[int, asyncio.Future] = {}
@@ -89,9 +208,32 @@ class BridgeClient:
         self._connect_lock = asyncio.Lock()
         self._closing = False
 
+    def _handle_registration(self, reply: Dict[str, Any]) -> None:
+        if reply.get("ok") is True:
+            confirmed = str(reply.get("session_id") or "").strip()
+            if confirmed:
+                self.session_id = confirmed
+            self.server_protocol_version = reply.get("protocol_version")
+            return
+        if reply.get("ok") is False:
+            if reply.get("error") == "protocol_mismatch":
+                raise ProtocolMismatchError(str(
+                    reply.get("message")
+                    or ("Bridge protocol mismatch: this CLI speaks protocol " + str(PROTOCOL_VERSION)
+                        + " but the bridge expects " + str(reply.get("expected")) + ".")
+                ))
+            raise RuntimeError("Bridge refused CLI registration: " + str(reply.get("error") or "unknown error"))
+        # No 'ok' field: a pre-protocol-2 bridge that ignores protocol_version.
+        raise ProtocolMismatchError(
+            "The bridge does not support protocol version " + str(PROTOCOL_VERSION)
+            + ". Update and restart the ZeroScript bridge (start.bat) to match this CLI."
+        )
+
     async def connect(self) -> None:
         """Open or restore the bridge connection and register this process as the CLI."""
         async with self._connect_lock:
+            if self.fatal_error is not None:
+                raise self.fatal_error
             if self.ws is not None and self.connected.is_set():
                 return
 
@@ -116,11 +258,22 @@ class BridgeClient:
             )
             self.ws = ws
             self._closing = False
+            registration = asyncio.get_running_loop().create_future()
+            self._registration = registration
             self.reader_task = asyncio.create_task(self._reader(ws))
             try:
                 await asyncio.wait_for(self.connected.wait(), timeout=15)
-                await ws.send(json.dumps({"type": "register_client", "client": "cli"}))
-            except BaseException:
+                await ws.send(json.dumps({
+                    "type": "register_client",
+                    "client": "cli",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "session_id": self.session_id,
+                }))
+                self._handle_registration(await asyncio.wait_for(registration, timeout=15))
+            except BaseException as exc:
+                if isinstance(exc, ProtocolMismatchError):
+                    # Remember the refusal so request() never enters a reconnect loop.
+                    self.fatal_error = exc
                 self.connected.clear()
                 if self.ws is ws:
                     self.ws = None
@@ -162,34 +315,54 @@ class BridgeClient:
         self.pending.clear()
 
     async def _reader(self, ws: Any) -> None:
+        failure: Exception = RuntimeError("Bridge connection closed.")
         try:
             async for raw in ws:
                 try:
                     message = json.loads(raw)
                 except (TypeError, ValueError):
                     continue
-                if message.get("type") == "connected":
+                if not isinstance(message, dict):
+                    continue
+                mtype = message.get("type")
+                if mtype == "connected":
                     self.initial_status = message
                     self.latest_control = message.get("agent_control") or {}
                     self.connected.set()
-                elif message.get("type") == "agent_control":
+                elif mtype == "client_registered":
+                    waiter = self._registration
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(message)
+                elif mtype == "agent_control":
                     self.latest_control = message.get("control") or {}
                 request_id = message.get("id")
                 if request_id is not None:
-                    future = self.pending.get(int(request_id))
+                    try:
+                        key = int(request_id)
+                    except (TypeError, ValueError):
+                        continue  # a non-numeric id must never kill the reader
+                    future = self.pending.get(key)
                     if future is not None and not future.done():
                         future.set_result(message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            for future in list(self.pending.values()):
-                if not future.done():
-                    future.set_exception(RuntimeError("Bridge reader failed: " + str(exc)))
-            self.pending.clear()
+            failure = RuntimeError("Bridge reader failed: " + str(exc))
         finally:
+            current = self.ws is ws or self.ws is None
             if self.ws is ws:
                 self.ws = None
                 self.connected.clear()
+            if current:
+                # The socket is gone: fail every waiter now instead of letting
+                # each one sit until its own timeout.
+                waiters = list(self.pending.values())
+                if self._registration is not None:
+                    waiters.append(self._registration)
+                for future in waiters:
+                    if not future.done():
+                        future.set_exception(failure)
+                self.pending.clear()
 
     async def request(self, message_type: str, response_timeout: float = 30.0, **payload: Any) -> Dict[str, Any]:
         if self.ws is None or not self.connected.is_set():
@@ -206,8 +379,10 @@ class BridgeClient:
         self.next_id += 1
         future = asyncio.get_running_loop().create_future()
         self.pending[request_id] = future
-        outgoing = {"type": message_type, "id": request_id}
+        outgoing = {"type": message_type, "id": request_id, "session_id": self.session_id}
         outgoing.update(payload)
+        if outgoing.get("session_id") is None:
+            outgoing.pop("session_id", None)  # explicit None = unscoped request
         try:
             try:
                 async with self._send_lock:
@@ -243,16 +418,25 @@ class BridgeClient:
             raise RuntimeError("Bridge returned no tool catalogue.")
         return [tool for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
 
-    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def call_tool(self, name: str, arguments: Dict[str, Any],
+                        session_id: Optional[str] = None,
+                        workspace_root: Optional[str] = None) -> Dict[str, Any]:
+        """Run one bridge tool. ``session_id`` overrides this client's session (used for subagents)."""
         timeout = 310.0
         if name == "workspace_run_task" and isinstance(arguments.get("timeout"), int):
             timeout = min(max(arguments["timeout"] + 15, 30), 315)
+        scope: Dict[str, Any] = {}
+        if session_id:
+            scope["session_id"] = str(session_id)
+        if workspace_root:
+            scope["workspace_root"] = str(workspace_root)
         response = await self.request(
             "call_tool",
             response_timeout=timeout + 15,
             name=name,
             arguments=arguments,
             timeout=int(timeout * 1000),
+            **scope,
         )
         if response.get("type") != "tool_result":
             raise RuntimeError("Unexpected bridge reply for tool " + name + ".")
@@ -426,10 +610,11 @@ class OpenAICompatibleProvider:
             return self.base_url
         return self.base_url + "/chat/completions"
 
-    def _post(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _post(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]],
+              model: Optional[str] = None) -> Dict[str, Any]:
         self.validate()
         body: Dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": messages,
             "temperature": 0.2,
         }
@@ -466,10 +651,10 @@ class OpenAICompatibleProvider:
         return result
 
     def _post_stream(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]],
-                     emit_text: Callable[[str], None]) -> Dict[str, Any]:
+                     emit_text: Callable[[str], None], model: Optional[str] = None) -> Dict[str, Any]:
         self.validate()
         body: Dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": messages,
             "temperature": 0.2,
             "stream": True,
@@ -514,16 +699,18 @@ class OpenAICompatibleProvider:
             ):
                 # Some OpenAI-compatible local servers accept Chat Completions but
                 # do not implement server-sent events. Retry only this explicit case.
-                return self._post(messages, tools)
+                return self._post(messages, tools, model)
             raise RuntimeError("Model API returned HTTP " + str(exc.code) + ": " + _clip(detail, 6000)) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError("Could not reach model API: " + str(exc.reason)) from exc
 
     async def complete(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]],
-                       on_text: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+                       on_text: Optional[Callable[[str], None]] = None,
+                       model: Optional[str] = None) -> Dict[str, Any]:
+        """Run one chat completion. ``model`` overrides ``self.model`` for this call only."""
         prepared = fit_messages_to_context(messages, tools, self.context_tokens)
         if on_text is None:
-            return await asyncio.to_thread(self._post, prepared, tools)
+            return await asyncio.to_thread(self._post, prepared, tools, model)
 
         loop = asyncio.get_running_loop()
         events: asyncio.Queue = asyncio.Queue()
@@ -534,7 +721,7 @@ class OpenAICompatibleProvider:
 
         def worker() -> Optional[Dict[str, Any]]:
             try:
-                return self._post_stream(prepared, tools, emit_text)
+                return self._post_stream(prepared, tools, emit_text, model)
             except Exception as exc:
                 loop.call_soon_threadsafe(events.put_nowait, ("error", exc))
                 return None
@@ -919,6 +1106,32 @@ Use concise progress updates in the terminal. Respect stop requests at checkpoin
 """
 
 
+@dataclass
+class _ToolContext:
+    """Per-call tool state. Subagents get their own, so nothing on the shared agent or provider is mutated."""
+    aliases: Dict[str, Dict[str, Any]]
+    tool_defs: List[Dict[str, Any]]
+    model: Optional[str] = None        # None = provider default model
+    session_id: Optional[str] = None   # None = bridge default session
+    last_tool_images: List[Dict[str, str]] = field(default_factory=list)
+    label: str = ""                    # "[label]" prefix for compact output, e.g. "explorer#2"
+    quiet: bool = False                # compact prefixed lines instead of panels/spinners
+    batch: bool = False                # this zeroscript_run_subagent call is part of a concurrent batch
+    sub_number: Optional[int] = None   # pre-allocated subagent number (batch calls)
+
+
+def _one_line(text: str, limit: int) -> str:
+    return _clip(" ".join(str(text).split()), limit)
+
+
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
 class IndependentAgent:
     def __init__(self, bridge: BridgeClient, provider: OpenAICompatibleProvider,
                  run_record: Dict[str, Any], max_turns: int = MAX_TURNS,
@@ -927,7 +1140,9 @@ class IndependentAgent:
         self.provider = provider
         self.run_record = run_record
         self.run_id = str(run_record["run_id"])
-        self.session_id = str(run_record["session_id"])
+        self.session_id = str(
+            getattr(bridge, "session_id", "") or run_record.get("target_session") or run_record.get("session_id") or ""
+        )
         self.all_tools = bool(all_tools)
         self.max_turns = max(1, min(int(max_turns), 100))
         self.progress = "Starting model runtime"
@@ -937,7 +1152,9 @@ class IndependentAgent:
         self.stop_event = asyncio.Event()
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.stop_notice_shown = False
-        self._last_tool_images: List[Dict[str, str]] = []
+        self._last_tool_images: List[Dict[str, str]] = []  # main-agent compat; subagents use their own _ToolContext
+        self.max_parallel_subagents: Optional[int] = None  # None -> ZS_MAX_PARALLEL_SUBAGENTS env -> 4; 0 = unlimited
+        self._subagent_counter = 0
         self._last_response_streamed = False
         self.recorder = AgentFlightRecorder(_session_dir() / (self.run_id + ".events.jsonl"))
         project_root = str(run_record.get("workspace") or "").strip()
@@ -1052,7 +1269,7 @@ class IndependentAgent:
                 status = await self.bridge.control(
                     "heartbeat", run_id=self.run_id, session_id=self.session_id, progress=self.progress
                 )
-                self.run_record = status.get("control") or self.run_record
+                self.run_record = _response_run(status, self.run_id, self.session_id) or self.run_record
                 if self.run_record.get("state") == "stop_requested":
                     # Keep renewing the lease while an already-running tool call
                     # finishes. The run loop observes stop_requested at its next
@@ -1071,11 +1288,11 @@ class IndependentAgent:
             return True
         try:
             response = await self.bridge.control("control_status", timeout=12)
-            state = response.get("control") or {}
-            if state.get("run_id") == self.run_id and state.get("state") == "stop_requested":
+            run = _find_run(response.get("control"), self.run_id)
+            if run and (run.get("state") == "stop_requested" or run.get("stop_requested")):
                 self.stop_event.set()
                 return True
-            return state.get("run_id") != self.run_id or state.get("owner") != "cli"
+            return not (run and run.get("target_session") == self.session_id and run.get("state") in CONTROL_ACTIVE)
         except Exception as exc:
             UI.warning("Could not verify run ownership: " + str(exc))
             self.stop_event.set()
@@ -1104,8 +1321,40 @@ class IndependentAgent:
             raise RuntimeError("The model response did not contain an assistant message.")
         return message
 
-    async def _execute_tool(self, alias: str, raw_arguments: Any) -> str:
-        tool = self.aliases.get(alias) or {}
+    def _root_context(self) -> _ToolContext:
+        return _ToolContext(aliases=self.aliases, tool_defs=self.tool_defs)
+
+    def _next_subagent_number(self) -> int:
+        self._subagent_counter += 1
+        return self._subagent_counter
+
+    def _parallel_subagent_limit(self) -> int:
+        """Max concurrent subagents: attribute (--max-parallel-subagents), else env ZS_MAX_PARALLEL_SUBAGENTS, else 4. 0 = unlimited."""
+        return resolve_max_parallel_subagents(getattr(self, "max_parallel_subagents", None))
+
+    async def _bridge_call_tool(self, name: str, arguments: Dict[str, Any], ctx: _ToolContext) -> Dict[str, Any]:
+        call = self.bridge.call_tool
+        if ctx.session_id and _accepts_kwarg(call, "session_id"):
+            return await call(name, arguments, session_id=ctx.session_id)
+        return await call(name, arguments)
+
+    @staticmethod
+    def _ui_tool_start(ctx: _ToolContext, name: str, arguments: Dict[str, Any]) -> None:
+        if ctx.quiet:
+            UI.info("[" + ctx.label + "] ↳ " + name + " " + _one_line(json.dumps(arguments, ensure_ascii=False, default=str), 160))
+        else:
+            UI.tool_start(name, _clip(json.dumps(arguments, ensure_ascii=False, indent=2), 1800))
+
+    @staticmethod
+    def _ui_tool_result(ctx: _ToolContext, content: str, ok: bool, limit: int) -> None:
+        if ctx.quiet:
+            UI.info("[" + ctx.label + "] " + ("✓ " if ok else "✗ ") + _one_line(content, 200))
+        else:
+            UI.tool_result(_clip(content, limit), ok=ok)
+
+    async def _execute_tool(self, alias: str, raw_arguments: Any, ctx: Optional[_ToolContext] = None) -> str:
+        ctx = ctx or self._root_context()
+        tool = ctx.aliases.get(alias) or {}
         tool_name = str(tool.get("name") or alias)
         try:
             hook_arguments = json.loads(raw_arguments or "{}") if isinstance(raw_arguments, str) else raw_arguments
@@ -1122,7 +1371,7 @@ class IndependentAgent:
         }
         pre_context = await self._run_hooks("PreToolUse", dict(payload))
         try:
-            result = await self._execute_tool_impl(alias, raw_arguments)
+            result = await self._execute_tool_impl(alias, raw_arguments, ctx)
         except Exception as exc:
             result = "ERROR: Tool execution raised an exception: " + str(exc)
         post_context = await self._run_hooks("PostToolUse", {
@@ -1136,9 +1385,10 @@ class IndependentAgent:
             notes.append("PostToolUse hook output (untrusted):\n" + post_context)
         return result + ("\n\n" + "\n\n".join(notes) if notes else "")
 
-    async def _execute_tool_impl(self, alias: str, raw_arguments: Any) -> str:
-        self._last_tool_images = []
-        tool = self.aliases.get(alias)
+    async def _execute_tool_impl(self, alias: str, raw_arguments: Any, ctx: Optional[_ToolContext] = None) -> str:
+        ctx = ctx or self._root_context()
+        ctx.last_tool_images = []
+        tool = ctx.aliases.get(alias)
         if not tool:
             return "ERROR: The model requested an unknown tool alias. Re-read the available tools and try again."
         name = str(tool.get("name") or "")
@@ -1156,7 +1406,7 @@ class IndependentAgent:
         self.recorder.record("tool.request", tool=name, argument_keys=sorted(str(k) for k in arguments))
         if await self._check_stop():
             return "ERROR: Stop requested or control was released before this tool could run. Do not execute it."
-        UI.tool_start(name, _clip(json.dumps(arguments, ensure_ascii=False, indent=2), 1800))
+        self._ui_tool_start(ctx, name, arguments)
         if name == "zeroscript_load_skill":
             try:
                 skill_name = str(arguments.get("name") or "")
@@ -1165,33 +1415,34 @@ class IndependentAgent:
             except (ValueError, OSError) as exc:
                 output = "Skill load failed: " + str(exc)
                 self.recorder.record("skill.load_failed", skill=arguments.get("name"), error=str(exc))
-                UI.tool_result(_clip(output, 1800), ok=False)
+                self._ui_tool_result(ctx, output, False, 1800)
                 return _clip(output)
             self.recorder.record("skill.loaded", skill=skill_name, argument_chars=len(skill_arguments))
-            UI.tool_result(_clip(output, 4000), ok=True)
+            self._ui_tool_result(ctx, output, True, 4000)
             return _clip(output)
         if name == "zeroscript_run_subagent":
             try:
                 agent_name = str(arguments.get("name") or "")
                 task = str(arguments.get("task") or "")
-                output = await self._run_subagent(agent_name, task)
+                output = await self._run_subagent(agent_name, task, concurrent=ctx.batch, number=ctx.sub_number)
             except Exception as exc:
                 output = "Subagent failed: " + str(exc)
                 self.recorder.record("subagent.failed", agent=arguments.get("name"), error=str(exc))
-                UI.tool_result(_clip(output, 1800), ok=False)
+                self._ui_tool_result(ctx, output, False, 1800)
                 return _clip(output)
             self.recorder.record("subagent.completed", agent=agent_name, output_chars=len(output))
-            UI.tool_result(_clip(output, 4000), ok=True)
+            self._ui_tool_result(ctx, output, True, 4000)
             return _clip(output)
         try:
-            with UI.status("[bold bright_cyan]Running tool[/bold bright_cyan] · " + name):
-                response = await self.bridge.call_tool(name, arguments)
+            # Rich allows one live spinner; quiet (concurrent subagent) calls print prefixed lines instead.
+            with (nullcontext() if ctx.quiet else UI.status("[bold bright_cyan]Running tool[/bold bright_cyan] · " + name)):
+                response = await self._bridge_call_tool(name, arguments, ctx)
         except Exception as exc:
             self.recorder.record("tool.error", tool=name, error=str(exc))
             return "ERROR: Bridge call failed for " + name + ": " + str(exc)
         if not response.get("ok"):
             output = "ERROR (" + str(response.get("kind") or "tool") + "): " + str(response.get("error") or "Tool call failed.")
-            UI.tool_result(_clip(output, 1800), ok=False)
+            self._ui_tool_result(ctx, output, False, 1800)
             return _clip(output)
         self.recorder.record("tool.result", tool=name, ok=True, output_chars=len(str(response.get("text") or "")), image_count=len(response.get("images") or []))
         output = str(response.get("text") or "(tool returned no text)")
@@ -1206,15 +1457,21 @@ class IndependentAgent:
                     continue
                 if mime not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
                     continue
-                self._last_tool_images.append({"data": data, "mimeType": mime})
-            output += "\n[Vision attachments prepared: " + str(len(self._last_tool_images)) + ".]"
+                ctx.last_tool_images.append({"data": data, "mimeType": mime})
+            output += "\n[Vision attachments prepared: " + str(len(ctx.last_tool_images)) + ".]"
         elif images:
             output += "\n[Image payloads were returned but this model profile is not configured for vision. Select a vision-capable profile to inspect them.]"
-        UI.tool_result(_clip(output, 1800), ok=True)
+        self._ui_tool_result(ctx, output, True, 1800)
         return _clip(output)
 
-    async def _run_subagent(self, name: str, task: str) -> str:
-        """Run one isolated conversation using a local agent profile and bounded turns."""
+    async def _run_subagent(self, name: str, task: str, concurrent: bool = False,
+                            number: Optional[int] = None) -> str:
+        """Run one isolated conversation using a local agent profile and bounded turns.
+
+        All per-subagent state (aliases, tools, model, images, bridge session) lives in a
+        private _ToolContext, so several subagents can run at once on the same agent.
+        ``concurrent`` selects compact "[name#n]" output instead of panels and spinners.
+        """
         profile = self.skill_catalog.find_agent(name)
         if profile is None or profile.disable_model_invocation:
             raise ValueError("Agent profile is missing or disabled for model invocation: " + str(name))
@@ -1272,16 +1529,27 @@ class IndependentAgent:
             {"role": "user", "content": "DELEGATED TASK\n" + task},
         ]
 
-        original_aliases, original_tools, original_model = self.aliases, self.tool_defs, self.provider.model
-        if profile.model and profile.model.casefold() not in {"inherit", "default"}:
-            self.provider.model = profile.model
-        self.aliases, self.tool_defs = child_aliases, child_tools
-        UI.info("Subagent " + profile.name + " started (max " + str(profile.max_turns) + " turns).")
+        child_model = profile.model if profile.model and profile.model.casefold() not in {"inherit", "default"} else None
+        number = number or self._next_subagent_number()
+        base_session = str(getattr(self.bridge, "session_id", "") or self.session_id)
+        child_ctx = _ToolContext(
+            aliases=child_aliases,
+            tool_defs=child_tools,
+            model=child_model,
+            session_id=base_session + ":sub-" + str(number),
+            label=profile.name + "#" + str(number),
+            quiet=bool(concurrent),
+        )
+        UI.info(
+            ("[" + child_ctx.label + "] started (max " + str(profile.max_turns) + " turns).") if child_ctx.quiet
+            else ("Subagent " + profile.name + " started (max " + str(profile.max_turns) + " turns).")
+        )
         try:
             for turn in range(max(1, min(int(profile.max_turns), 20))):
                 if await self._check_stop():
                     return "Subagent stopped because the parent run was stopped."
-                response = await self.provider.complete(child_messages, child_tools)
+                response = await self.provider.complete(
+                    child_messages, child_tools, **({"model": child_ctx.model} if child_ctx.model else {}))
                 choices = response.get("choices") or []
                 message = choices[0].get("message") if choices else None
                 if not isinstance(message, dict):
@@ -1301,23 +1569,123 @@ class IndependentAgent:
                     if index > 20:
                         result_text = "Subagent tool-call batch exceeded the 20-call limit; this tool was not executed."
                     else:
-                        result_text = await self._execute_tool(alias, function.get("arguments", "{}"))
+                        result_text = await self._execute_tool(alias, function.get("arguments", "{}"), child_ctx)
                     child_messages.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
-                    if index <= 20 and self._last_tool_images and self.provider.supports_vision:
+                    if index <= 20 and child_ctx.last_tool_images and self.provider.supports_vision:
                         image_content: List[Dict[str, Any]] = [
                             {"type": "text", "text": "Inspect the image attachment(s) returned by the delegated tool. Use only visible evidence."}
                         ]
-                        for image_item in self._last_tool_images[:4]:
+                        for image_item in child_ctx.last_tool_images[:4]:
                             image_content.append({
                                 "type": "image_url",
                                 "image_url": {"url": "data:" + image_item["mimeType"] + ";base64," + image_item["data"]},
                             })
                         child_messages.append({"role": "user", "content": image_content})
-                        self._last_tool_images = []
+                        child_ctx.last_tool_images = []
             return "Subagent '" + profile.name + "' reached its configured turn limit without a final answer."
         finally:
-            self.aliases, self.tool_defs, self.provider.model = original_aliases, original_tools, original_model
-            self._last_tool_images = []
+            child_ctx.last_tool_images = []
+
+    @staticmethod
+    def _subagent_label_name(raw_arguments: Any) -> str:
+        try:
+            data = json.loads(raw_arguments or "{}") if isinstance(raw_arguments, str) else raw_arguments
+        except (TypeError, ValueError):
+            data = {}
+        return str(data.get("name") or "subagent") if isinstance(data, dict) else "subagent"
+
+    def _append_tool_result(self, call_id: str, tool_name: str, result_text: str,
+                            images: List[Dict[str, str]], session: Dict[str, Any]) -> None:
+        self.messages.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
+        if images:
+            image_content: List[Dict[str, Any]] = [
+                {"type": "text", "text": "Inspect the image attachment(s) returned by tool " + tool_name + ". Use only visible evidence; state uncertainty where details are unclear."}
+            ]
+            for image_item in images:
+                image_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": "data:" + image_item["mimeType"] + ";base64," + image_item["data"]},
+                })
+            self.messages.append({"role": "user", "content": image_content})
+        session["messages"] = self.messages
+        session["updated_at"] = time.time()
+        _write_session(self.run_id, session)
+
+    async def _run_tool_calls(self, turn: int, tool_calls: List[Dict[str, Any]], session: Dict[str, Any]) -> bool:
+        """Execute one assistant turn's tool calls. Returns False if a stop request interrupted them.
+
+        Scheduling policy: normally every call runs sequentially in order. When the turn holds
+        two or more zeroscript_run_subagent calls, the non-subagent calls still run first, one by
+        one in their original order, and then ALL subagent calls run concurrently (bounded by a
+        semaphore, see _parallel_subagent_limit). Running them after the sequential calls keeps
+        main-agent tool side effects deterministic, never overlaps them with subagent writes, and
+        leaves exactly one live spinner at any moment. Tool results are always appended to the
+        conversation in the model's ORIGINAL call order, whichever call finished first.
+        A lone subagent call keeps running in place, exactly as before.
+        """
+        entries: List[Tuple[int, str, str, Any, str]] = []
+        for index, call in enumerate(tool_calls, start=1):
+            function = call.get("function") or {}
+            alias = str(function.get("name") or "")
+            call_id = str(call.get("id") or ("zs-tool-" + str(turn) + "-" + str(index)))
+            tool_name = str((self.aliases.get(alias) or {}).get("name") or alias)
+            entries.append((index, alias, call_id, function.get("arguments", "{}"), tool_name))
+        subagent_entries = [e for e in entries if e[4] == "zeroscript_run_subagent"]
+        deferred = {e[0] for e in subagent_entries} if len(subagent_entries) > 1 else set()
+        results: Dict[int, Tuple[str, List[Dict[str, str]]]] = {}
+        stopped = False
+
+        for index, alias, call_id, raw_arguments, tool_name in entries:
+            if index in deferred:
+                continue
+            if await self._check_stop():
+                stopped = True
+                break
+            self.progress = "Executing " + tool_name
+            ctx = self._root_context()
+            result_text = await self._execute_tool(alias, raw_arguments, ctx)
+            self._last_tool_images = ctx.last_tool_images
+            if deferred:
+                results[index] = (result_text, ctx.last_tool_images)
+            else:
+                self._append_tool_result(call_id, tool_name, result_text, ctx.last_tool_images, session)
+
+        if deferred and not stopped:
+            if await self._check_stop():
+                stopped = True
+            else:
+                limit = self._parallel_subagent_limit()
+                semaphore = asyncio.Semaphore(limit) if limit > 0 else None
+                batch = [e for e in entries if e[0] in deferred]
+                contexts: Dict[int, _ToolContext] = {}
+                for index, alias, call_id, raw_arguments, tool_name in batch:  # numbers follow call order
+                    number = self._next_subagent_number()
+                    ctx = self._root_context()
+                    ctx.batch, ctx.quiet, ctx.sub_number = True, True, number
+                    ctx.label = self._subagent_label_name(raw_arguments) + "#" + str(number)
+                    contexts[index] = ctx
+
+                async def run_one(entry: Tuple[int, str, str, Any, str]) -> str:
+                    index, alias, _call_id, raw_arguments, _tool_name = entry
+                    if semaphore is None:
+                        return await self._execute_tool(alias, raw_arguments, contexts[index])
+                    async with semaphore:
+                        return await self._execute_tool(alias, raw_arguments, contexts[index])
+
+                self.progress = "Running " + str(len(batch)) + " subagents concurrently"
+                UI.info(self.progress + (" (limit " + str(limit) + ")" if limit else " (no limit)"))
+                with UI.status("[bold bright_cyan]Running subagents[/bold bright_cyan] · " + str(len(batch)) + " in parallel"):
+                    outcomes = await asyncio.gather(*(run_one(e) for e in batch), return_exceptions=True)
+                for entry, outcome in zip(batch, outcomes):
+                    if isinstance(outcome, BaseException):
+                        outcome = "ERROR: Subagent call raised an exception: " + str(outcome)
+                    results[entry[0]] = (str(outcome), [])
+
+        for index, _alias, call_id, _raw, tool_name in entries:  # original call order
+            if index in results:
+                result_text, images = results[index]
+                self._append_tool_result(call_id, tool_name, result_text, images, session)
+        return not stopped
 
     async def run(self, resume_messages: Optional[List[Dict[str, Any]]] = None) -> str:
         self.messages = list(resume_messages) if resume_messages else self._build_messages()
@@ -1421,37 +1789,10 @@ class IndependentAgent:
                         UI.markdown(final_text)
                     break
 
-                for index, call in enumerate(tool_calls, start=1):
-                    if await self._check_stop():
-                        status = "cancelled"
-                        final_text = "Run stopped at a tool boundary."
-                        break
-                    function = call.get("function") or {}
-                    alias = str(function.get("name") or "")
-                    call_id = str(call.get("id") or ("zs-tool-" + str(turn) + "-" + str(index)))
-                    self.progress = "Executing " + str((self.aliases.get(alias) or {}).get("name") or alias)
-                    result_text = await self._execute_tool(alias, function.get("arguments", "{}"))
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": result_text,
-                    })
-                    if self._last_tool_images:
-                        image_content: List[Dict[str, Any]] = [
-                            {"type": "text", "text": "Inspect the image attachment(s) returned by tool " + str((self.aliases.get(alias) or {}).get("name") or alias) + ". Use only visible evidence; state uncertainty where details are unclear."}
-                        ]
-                        for image_item in self._last_tool_images:
-                            image_content.append({
-                                "type": "image_url",
-                                "image_url": {"url": "data:" + image_item["mimeType"] + ";base64," + image_item["data"]},
-                            })
-                        self.messages.append({"role": "user", "content": image_content})
-                    session["messages"] = self.messages
-                    session["updated_at"] = time.time()
-                    _write_session(self.run_id, session)
-                else:
-                    continue
-                break
+                if not await self._run_tool_calls(turn, tool_calls, session):
+                    status = "cancelled"
+                    final_text = "Run stopped at a tool boundary."
+                    break
             else:
                 status = "blocked"
                 final_text = "Stopped after reaching the bounded limit of " + str(self.max_turns) + " model turns."
@@ -1501,8 +1842,8 @@ class IndependentAgent:
                 UI.warning("Could not save the CLI transcript: " + str(exc))
         try:
             current = await self.bridge.control("control_status", timeout=12)
-            control = current.get("control") or {}
-            if control.get("run_id") == self.run_id and control.get("owner") == "cli":
+            run = _find_run(current.get("control"), self.run_id)
+            if run and run.get("target_session") == self.session_id and run.get("state") in CONTROL_ACTIVE:
                 await self.bridge.control(
                     "complete",
                     run_id=self.run_id,
@@ -1515,25 +1856,73 @@ class IndependentAgent:
         return final_text
 
 
-def _print_control(control: Dict[str, Any]) -> None:
-    state = str(control.get("state") or "idle")
+def _print_run(run: Dict[str, Any]) -> None:
+    """Show one protocol-2 run record."""
+    state = str(run.get("state") or "idle")
     rows = [
-        ("Run", str(control.get("run_id") or "(none)")),
+        ("Run", str(run.get("run_id") or "(none)")),
         ("State", state),
-        ("Owner", str(control.get("owner") or "none")),
-        ("Workspace", str(control.get("workspace") or "(not selected)")),
+        ("Origin", str(run.get("origin_role") or "?") + " " + str(run.get("origin_session") or "")),
+        ("Target session", str(run.get("target_session") or "(unassigned)")),
+        ("Workspace", str(run.get("workspace") or "(not selected)")),
     ]
-    if control.get("goal"):
-        rows.append(("Goal", _clip(str(control.get("goal")), 600).replace("\n", " ")))
-    if control.get("progress"):
-        rows.append(("Progress", str(control.get("progress"))))
-    UI.table("Agent control", ("Field", "Value"), rows)
-    if control.get("summary"):
-        UI.panel("Last result", _clip(str(control.get("summary")), 1800))
+    if run.get("goal"):
+        rows.append(("Goal", _clip(str(run.get("goal")), 600).replace("\n", " ")))
+    if run.get("progress"):
+        rows.append(("Progress", str(run.get("progress"))))
+    UI.table("Agent run", ("Field", "Value"), rows)
+    if run.get("summary"):
+        UI.panel("Last result", _clip(str(run.get("summary")), 1800))
     if state == "queued":
-        UI.info("Run /takeover in the CLI to claim the queued handoff.")
-    elif state == "interrupted":
-        UI.info("Recover with /resume " + str(control.get("run_id")) + ".")
+        UI.info("Run /takeover in a CLI session to claim the queued handoff.")
+    elif state == "stale":
+        UI.info("Heartbeat expired. Try /resume " + str(run.get("run_id")) + " if the bridge still allows it.")
+
+
+def _print_control(control: Dict[str, Any], session_id: str = "") -> None:
+    """Overview of a protocol-2 control snapshot: armed CLI sessions and runs."""
+    armed = _armed_cli_sessions(control)
+    if armed:
+        UI.table("Armed CLI sessions", ("Session", "Workspace"), [
+            (str(s.get("session_id")) + (" (this CLI)" if s.get("session_id") == session_id else ""),
+             str(s.get("workspace") or "(not selected)"))
+            for s in armed
+        ])
+    runs = _control_runs(control)
+    live = [r for r in runs if r.get("state") in {"queued", "active", "stop_requested"}]
+    finished = [r for r in runs if r not in live][-3:]
+    shown = live + finished
+    if not shown:
+        UI.info("No agent runs recorded.")
+        return
+    UI.table("Agent runs", ("Run", "State", "Owner session", "Goal"), [
+        (str(r.get("run_id")) + (" *" if r.get("target_session") == session_id and session_id else ""),
+         str(r.get("state")), str(r.get("target_session") or "(unassigned)"),
+         _clip(str(r.get("goal") or ""), 70).replace("\n", " "))
+        for r in shown
+    ])
+    if any(r.get("state") == "queued" for r in live):
+        UI.info("A queued handoff is waiting. Run /takeover in a CLI session to claim it.")
+    if session_id:
+        UI.print("* = run owned by this CLI session", "muted" if UI.rich_enabled else None)
+
+
+async def _fetch_control(bridge: "BridgeClient") -> Dict[str, Any]:
+    """Unscoped control snapshot (all runs and sessions, not only this session's)."""
+    response = await bridge.control("control_status", timeout=12, session_id=None)
+    control = response.get("control")
+    return control if isinstance(control, dict) else {}
+
+
+def _bridge_workspace_root(bridge: "BridgeClient") -> str:
+    return str((bridge.initial_status.get("workspace") or {}).get("root") or "").strip()
+
+
+def _make_agent(bridge: "BridgeClient", provider: Any, run: Dict[str, Any], max_turns: int,
+                all_tools: bool = False) -> "IndependentAgent":
+    agent = IndependentAgent(bridge, provider, run, max_turns, all_tools=all_tools)
+    agent.max_parallel_subagents = _RUNTIME_SETTINGS.get("max_parallel_subagents")
+    return agent
 
 
 def _require_provider(provider: OpenAICompatibleProvider) -> None:
@@ -1550,9 +1939,13 @@ def _require_provider(provider: OpenAICompatibleProvider) -> None:
 
 
 async def _status_command(bridge: BridgeClient) -> int:
-    response = await bridge.control("control_status", timeout=12)
-    control = response.get("control") or {}
-    _print_control(control)
+    control = await _fetch_control(bridge)
+    UI.table("CLI session", ("Setting", "Value"), [
+        ("Session ID", bridge.session_id),
+        ("Protocol", str(bridge.server_protocol_version or PROTOCOL_VERSION)),
+        ("My active runs", ", ".join(str(r.get("run_id")) for r in _my_active_runs(control, bridge.session_id)) or "(none)"),
+    ])
+    _print_control(control, bridge.session_id)
     try:
         info = await bridge.call_tool("workspace_info", {})
         if info.get("ok"):
@@ -1748,26 +2141,32 @@ async def _takeover_command(bridge: BridgeClient, provider: OpenAICompatibleProv
             "Also, /takeover only waits for a handoff. In the browser chat, explicitly ask the browser agent to call "
             "zeroscript_handoff_to_cli, then leave this terminal waiting.\n\n" + str(exc)
         ) from exc
-    session_id = uuid.uuid4().hex
+    session_id = bridge.session_id
+    workspace_root = _bridge_workspace_root(bridge)
     # Arm only after provider validation. The bridge rejects browser handoffs
     # unless at least one validated CLI session is waiting to claim the task.
     try:
         # Include the arm request inside the cleanup scope: even if its reply is
         # lost after the bridge records it, the finally block will disarm it.
-        await bridge.control("arm", timeout=12, session_id=session_id)
-        UI.success("CLI takeover armed. Now ask the browser agent to call zeroscript_handoff_to_cli.")
+        await bridge.control("arm", timeout=12, session_id=session_id, workspace_root=workspace_root or None)
+        UI.success("CLI session " + session_id + " armed. Now ask the browser agent to call zeroscript_handoff_to_cli.")
         UI.print("Press Ctrl+C to stop waiting.", "muted" if UI.rich_enabled else None)
         while True:
-            response = await bridge.control("control_status", timeout=12)
-            control = response.get("control") or {}
-            if control.get("state") == "queued":
-                if run_id and control.get("run_id") != run_id:
-                    await asyncio.sleep(1.5)
-                    continue
+            control = await _fetch_control(bridge)
+            wanted = _find_run(control, run_id) if run_id else None
+            if run_id and wanted is None:
+                raise RuntimeError("Run " + run_id + " is not known to the bridge.")
+            if wanted is not None and wanted.get("state") == "stale":
+                return await _resume_command(bridge, provider, max_turns, run_id, all_tools=all_tools)
+            if wanted is not None and wanted.get("state") != "queued":
+                raise RuntimeError("Run " + run_id + " is " + str(wanted.get("state")) + ", not queued.")
+            candidates = [wanted] if wanted is not None else _claimable_runs(control, session_id, workspace_root or None)
+            if candidates:
+                chosen_id = str(candidates[0].get("run_id"))
                 try:
                     claim = await bridge.control(
                         "claim", timeout=15, session_id=session_id,
-                        run_id=control.get("run_id"),
+                        run_id=chosen_id,
                     )
                 except RuntimeError as exc:
                     # A browser tool call may still be finishing. Retrying the
@@ -1776,21 +2175,13 @@ async def _takeover_command(bridge: BridgeClient, provider: OpenAICompatibleProv
                         await asyncio.sleep(1.0)
                         continue
                     raise
-                claimed = claim.get("control") or {}
-                _print_control(claimed)
-                agent = IndependentAgent(
-                    bridge, provider, claimed, max_turns,
-                    all_tools=all_tools,
-                )
+                claimed = _response_run(claim, chosen_id)
+                if not claimed:
+                    raise RuntimeError("The bridge claimed run " + chosen_id + " but returned no run record.")
+                _print_run(claimed)
+                agent = _make_agent(bridge, provider, claimed, max_turns, all_tools=all_tools)
                 await agent.run()
                 return 0
-            if control.get("state") == "interrupted" and run_id == control.get("run_id"):
-                return await _resume_command(
-                    bridge, provider, max_turns, str(control.get("run_id")),
-                    all_tools=all_tools,
-                )
-            if run_id and control.get("run_id") and control.get("run_id") != run_id:
-                raise RuntimeError("Requested handoff run ID does not match the current control record.")
             await asyncio.sleep(1.5)
     except KeyboardInterrupt:
         UI.warning("Stopped waiting. No task was claimed.")
@@ -1811,11 +2202,14 @@ async def _resume_command(bridge: BridgeClient, provider: OpenAICompatibleProvid
     messages = session.get("messages")
     if not isinstance(messages, list) or not messages:
         raise RuntimeError("The saved run does not have a resumable conversation transcript.")
-    control_response = await bridge.control("control_status", timeout=12)
-    control = control_response.get("control") or {}
-    if control.get("run_id") != run_id or control.get("state") not in {"interrupted", "queued"}:
-        raise RuntimeError("Only the matching interrupted or queued run can be resumed.")
-    session_id = uuid.uuid4().hex
+    control = await _fetch_control(bridge)
+    known = _find_run(control, run_id)
+    if known is None or known.get("state") not in {"queued", "stale"}:
+        raise RuntimeError(
+            "Only a queued or stale run known to the bridge can be resumed; run " + run_id
+            + (" is " + str(known.get("state")) if known else " was not found") + "."
+        )
+    session_id = bridge.session_id
     while True:
         try:
             claim = await bridge.control("claim", timeout=15, session_id=session_id, run_id=run_id)
@@ -1825,14 +2219,13 @@ async def _resume_command(bridge: BridgeClient, provider: OpenAICompatibleProvid
                 raise
             UI.info("Waiting for the browser's in-flight tool call to finish before resuming…")
             await asyncio.sleep(1.0)
-    record = claim.get("control") or {}
+    record = _response_run(claim, run_id)
+    if not record:
+        raise RuntimeError("The bridge claimed run " + run_id + " but returned no run record.")
     session["session_id"] = session_id
     session["updated_at"] = time.time()
     _write_session(run_id, session)
-    agent = IndependentAgent(
-        bridge, provider, record, max_turns,
-        all_tools=all_tools,
-    )
+    agent = _make_agent(bridge, provider, record, max_turns, all_tools=all_tools)
     await agent.run(resume_messages=messages)
     return 0
 
@@ -1853,7 +2246,7 @@ async def _direct_run(bridge: BridgeClient, provider: OpenAICompatibleProvider, 
     if file_context.skipped:
         UI.warning("Some file references were left unattached because the file/count limit was reached: "
                    + ", ".join(file_context.skipped))
-    session_id = uuid.uuid4().hex
+    session_id = bridge.session_id
     response = await bridge.control(
         "start",
         timeout=15,
@@ -1863,12 +2256,11 @@ async def _direct_run(bridge: BridgeClient, provider: OpenAICompatibleProvider, 
         plan=[],
         acceptance_criteria=[],
     )
-    record = response.get("control") or {}
-    _print_control(record)
-    agent = IndependentAgent(
-        bridge, provider, record, max_turns,
-        all_tools=all_tools,
-    )
+    record = _response_run(response, session_id=session_id)
+    if not record:
+        raise RuntimeError("The bridge started a run but returned no run record.")
+    _print_run(record)
+    agent = _make_agent(bridge, provider, record, max_turns, all_tools=all_tools)
     if resume_messages is None and conversation_state and isinstance(conversation_state.get("messages"), list):
         resume_messages = list(conversation_state["messages"]) + [{"role": "user", "content": goal}]
     await agent.run(resume_messages=resume_messages)
@@ -1882,20 +2274,33 @@ async def _direct_run(bridge: BridgeClient, provider: OpenAICompatibleProvider, 
 
 async def _simple_control(bridge: BridgeClient, command: str, run_id: Optional[str] = None) -> int:
     if command == "stop":
-        response = await bridge.control("stop", timeout=12, run_id=run_id)
-        _print_control(response.get("control") or {})
+        targets = [run_id] if run_id else []
+        if not targets:
+            control = await _fetch_control(bridge)
+            mine = _my_active_runs(control, bridge.session_id)
+            others = [r for r in _control_runs(control) if r.get("state") in {"queued", "active"}]
+            chosen = mine or others
+            if not chosen:
+                raise RuntimeError("There is no queued or active run to stop.")
+            if len(chosen) > 1 and not mine:
+                raise RuntimeError("Several runs are active; pick one: /stop RUN_ID (" + ", ".join(str(r.get("run_id")) for r in chosen) + ")")
+            targets = [str(r.get("run_id")) for r in chosen]
+        for target in targets:
+            response = await bridge.control("stop", timeout=12, run_id=target)
+            _print_run(_response_run(response, target) or {"run_id": target, "state": "stop_requested"})
         UI.success("Stop request recorded.")
         return 0
     if command in {"return-browser", "yield"}:
-        status_response = await bridge.control("control_status", timeout=12)
-        control = status_response.get("control") or {}
-        if control.get("owner") != "cli" or not control.get("run_id") or not control.get("session_id"):
-            raise RuntimeError("The CLI does not currently own an active run.")
-        response = await bridge.control(
-            "yield", timeout=12, run_id=control["run_id"], session_id=control["session_id"],
-            summary="Control returned by the user from the ZeroScript CLI.",
-        )
-        _print_control(response.get("control") or {})
+        control = await _fetch_control(bridge)
+        mine = _my_active_runs(control, bridge.session_id)
+        if not mine:
+            raise RuntimeError("This CLI session (" + bridge.session_id + ") does not currently own an active run.")
+        for run in mine:
+            response = await bridge.control(
+                "yield", timeout=12, run_id=run["run_id"], session_id=bridge.session_id,
+                summary="Control returned by the user from the ZeroScript CLI.",
+            )
+            _print_run(_response_run(response, run["run_id"]) or run)
         return 0
     if command == "takeover":
         raise RuntimeError("Use the async takeover command.")
@@ -2036,7 +2441,15 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--all-tools", action="store_true",
                         help="Expose the entire bridge tool catalogue instead of the task-scoped selection")
     parser.add_argument("--max-turns", type=int, default=MAX_TURNS, help="Maximum model/tool cycles (default: 40)")
+    parser.add_argument("--session-id", default=None,
+                        help="Stable bridge session ID for this CLI (default: cli-<random>); 1-64 chars A-Z a-z 0-9 . _ -")
+    parser.add_argument("--max-parallel-subagents", type=int, default=None,
+                        help="Maximum subagents running at once (default: $ZS_MAX_PARALLEL_SUBAGENTS or 4; 0 = unlimited)")
     args = parser.parse_args(argv)
+    session_id = _validate_session_id(args.session_id) if args.session_id else None
+    if args.max_parallel_subagents is not None and args.max_parallel_subagents < 0:
+        parser.error("--max-parallel-subagents must be 0 (unlimited) or greater")
+    _RUNTIME_SETTINGS["max_parallel_subagents"] = resolve_max_parallel_subagents(args.max_parallel_subagents)
     if args.profile:
         profile_path = Path(os.environ.get("ZS_CLI_HOME", str(Path.home() / ".zeroscript-win"))) / "model-profiles.json"
         profile = ModelProfiles(profile_path).load().get(args.profile)
@@ -2054,7 +2467,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
     provider = OpenAICompatibleProvider(args.base_url, args.api_key, args.model, vision=args.vision or getattr(args, "vision", False), context_tokens=args.context_tokens)
     command = args.command_or_goal
     extra = args.extra or []
-    bridge = BridgeClient(args.bridge_url)
+    bridge = BridgeClient(args.bridge_url, session_id=session_id)
     try:
         await bridge.connect()
         active_workspace = bridge.initial_status.get("workspace") or {}
@@ -2146,6 +2559,7 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
             str(workspace.get("root") or ""),
             workspace.get("configured") is True,
         )
+        UI.info("CLI session ID: " + bridge.session_id + " (protocol " + str(bridge.server_protocol_version or PROTOCOL_VERSION) + ")")
         UI.info("Your conversation persists across tasks in this terminal. Use /new to reset it, /load to restore another session.")
         UI.print("Loading a model for the first time can take a few seconds. Type /help for the full command list.", "muted" if UI.rich_enabled else None)
         summaries = _session_summaries(1)
@@ -2315,8 +2729,9 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
                         all_tools=args.all_tools,
                     )
                     try:
-                        control = (await bridge.control("control_status", timeout=12)).get("control") or {}
-                        run_id = str(control.get("run_id") or "")
+                        control = await _fetch_control(bridge)
+                        mine_runs = [r for r in _control_runs(control) if r.get("target_session") == bridge.session_id]
+                        run_id = str(mine_runs[-1].get("run_id") or "") if mine_runs else ""
                         if run_id:
                             saved = _read_session(run_id)
                             conversation_state["messages"] = saved.get("messages") or None
