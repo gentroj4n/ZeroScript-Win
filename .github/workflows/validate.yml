@@ -25,7 +25,7 @@ jobs:
       - name: Test workspace tools and bridge
         shell: pwsh
         run: |
-          python -m unittest workspace_agent.test_tools workspace_agent.test_bridge workspace_agent.test_agent_control workspace_agent.test_unity_recovery workspace_agent.test_code_intelligence workspace_agent.test_browser_qa workspace_agent.test_browser_server workspace_agent.test_assetripper_jobs workspace_agent.test_unity_asset_inspector workspace_agent.test_reconstruction_tracker zeroscript_cli.test_agent zeroscript_cli.test_remaster_services zeroscript_cli.test_skills zeroscript_cli.test_hooks zeroscript_cli.test_file_context -v 2>&1 | Tee-Object -FilePath workspace-test-results.txt
+          python -m unittest workspace_agent.test_tools workspace_agent.test_bridge workspace_agent.test_agent_control workspace_agent.test_unity_recovery workspace_agent.test_code_intelligence workspace_agent.test_browser_qa workspace_agent.test_browser_server workspace_agent.test_assetripper_jobs workspace_agent.test_unity_asset_inspector workspace_agent.test_reconstruction_tracker workspace_agent.test_file_locks workspace_agent.test_mcp_concurrency zeroscript_cli.test_agent zeroscript_cli.test_remaster_services zeroscript_cli.test_skills zeroscript_cli.test_hooks zeroscript_cli.test_file_context zeroscript_cli.test_bridge_protocol zeroscript_cli.test_parallel_subagents -v 2>&1 | Tee-Object -FilePath workspace-test-results.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile Python
         shell: pwsh
@@ -67,6 +67,7 @@ jobs:
           node --check zeroscript-extension/core/main.js 2>&1 | tee -a extension-test-results.txt
           node --check zeroscript-extension/background.js 2>&1 | tee -a extension-test-results.txt
           node --check zeroscript-extension/popup.js 2>&1 | tee -a extension-test-results.txt
+          node zeroscript-extension/background.test.cjs 2>&1 | tee -a extension-test-results.txt
       - name: Validate extension manifest
         shell: bash
         run: |
