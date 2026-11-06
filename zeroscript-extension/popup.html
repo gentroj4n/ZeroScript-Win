@@ -122,7 +122,21 @@
       <pre id="projectSummary" class="project-summary" hidden></pre>
       <div id="explorerStatus" class="hint explorer-status" aria-live="polite">Connect the local bridge, then choose or reopen a project.</div>
     </section>
-
+    <details class="advanced-section" id="handoffSection">
+      <summary class="section-label">CLI handoff · optional</summary>
+    <section class="card" id="handoffCard">
+      <div class="card-heading">
+        <div class="card-title">Handoff target</div>
+        <span id="handoffBadge" class="badge">No CLI armed</span>
+      </div>
+      <label for="handoffTarget" class="hint" style="display:block;margin-top:0">When an agent hands a task to the terminal, send it to:</label>
+      <select id="handoffTarget" style="box-sizing:border-box;width:100%;margin-top:6px;background:#0d131d;color:#e1e8f4;border:1px solid #2c374a;border-radius:8px;padding:8px;font:11px/1.4 inherit">
+        <option value="">Automatic (any armed CLI)</option>
+      </select>
+      <div class="hint">Each browser tab is its own agent and hands off independently. Armed ZeroScript CLI sessions appear here; an explicit target chosen by the agent itself always wins.</div>
+      <div id="handoffRuns" style="font-size:10px;line-height:1.6;max-height:120px;overflow:auto;margin-top:8px"></div>
+    </section>
+    </details>
     <details class="advanced-section">
       <summary class="section-label">Autonomy · optional</summary>
     <section class="card" id="autopilotCard">
