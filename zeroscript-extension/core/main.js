@@ -1331,6 +1331,16 @@
       return ZS.FEEDBACK.staleExtension;
     }
     if (r.kind === "disconnected") return ZS.FEEDBACK.bridgeOffline;
+    if (r.kind === "protocol_mismatch") {
+      return `ERROR: ${r.error}\nThe browser extension and the local bridge speak different protocol versions, so no tool can run. Tell the user to update ZeroScript (extension and bridge) and then stop.`;
+    }
+    // Multi-agent bridge errors: an ordinary tool error, shown verbatim. Never
+    // retried automatically - the same call would just hit the same lock/limit.
+    if (r.kind === "file_locked" || r.kind === "busy") {
+      return `ERROR calling '${name}' [${r.kind}]: ${r.error}\n` + (r.kind === "file_locked"
+        ? "Another agent holds a lock on this file. Do not retry the same call right away: work on a different file, or tell the user and wait."
+        : "The bridge is at its concurrency limit. Do not retry right away: tell the user and wait.");
+    }
     if (r.kind === "timeout") {
       return `ERROR: tool '${name}' timed out after ${name === "execute_luau" ? 20 : 120}s.\n${r.error}\nTry a shorter/simpler call or check that Roblox Studio is open and responsive.`;
     }
@@ -2012,6 +2022,9 @@
   function stopLoop() {
     if (A.stopping) return; // already winding down - ignore double-clicks
     diag("stopLoop");
+    // If this tab has a handoff run out at the bridge, stop it too (background.js
+    // only touches runs whose origin_session is THIS tab; no-op otherwise).
+    bg({ type: "agent_stop" });
     A.stop = true;
     A.stopping = true;
     A.stopAt = Date.now(); // grace anchor for the regenerate-as-resume gates
@@ -4713,12 +4726,19 @@
       }
     });
   } catch {}
+  // `control` is this tab's filtered view (background.js keeps only runs whose
+  // origin_session is this tab's own session), so ANY held run here is ours.
+  // Protocol 2 has no top-level owner/state/run_id - state lives on each run.
   function syncExternalControl(control) {
     if (!control || typeof control !== "object") return;
-    const queued = control.state === "queued";
-    const cliOwns = control.owner === "cli" && ["active", "stop_requested"].includes(control.state);
+    const runs = Array.isArray(control.runs) ? control.runs : [];
+    const run = runs.find((r) => r && r.state === "active") ||
+      runs.find((r) => r && r.state === "stop_requested") ||
+      runs.find((r) => r && r.state === "queued") || null;
+    const queued = !!run && run.state === "queued";
+    const cliOwns = !!run && ["active", "stop_requested"].includes(run.state);
     const held = queued || cliOwns;
-    const nextState = queued ? "queued" : cliOwns ? control.state : "idle";
+    const nextState = queued ? "queued" : cliOwns ? run.state : "idle";
     if (held && !A.externalControl) {
       A.externalControl = true;
       A.externalControlState = nextState;
@@ -4752,11 +4772,16 @@
       else if (A.running) BackgroundKeepAlive.start();
     }
     if (msg && msg.type === "zs-agent-control") {
-      syncExternalControl(msg);
+      syncExternalControl(msg.control);
       return true;
     }
     if (msg && msg.type === "zs-status") {
       if (msg.agentControl) syncExternalControl(msg.agentControl);
+      // Bridge refused our protocol version: say so once per distinct message.
+      if ((msg.protocolError || null) !== (A.protocolErrorShown || null)) {
+        A.protocolErrorShown = msg.protocolError || null;
+        if (msg.protocolError) ui.banner("warn", "Update ZeroScript", msg.protocolError);
+      }
       ui.setStatus({ connected: msg.connected, mcpAlive: msg.mcpAlive, studio: msg.studio, studioApp: msg.studioApp, studioProc: msg.studioProc, tools: msg.tools, servers: msg.servers });
     }
     if (msg && msg.type === "zs-open-menu") {

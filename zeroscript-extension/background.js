@@ -68,6 +68,22 @@ const HEARTBEAT_MS = 10000;
 const STALE_SOCKET_MS = 25000;
 const REQUEST_TIMEOUT_DEFAULT = 130000; // a bit above the 120s tool timeout
 
+// Bridge protocol 2: one shared socket, many agents. The socket registers under
+// a stable per-install connection id; every call_tool additionally carries the
+// per-TAB session id so each tab is its own agent (own workspace, own handoff
+// runs, only that tab is paused while its handoff is out).
+const PROTOCOL_VERSION = 2;
+const CONNECTION_ID_KEY = "zsConnectionId";
+const HANDOFF_TARGET_KEY = "zsHandoffTarget"; // "" / unset = automatic
+const TAB_SESSION_PREFIX = "browser-tab-";
+// After a protocol_mismatch the bridge closes the socket on us. Retrying at the
+// normal 1-5s cadence would just spam it, so back off hard until the user
+// updates one side (a manual Reconnect still tries immediately).
+const PROTOCOL_BACKOFF_MIN = 15000;
+const PROTOCOL_BACKOFF_MAX = 120000;
+// Run states in which a handoff is still out (the tab stays paused).
+const HELD_RUN_STATES = ["queued", "active", "stop_requested"];
+
 // Workspace tools share one bridge-wide active root. Serialize root activation
 // and the subsequent tool call in this worker so separate AI tabs cannot switch
 // the bridge between those two operations.
@@ -130,19 +146,29 @@ async function activateWorkspaceRoot(projectPath) {
   }
   return actualRoot;
 }
-async function callToolInProject(projectPath, name, args, timeout) {
+async function callToolInProject(projectPath, name, args, timeout, sessionId) {
   // Pass the conversation root as request metadata. The bridge creates a scoped
   // manager view for this call, so parallel conversations never mutate or queue
   // behind the shared global workspace root.
+  // A failed response is returned as-is (not thrown) so its `kind`
+  // (file_locked / busy / timeout ...) reaches the model; throwing here left the
+  // content script without any reply and was misreported as a stale extension.
   const duration = timeout || 120000;
-  const response = await send({
+  return send({
     type: "call_tool", name, arguments: args || {}, timeout: duration,
-    workspace_root: projectPath
+    session_id: sessionId, workspace_root: projectPath
   }, duration + 10000);
-  if (!response || !response.ok) {
-    throw new Error(response && response.error || "Workspace operation failed: " + name);
-  }
-  return response;
+}
+
+// ── session ids (protocol 2) ────────────────────────────────────────────
+// Derived here from the sender, never from message content: a content script
+// (or a page) must not be able to claim another tab's session.
+function tabSessionId(tabId) {
+  return Number.isInteger(tabId) ? TAB_SESSION_PREFIX + tabId : null;
+}
+async function sessionForSender(sender) {
+  // Popup / extension pages without a tab fall back to the connection session.
+  return tabSessionId(sender && sender.tab && sender.tab.id) || await loadConnectionId();
 }
 
 let ws = null;
@@ -174,14 +200,68 @@ let studioApp = null;
 let studioProc = null;
 let workspaceCache = null;
 let agentControlCache = null;
+let connectionId = null;
+let connectionIdPromise = null;
+// {error, expected, message} after a failed registration; null when healthy.
+let protocolError = null;
+let protocolBackoff = PROTOCOL_BACKOFF_MIN;
 
 function log(...a) {
   console.log("[zs-bg]", ...a);
 }
 
+// ── connection id ───────────────────────────────────────────────────────
+// Stable random id for this browser profile, persisted so the bridge sees the
+// same session across service-worker restarts and reconnects.
+function loadConnectionId() {
+  if (connectionId) return Promise.resolve(connectionId);
+  if (!connectionIdPromise) {
+    connectionIdPromise = (async () => {
+      let id = "";
+      try {
+        const stored = await chrome.storage.local.get({ [CONNECTION_ID_KEY]: "" });
+        id = stored && stored[CONNECTION_ID_KEY];
+      } catch {}
+      if (typeof id !== "string" || !/^browser-(?!tab-)[\w-]+$/.test(id)) {
+        id = "browser-" + crypto.randomUUID();
+        try { await chrome.storage.local.set({ [CONNECTION_ID_KEY]: id }); } catch {}
+      }
+      connectionId = id;
+      return id;
+    })();
+  }
+  return connectionIdPromise;
+}
+
+function registerMessage() {
+  return { type: "register_client", client: "browser", protocol_version: PROTOCOL_VERSION, session_id: connectionId };
+}
+
+function handleRegistration(msg) {
+  if (msg.ok === false) {
+    const detail = String(msg.message || msg.error || "the bridge rejected this extension");
+    protocolError = {
+      error: String(msg.error || "registration_failed"),
+      expected: msg.expected,
+      message: msg.error === "protocol_mismatch" && !/^update zeroscript/i.test(detail)
+        ? "Update ZeroScript: " + detail : detail,
+    };
+    log("bridge refused registration:", protocolError.message);
+  } else {
+    protocolError = null;
+    protocolBackoff = PROTOCOL_BACKOFF_MIN;
+  }
+  broadcastStatus();
+}
+
 // ── WebSocket lifecycle ─────────────────────────────────────────────────
 function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  if (!connectionId) {
+    // The id lives in async storage; the socket needs it to register.
+    loadConnectionId().then(connect);
     return;
   }
   clearTimeout(reconnectTimer);
@@ -198,7 +278,7 @@ function connect() {
     reconnectDelay = RECONNECT_MIN;
     lastMessageAt = Date.now();
     log("connected to bridge");
-    try { ws.send(JSON.stringify({ type: "register_client", client: "browser" })); } catch {}
+    try { ws.send(JSON.stringify(registerMessage())); } catch {}
     startHeartbeat();
     broadcastStatus();
   };
@@ -235,6 +315,11 @@ function connect() {
 
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
+  if (protocolError && protocolError.error === "protocol_mismatch") {
+    reconnectTimer = setTimeout(connect, protocolBackoff);
+    protocolBackoff = Math.min(protocolBackoff * 2, PROTOCOL_BACKOFF_MAX);
+    return;
+  }
   reconnectTimer = setTimeout(connect, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 1.7, RECONNECT_MAX);
 }
@@ -283,6 +368,9 @@ function waitForConnection(timeout = 8000) {
 
 // ── request/response over the socket ────────────────────────────────────
 async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT) {
+  if (protocolError && protocolError.error === "protocol_mismatch") {
+    return { ok: false, kind: "protocol_mismatch", error: protocolError.message };
+  }
   // The MV3 service worker can be suspended; the first message after a wake-up
   // arrives before the socket has re-opened. Wait for it instead of failing -
   // otherwise Kimi wrongly hears "bridge offline".
@@ -313,6 +401,12 @@ async function send(obj, timeout = REQUEST_TIMEOUT_DEFAULT) {
   });
 }
 
+// Fire-and-forget frame (no id, no reply awaited). False if the socket is down.
+function sendNoReply(obj) {
+  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return false;
+  try { ws.send(JSON.stringify(obj)); return true; } catch { return false; }
+}
+
 // Ask the bridge whether a Roblox Studio instance is actually connected to the
 // MCP server. Broadcasts only on change so the UI updates promptly but quietly.
 let studioProbing = false;
@@ -334,6 +428,10 @@ async function refreshStudioStatus() {
 function handleBridgeMessage(msg) {
   if (msg.agent_control && typeof msg.agent_control === "object") {
     agentControlCache = msg.agent_control;
+  }
+  if (msg.type === "client_registered") {
+    handleRegistration(msg);
+    return;
   }
   if (msg.type === "agent_control") {
     agentControlCache = msg.control && typeof msg.control === "object" ? msg.control : {};
@@ -420,29 +518,79 @@ function failAllPending(reason) {
   pending.clear();
 }
 
-// ── status push to any open DeepSeek tab + popup ─────────────────────────
-function statusObj() {
-  return { type: "zs-status", connected, mcpAlive, studio: studioConnected, studioApp, studioProc, tools: toolsCache.length, servers: serversCache, workspace: workspaceCache, agentControl: agentControlCache };
+// ── agent control (protocol 2) ───────────────────────────────────────────
+// The bridge broadcasts ONE control object for everybody:
+//   {version:2, runs:[{run_id, origin_session, target_session, state, ...}],
+//    sessions:[{session_id, role, workspace, armed}]}
+// A tab must only react to runs it started (origin_session === its own session),
+// so tabs get a filtered copy; the popup gets everything.
+function filterControlForSession(control, sessionId) {
+  const c = control && typeof control === "object" ? control : {};
+  return {
+    version: c.version,
+    runs: Array.isArray(c.runs) ? c.runs.filter((r) => r && r.origin_session === sessionId) : [],
+    // Armed CLI sessions are shared info (handoff targets), not other tabs' state.
+    sessions: Array.isArray(c.sessions) ? c.sessions.filter((x) => x && x.role === "cli") : [],
+  };
+}
+function heldRunsForSession(control, sessionId) {
+  return filterControlForSession(control, sessionId).runs.filter((r) => HELD_RUN_STATES.includes(r.state));
+}
+function armedCliSessions(control) {
+  const list = control && Array.isArray(control.sessions) ? control.sessions : [];
+  return list.filter((x) => x && x.role === "cli" && x.armed === true && x.session_id);
+}
+
+// ── status push to every provider tab + popup ────────────────────────────
+// statusObj(tabId): per-tab agentControl for a content script; no tabId (popup)
+// = the full control object.
+function statusObj(tabId) {
+  const agentControl = Number.isInteger(tabId)
+    ? filterControlForSession(agentControlCache, tabSessionId(tabId))
+    : agentControlCache;
+  return {
+    type: "zs-status", connected, mcpAlive, studio: studioConnected, studioApp, studioProc,
+    tools: toolsCache.length, servers: serversCache, workspace: workspaceCache, agentControl,
+    protocolError: protocolError ? protocolError.message : null,
+  };
 }
 
 function broadcastAgentControl() {
   const control = agentControlCache || {};
-  const message = { type: "zs-agent-control", ...control };
-  chrome.runtime.sendMessage(message).catch(() => {});
+  chrome.runtime.sendMessage({ type: "zs-agent-control", control }).catch(() => {});
   chrome.tabs.query({ url: PROVIDER_URLS }, (tabs) => {
-    for (const t of tabs) chrome.tabs.sendMessage(t.id, message).catch(() => {});
+    for (const t of tabs) {
+      const sessionId = tabSessionId(t.id);
+      chrome.tabs.sendMessage(t.id, {
+        type: "zs-agent-control", session_id: sessionId, control: filterControlForSession(control, sessionId),
+      }).catch(() => {});
+    }
   });
 }
 
 function broadcastStatus() {
   chrome.runtime.sendMessage(statusObj()).catch(() => {});
   chrome.tabs.query({ url: PROVIDER_URLS }, (tabs) => {
-    for (const t of tabs) chrome.tabs.sendMessage(t.id, statusObj()).catch(() => {});
+    for (const t of tabs) chrome.tabs.sendMessage(t.id, statusObj(t.id)).catch(() => {});
   });
 }
 
+// The popup lets the user pin a handoff target. Applied only when the model did
+// not pass its own target_session_id and the pinned CLI is still armed.
+async function withHandoffTarget(name, args) {
+  if (!String(name || "").endsWith("zeroscript_handoff_to_cli")) return args;
+  if (args && args.target_session_id) return args;
+  let pinned = "";
+  try {
+    const stored = await chrome.storage.local.get({ [HANDOFF_TARGET_KEY]: "" });
+    pinned = stored && stored[HANDOFF_TARGET_KEY];
+  } catch {}
+  if (!pinned || !armedCliSessions(agentControlCache).some((x) => x.session_id === pinned)) return args;
+  return { ...(args || {}), target_session_id: pinned };
+}
+
 // ── messages from content.js / popup.js ─────────────────────────────────
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg.type) {
       case "autopilot_create_run": {
@@ -580,8 +728,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         break;
       }
       case "status":
-        if (!connected) connect(); // self-heal after a worker wake-up
-        sendResponse(statusObj());
+        // Self-heal after a worker wake-up - but never poll-reconnect while the
+        // bridge is refusing our protocol version (that would defeat the backoff).
+        if (!connected && !protocolError) connect();
+        sendResponse(statusObj(sender && sender.tab ? sender.tab.id : undefined));
         break;
       case "list_tools": {
         // Prefer a live refresh; fall back to cache so the loop never stalls.
@@ -597,13 +747,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case "call_tool": {
         const timeout = (msg.timeout || 120000) + 10000;
         const isWorkspaceTool = String(msg.name || "").includes("workspace_") || msg.name === "roblox_export_tree";
+        const sessionId = await sessionForSender(sender);
+        const args = await withHandoffTarget(msg.name, msg.arguments);
         const r = isWorkspaceTool && msg.projectPath
-          ? await callToolInProject(msg.projectPath, msg.name, msg.arguments, msg.timeout)
+          ? await callToolInProject(msg.projectPath, msg.name, args, msg.timeout, sessionId)
           : await send(
-              { type: "call_tool", name: msg.name, arguments: msg.arguments, timeout: msg.timeout },
+              { type: "call_tool", name: msg.name, arguments: args, timeout: msg.timeout, session_id: sessionId },
               timeout
             );
         sendResponse(r);
+        break;
+      }
+      case "agent_stop": {
+        // The tab's Stop action: ask the bridge to stop this tab's own handoff
+        // run(s). Nothing else is touched - other tabs' runs are not ours.
+        const sessionId = tabSessionId(sender && sender.tab && sender.tab.id);
+        if (!sessionId) { sendResponse({ ok: false, error: "agent_stop needs a tab sender" }); break; }
+        const runs = heldRunsForSession(agentControlCache, sessionId);
+        let sent = 0;
+        for (const run of runs) {
+          if (sendNoReply({ type: "agent_stop", run_id: run.run_id, session_id: sessionId })) sent++;
+        }
+        sendResponse({ ok: true, runs: runs.length, sent });
         break;
       }
       case "restart_mcp": {
@@ -626,13 +791,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       case "reconnect":
         reconnectDelay = RECONNECT_MIN;
+        protocolBackoff = PROTOCOL_BACKOFF_MIN;
         connect();
         sendResponse({ ok: true });
         break;
       default:
         sendResponse({ ok: false, error: "unknown message" });
     }
-  })();
+  })().catch((error) => {
+    // Never leave the caller without a reply: a closed port is indistinguishable
+    // from "extension was reloaded" in the content script.
+    try { sendResponse({ ok: false, kind: "error", error: String(error && error.message || error) }); } catch {}
+  });
   return true; // async sendResponse
 });
 

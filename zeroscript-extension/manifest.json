@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ArcScript — Local Coding Agent",
-  "version": "1.13.1",
+  "version": "1.14.0",
   "description": "Free, local-first AI development agent for Windows workspaces, with optional MCP and Roblox Studio integrations.",
   "permissions": [
     "storage"

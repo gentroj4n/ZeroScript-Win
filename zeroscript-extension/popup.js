@@ -110,6 +110,14 @@ function render(s) {
   dot.className = "dot " + (s.connected ? (ready ? "on" : "warn") : "");
   state.textContent = !s.connected ? "Bridge offline" : ready ? "Local bridge connected" : "Bridge connected · waiting for tools";
   detail.textContent = s.connected ? `${s.tools || 0} tools loaded · ${up} MCP service(s) online` : "Start bridge.py or run start.bat";
+  if (s.protocolError) {
+    // The bridge refused our protocol version: the message already reads
+    // "Update ZeroScript: ..." and is the only useful thing to show.
+    dot.className = "dot warn";
+    state.textContent = "Update ZeroScript";
+    detail.textContent = s.protocolError;
+  }
+  if (s.agentControl) renderAgentControl(s.agentControl);
 
   const workspace = s.workspace && typeof s.workspace === "object" ? s.workspace : null;
   if (workspace) {
@@ -158,6 +166,70 @@ function render(s) {
     ? `Other integrations · ${other.filter((x) => x.alive).length}/${other.length} online: ${other.map((x) => x.id).join(", ")}`
     : "Optional MCP integrations can be configured separately.";
 }
+
+// ── CLI handoff (protocol 2) ────────────────────────────────────────────
+// `control` is the FULL bridge control object: {runs:[...], sessions:[...]}.
+// The pinned target lives in chrome.storage.local (zsHandoffTarget); background.js
+// applies it to handoff calls that don't name their own target.
+const HANDOFF_TARGET_KEY = "zsHandoffTarget";
+let pinnedHandoffTarget = "";
+let lastAgentControl = null;
+
+function shortSession(id) {
+  const text = String(id || "");
+  return text.length > 22 ? text.slice(0, 10) + "…" + text.slice(-8) : text;
+}
+
+function renderAgentControl(control) {
+  lastAgentControl = control;
+  const select = document.getElementById("handoffTarget");
+  const badge = document.getElementById("handoffBadge");
+  const runsBox = document.getElementById("handoffRuns");
+  if (!select || !badge || !runsBox) return;
+  const sessions = Array.isArray(control && control.sessions) ? control.sessions : [];
+  const runs = Array.isArray(control && control.runs) ? control.runs : [];
+  const armed = sessions.filter((x) => x && x.role === "cli" && x.armed === true && x.session_id);
+  select.replaceChildren();
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "Automatic (any armed CLI)";
+  select.appendChild(auto);
+  for (const cli of armed) {
+    const option = document.createElement("option");
+    option.value = cli.session_id;
+    option.textContent = shortSession(cli.session_id) + (cli.workspace ? " · " + cli.workspace : "");
+    select.appendChild(option);
+  }
+  // A pinned CLI that is no longer armed falls back to automatic (in the UI;
+  // the stored choice is kept so it works again if that CLI re-arms).
+  select.value = armed.some((x) => x.session_id === pinnedHandoffTarget) ? pinnedHandoffTarget : "";
+  badge.textContent = armed.length ? `${armed.length} CLI armed` : "No CLI armed";
+  badge.className = "badge" + (armed.length ? " ready" : "");
+  runsBox.replaceChildren();
+  for (const run of runs.slice(0, 20)) {
+    if (!run) continue;
+    const row = document.createElement("div");
+    const origin = String(run.origin_session || "").replace(/^browser-tab-/, "tab ");
+    const goal = String(run.goal || "").slice(0, 60);
+    row.textContent = `${origin} → ${run.target_session ? shortSession(run.target_session) : "any CLI"} · ${run.state || "?"}` +
+      (run.progress ? " · " + String(run.progress).slice(0, 60) : goal ? " · " + goal : "");
+    runsBox.appendChild(row);
+  }
+}
+
+function initHandoffTarget() {
+  const select = document.getElementById("handoffTarget");
+  if (!select) return;
+  chrome.storage.local.get({ [HANDOFF_TARGET_KEY]: "" }, (value) => {
+    pinnedHandoffTarget = typeof value[HANDOFF_TARGET_KEY] === "string" ? value[HANDOFF_TARGET_KEY] : "";
+    if (lastAgentControl) renderAgentControl(lastAgentControl);
+  });
+  select.addEventListener("change", () => {
+    pinnedHandoffTarget = select.value;
+    chrome.storage.local.set({ [HANDOFF_TARGET_KEY]: pinnedHandoffTarget });
+  });
+}
+initHandoffTarget();
 
 function refresh() {
   chrome.runtime.sendMessage({ type: "status" }, (s) => {
@@ -213,6 +285,7 @@ document.getElementById("settings").addEventListener("click", () => {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "zs-status") render(msg);
+  if (msg && msg.type === "zs-agent-control" && msg.control) renderAgentControl(msg.control);
 });
 let activeAutopilotRunId = null;
 let lastAutopilotDispatchAt = 0;
