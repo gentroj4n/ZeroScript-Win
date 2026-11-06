@@ -219,7 +219,7 @@ class WorkspaceLockingTests(unittest.TestCase):
         thread = threading.Thread(target=holder)
         thread.start()
         held.wait(2)
-        old = file_locks.default_timeout
+        old = file_locks._default_timeout
         file_locks._default_timeout = 0.05
         try:
             with lock_owner("agent-2"):
@@ -230,7 +230,7 @@ class WorkspaceLockingTests(unittest.TestCase):
                     self.ws.delete_file("f.txt")
                 self.ws.read_file("f.txt")  # reads are never locked
         finally:
-            file_locks._default_timeout = None if old == 60.0 else old
+            file_locks._default_timeout = old
             release.set()
             thread.join(5)
         self.assertEqual(target.read_text(encoding="utf-8"), "x")

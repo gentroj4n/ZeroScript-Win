@@ -23,7 +23,7 @@ class AgentFlightRecorder:
     def __init__(self, path: str | Path, max_bytes: int = 8 * 1024 * 1024):
         self.path, self.max_bytes = Path(path), max(65536, int(max_bytes))
         self._lock = threading.Lock()
-    def record(self, event: str, **fields: Any) -> dict[str, Any]:
+    def record(self, event: str, /, **fields: Any) -> dict[str, Any]:
         row = {"time": time.time(), "event": str(event)[:120], "fields": redact(fields)}
         data = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode()
         # Rotate-then-append must be atomic: concurrent subagents/threads share one recorder.

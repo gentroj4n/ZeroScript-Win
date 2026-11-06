@@ -123,4 +123,11 @@ class RemasterServiceTests(unittest.TestCase):
         self.assertTrue(any("Missing required" in e for e in errors))
         self.assertTrue(any("must be integer" in e for e in errors))
 
+    def test_flight_recorder_accepts_event_as_field(self):
+        # Hook records pass event=<hook event>; record()'s own name must not clash.
+        with tempfile.TemporaryDirectory() as td:
+            row=AgentFlightRecorder(Path(td)/"e.jsonl").record("hook.completed", event="PreToolUse", returncode=0)
+            self.assertEqual(row["event"],"hook.completed")
+            self.assertEqual(row["fields"]["event"],"PreToolUse")
+
 if __name__ == "__main__": unittest.main()

@@ -57,7 +57,9 @@ def _default_timeout() -> float:
 
 
 def _normalize(path: PathLike) -> str:
-    return os.path.normcase(os.path.abspath(os.fspath(path)))
+    # realpath expands Windows 8.3 short names (GENTRO~1) and symlinks, so two
+    # spellings of the same file always map to the same lock key.
+    return os.path.normcase(os.path.realpath(os.fspath(path)))
 
 
 def _is_ancestor(parent: str, child: str) -> bool:
