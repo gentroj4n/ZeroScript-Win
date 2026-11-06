@@ -252,6 +252,18 @@ class WorkspaceBridgeTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in listing["files"]], ["main.py"])
 
 
+class OriginCheckTests(unittest.TestCase):
+    def test_cli_and_extension_origins_allowed(self):
+        self.assertTrue(bridge._origin_allowed(None))
+        self.assertTrue(bridge._origin_allowed("chrome-extension://abcdefghijklmnop"))
+        self.assertTrue(bridge._origin_allowed("moz-extension://1234-5678"))
+
+    def test_web_page_origins_rejected(self):
+        for origin in ("https://evil.example", "http://localhost:3000", "http://127.0.0.1", "null", ""):
+            with self.subTest(origin=origin):
+                self.assertFalse(bridge._origin_allowed(origin))
+
+
 class FakeSocket:
     def __init__(self):
         self.sent = []

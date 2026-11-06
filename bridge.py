@@ -2522,8 +2522,28 @@ async def broadcast_agent_control():
             pass
 
 
+def _origin_allowed(origin):
+    """Browsers do not apply CORS to WebSockets, so any web page could otherwise
+    drive this bridge. Allow only clients with no Origin header (the CLI) and
+    browser-extension origins; reject every http(s) page and the opaque "null"."""
+    if origin is None:
+        return True
+    return origin.startswith(("chrome-extension://", "moz-extension://"))
+
+
+def _ws_origin(ws):
+    request = getattr(ws, "request", None)
+    headers = request.headers if request is not None else getattr(ws, "request_headers", None)
+    return headers.get("Origin") if headers is not None else None
+
+
 async def handler(ws):
     peer = getattr(ws, "remote_address", ("?",))[0]
+    origin = _ws_origin(ws)
+    if not _origin_allowed(origin):
+        log(f"rejected connection from {peer}: origin {origin!r} is not allowed", "rd")
+        await ws.close(1008, "origin not allowed")
+        return
     clients.add(ws)
     client_roles[ws] = "browser"
     client_inflight[ws] = 0
