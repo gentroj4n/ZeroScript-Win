@@ -71,6 +71,11 @@ except Exception:
     export_roblox_tree = None
 
 try:
+    from zeroscript_cli.remaster_services import validate_tool_arguments
+except Exception:
+    validate_tool_arguments = None
+
+try:
     from workspace_agent import unity_recovery
 except Exception:
     unity_recovery = None
@@ -1988,6 +1993,12 @@ class MCPManager:
         if arguments is not None and not isinstance(arguments, dict):
             raise RuntimeError("MCP arguments must be a JSON object.")
         args = arguments or {}
+        if name.startswith("workspace_") and validate_tool_arguments is not None:
+            schema = next((t.get("inputSchema") for t in self._workspace_tools() if t["name"] == name), None)
+            if schema is not None:
+                errors = validate_tool_arguments(schema, args)
+                if errors:
+                    raise RuntimeError(f"Invalid arguments for {name}: " + "; ".join(errors[:5]))
         if name == "zeroscript_handoff_to_cli":
             if agent_control is None:
                 raise RuntimeError("ZeroScript agent-control module is unavailable.")
