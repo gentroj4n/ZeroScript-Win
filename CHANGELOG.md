@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- **Concurrent agents** (bridge protocol 2, extension 1.14.0, CLI 1.17.0): browser tabs, CLIs, and CLI subagents run as independent sessions with their own workspace roots. Writes take per-file locks (reads never lock; writers wait up to 60s, `ZS_FILE_LOCK_TIMEOUT`). MCP servers run known read-only tools in parallel and mutating tools one at a time per server. Tool calls are capped at 16 in flight overall and 4 per session, queueing up to 120s (`max_inflight`, `max_inflight_per_session`, `queue_timeout` or the `ZS_*` equivalents). CLI subagents run in parallel (`--max-parallel-subagents`, default 4). See `docs/CONCURRENT_AGENTS.md`.
+- **Targeted CLI handoff**: the agent-control ledger tracks multiple runs, any number of CLIs can be armed, `zeroscript_handoff_to_cli` takes an optional `target_session_id`, and the popup has a handoff target picker. Only the handing-off tab pauses.
 - Added an optional **Discord MCP integration** (`zeroscript_discord/`) for managing Discord guilds from ZeroScript: channels (list/get/create/edit/delete, plus role and member permission overwrites) and roles (list/create/edit/delete, assign/remove on members). It speaks the Discord REST API v10 over stdlib `urllib`, so it adds no pip dependency, and is registered as the `discord` entry in `config.json`. The bot token is read only from `DISCORD_BOT_TOKEN` and scrubbed from every response; an optional `ZS_DISCORD_GUILD_IDS` allowlist restricts which guilds can be touched; channel/role deletion and channel-locking overwrites require `confirm=true`; the `@everyone` role is immutable. Added `docs/DISCORD_MCP.md` and an offline `unittest` suite (38 tests, REST layer patched at `urllib.request.urlopen`).
 - Added a dedicated **Roblox UI workspace** in the ArcScript Workspace: a structured component tree, typed property inspector, live browser preview with device presets, local document persistence to `.zeroscript/roblox-ui/current.json`, Roblox-compatible Luau generation, and Studio apply via the existing MCP execute path. Added the `roblox-ui-expert` project skill (`.zeroscript/skills/roblox-ui-expert/`) with its full reference set, discoverable by the CLI skill loader. Added `docs/ROBLOX_UI_WORKSPACE.md` and Node regression tests.
 - Added remaster CLI diagnostics, per-run event recording, project indexing, model profiles, Git worktree helpers, acceptance verification, snapshots, artifact inventory, MCP argument validation, and optional visual regression comparison.
@@ -11,6 +13,12 @@
 - Added model-invocable bundled and user/project skills, custom slash command discovery and reload, global and path-scoped instructions, Markdown agent profiles, bounded subagent tool loops, role-scoped tool lists, and CLI regression coverage.
 - Added Claude-style opt-in command hooks for session, prompt, pre-tool, post-tool, and stop events with bounded execution, matcher support, and regression tests.
 - Added a `/hooks` inspection command, hook output context handling tests, and independent CLI validation workflow.
+
+### Changed
+- Clients with a mismatched protocol version are rejected with an update prompt; messages without a session id get a default session.
+
+### Fixed
+- Every workspace tool now honors the chat's `workspace_root`; previously only the handoff tool used it and other calls ran against the bridge-wide root.
 
 All notable changes to ArcScript are documented here.
 
