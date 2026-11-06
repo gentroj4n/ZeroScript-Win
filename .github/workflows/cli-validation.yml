@@ -27,7 +27,7 @@ jobs:
       - name: Run CLI regression tests
         shell: pwsh
         run: |
-          python -m unittest zeroscript_cli.test_agent zeroscript_cli.test_remaster_services zeroscript_cli.test_skills zeroscript_cli.test_hooks -v 2>&1 | Tee-Object -FilePath cli-test-results.txt
+          python -m unittest zeroscript_cli.test_agent zeroscript_cli.test_remaster_services zeroscript_cli.test_skills zeroscript_cli.test_hooks zeroscript_cli.test_bridge_protocol zeroscript_cli.test_parallel_subagents -v 2>&1 | Tee-Object -FilePath cli-test-results.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compile CLI modules
         shell: pwsh
