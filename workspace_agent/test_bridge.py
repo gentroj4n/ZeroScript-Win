@@ -74,7 +74,7 @@ class WorkspaceBridgeTests(unittest.TestCase):
         self.manager.workspace_configured = True
         self.manager.workspace.write_file("main.py", "print('ok')\n")
         result = self.manager.call("workspace_read_file", {"path": "main.py"}, 5)
-        self.assertEqual(result["content"], "print('ok')\n")
+        self.assertEqual(json.loads(result["text"])["content"], "print('ok')\n")
 
     def test_workspace_preview_image_returns_image_payload(self):
         image_path = self.root / "preview.png"
@@ -94,7 +94,7 @@ class WorkspaceBridgeTests(unittest.TestCase):
         image_path = output / "pallet_town.png"
         image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"test-payload")
         jpeg_path = output / "pallet_town_preview.jpg"
-        jpeg_path.write_bytes(b"\\xff\\xd8\\xff\\xe0" + b"test-payload")
+        jpeg_path.write_bytes(b"\xff\xd8\xff\xe0" + b"test-payload")
         self.manager.workspace_configured = True
 
         # Both common raster formats should validate by their file signatures.
