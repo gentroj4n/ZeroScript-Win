@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from workspace_agent.file_locks import file_locks
+
 DEFAULT_IGNORES = {
     ".git", ".hg", ".svn", ".next", ".nuxt", ".turbo", ".venv", "venv",
     "__pycache__", "node_modules", "bin", "obj", "dist", "build",
@@ -186,15 +188,16 @@ class Workspace:
             raise WorkspaceError(f"File writes are limited to {MAX_READ_BYTES} bytes.")
         if target.exists() and not target.is_file():
             raise WorkspaceError("Target exists and is not a regular file.")
-        existed = target.exists()
-        previous = ""
-        if existed:
-            try:
-                previous = self._read_text_exact(target)
-            except UnicodeDecodeError as exc:
-                raise WorkspaceError("Refusing to overwrite a non-UTF-8 file.") from exc
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="")
+        with file_locks.hold([target]):
+            existed = target.exists()
+            previous = ""
+            if existed:
+                try:
+                    previous = self._read_text_exact(target)
+                except UnicodeDecodeError as exc:
+                    raise WorkspaceError("Refusing to overwrite a non-UTF-8 file.") from exc
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8", newline="")
         diff = "".join(difflib.unified_diff(
             previous.splitlines(keepends=True),
             content.splitlines(keepends=True),
@@ -216,6 +219,28 @@ class Workspace:
         Studio MCP. All paths and payloads are validated before any write occurs.
         Existing files are protected unless overwrite=True is explicitly supplied.
         """
+        with file_locks.hold(self._lock_targets(files)):
+            return self._write_files_locked(files, overwrite)
+
+    def _lock_targets(self, items: Any) -> list[Path]:
+        """Best-effort list of resolved paths named by a batch request.
+
+        Invalid entries are skipped here; the real validation (run while the
+        locks are held) reports them with the usual error messages.
+        """
+        targets: list[Path] = []
+        if not isinstance(items, list):
+            return targets
+        for item in items[:200]:
+            path = item.get("path") if isinstance(item, dict) else None
+            if isinstance(path, str) and path.strip():
+                try:
+                    targets.append(self._resolve(path))
+                except (WorkspaceError, OSError, ValueError):
+                    continue
+        return targets
+
+    def _write_files_locked(self, files: list[dict[str, Any]], overwrite: bool = False) -> dict[str, Any]:
         if not isinstance(files, list) or not files:
             raise WorkspaceError("files must be a non-empty list.")
         if len(files) > 200:
@@ -302,6 +327,10 @@ class Workspace:
 
     def multi_edit(self, edits: list[dict[str, Any]]) -> dict[str, Any]:
         """Apply a validated batch of exact text replacements across existing files."""
+        with file_locks.hold(self._lock_targets(edits)):
+            return self._multi_edit_locked(edits)
+
+    def _multi_edit_locked(self, edits: list[dict[str, Any]]) -> dict[str, Any]:
         if not isinstance(edits, list) or not edits:
             raise WorkspaceError("edits must be a non-empty list.")
         if len(edits) > 200:
@@ -428,15 +457,16 @@ class Workspace:
         raw = raw if raw.is_absolute() else self.root / raw
         if raw.is_symlink():
             raise WorkspaceError("Creating through a symbolic link is not supported.")
-        if target.exists():
-            raise WorkspaceError(f"Path already exists: {path}")
-        if not target.parent.is_dir():
-            raise WorkspaceError("Parent directory does not exist. Create it first.")
-        try:
-            with target.open("x", encoding="utf-8", newline="") as handle:
-                handle.write(content)
-        except FileExistsError as exc:
-            raise WorkspaceError(f"Path already exists: {path}") from exc
+        with file_locks.hold([target]):
+            if target.exists():
+                raise WorkspaceError(f"Path already exists: {path}")
+            if not target.parent.is_dir():
+                raise WorkspaceError("Parent directory does not exist. Create it first.")
+            try:
+                with target.open("x", encoding="utf-8", newline="") as handle:
+                    handle.write(content)
+            except FileExistsError as exc:
+                raise WorkspaceError(f"Path already exists: {path}") from exc
         return {"path": target.relative_to(self.root).as_posix(), "created": True,
                 "type": "file", "bytes": len(content.encode("utf-8"))}
 
@@ -451,9 +481,10 @@ class Workspace:
         target = self._resolve(path)
         if target == self.root:
             raise WorkspaceError("The workspace root cannot be created or replaced.")
-        if target.exists():
-            raise WorkspaceError(f"Path already exists: {path}")
-        target.mkdir(parents=True, exist_ok=False)
+        with file_locks.hold([target]):
+            if target.exists():
+                raise WorkspaceError(f"Path already exists: {path}")
+            target.mkdir(parents=True, exist_ok=False)
         return {"path": target.relative_to(self.root).as_posix(), "created": True, "type": "directory"}
 
     def move_path(self, source: str, destination: str) -> dict[str, Any]:
@@ -470,15 +501,16 @@ class Workspace:
         new = self._resolve(destination)
         if old == self.root:
             raise WorkspaceError("The workspace root cannot be moved.")
-        if not old.exists():
-            raise WorkspaceError(f"Source path does not exist: {source}")
-        if new.exists():
-            raise WorkspaceError(f"Destination already exists: {destination}")
-        if not new.parent.is_dir():
-            raise WorkspaceError("Destination parent directory must already exist.")
-        if old.is_dir() and old in new.parents:
-            raise WorkspaceError("A directory cannot be moved into itself or one of its descendants.")
-        old.rename(new)
+        with file_locks.hold([old, new]):
+            if not old.exists():
+                raise WorkspaceError(f"Source path does not exist: {source}")
+            if new.exists():
+                raise WorkspaceError(f"Destination already exists: {destination}")
+            if not new.parent.is_dir():
+                raise WorkspaceError("Destination parent directory must already exist.")
+            if old.is_dir() and old in new.parents:
+                raise WorkspaceError("A directory cannot be moved into itself or one of its descendants.")
+            old.rename(new)
         return {"source": old.relative_to(self.root).as_posix(),
                 "destination": new.relative_to(self.root).as_posix(),
                 "type": "directory" if new.is_dir() else "file", "moved": True}
@@ -492,11 +524,13 @@ class Workspace:
         target = self._resolve(path)
         if target == self.root:
             raise WorkspaceError("The workspace root cannot be deleted.")
-        if not target.exists() or not target.is_file():
-            raise WorkspaceError(f"Not an existing regular file: {path}")
-        relative = target.relative_to(self.root).as_posix()
-        target.unlink()
+        with file_locks.hold([target]):
+            if not target.exists() or not target.is_file():
+                raise WorkspaceError(f"Not an existing regular file: {path}")
+            relative = target.relative_to(self.root).as_posix()
+            target.unlink()
         return {"path": relative, "deleted": True, "type": "file"}
+
     def find_files(self, pattern: str = "*", path: str = ".", max_results: int = 200, include_hidden: bool = False) -> dict[str, Any]:
         """Find files by glob against their workspace-relative path or filename."""
         if not isinstance(pattern, str) or not pattern.strip():
@@ -742,6 +776,31 @@ class Workspace:
         expected_hash: str = "",
     ) -> dict[str, Any]:
         """Preview or apply a bounded multi-file replacement within the workspace."""
+        if apply and isinstance(query, str) and query and isinstance(replacement, str):
+            # Discover which files would change, lock exactly those, then run the
+            # whole scan again under the locks so a concurrent edit is never lost.
+            preview = self._replace_in_files_impl(
+                query, replacement, path, max_files, case_sensitive, regex, False, "")
+            locked = [self._resolve(item["path"]) for item in preview["files"]]
+            with file_locks.hold(locked):
+                return self._replace_in_files_impl(
+                    query, replacement, path, max_files, case_sensitive, regex, apply,
+                    expected_hash, {item["path"] for item in preview["files"]})
+        return self._replace_in_files_impl(
+            query, replacement, path, max_files, case_sensitive, regex, apply, expected_hash)
+
+    def _replace_in_files_impl(
+        self,
+        query: str,
+        replacement: str,
+        path: str = ".",
+        max_files: int = 100,
+        case_sensitive: bool = False,
+        regex: bool = False,
+        apply: bool = False,
+        expected_hash: str = "",
+        locked_paths: set[str] | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(query, str) or not query:
             raise WorkspaceError("Replacement search text must not be empty.")
         if not isinstance(replacement, str):
@@ -838,6 +897,8 @@ class Workspace:
                     "files_scanned": scanned, "skipped_large_files": skipped_large,
                     "message": "No matching text remains; no files were changed.",
                 }
+            if locked_paths is not None and any(item["path"] not in locked_paths for item in pending):
+                raise WorkspaceError("Project files changed after the preview. Run Preview Replace All again before applying.")
             edits = [
                 {"path": item["path"], "old_string": item["original"], "new_string": item["updated"], "whole_file": True}
                 for item in pending
@@ -975,6 +1036,11 @@ class Workspace:
     def apply_patch(self, path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict[str, Any]:
         """Apply an exact text replacement, refusing ambiguous matches by default."""
         target = self._resolve(path)
+        with file_locks.hold([target]):
+            return self._apply_patch_locked(target, path, old_string, new_string, replace_all)
+
+    def _apply_patch_locked(self, target: Path, path: str, old_string: str, new_string: str,
+                            replace_all: bool) -> dict[str, Any]:
         if not target.is_file():
             raise WorkspaceError(f"Patch target is not an existing file: {path}")
         if target.stat().st_size > MAX_READ_BYTES:

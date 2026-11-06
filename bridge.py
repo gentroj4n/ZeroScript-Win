@@ -23,7 +23,9 @@ import base64
 import json
 import os
 import hashlib
+import contextlib
 import copy
+import uuid
 from pathlib import Path
 import queue
 import re
@@ -42,6 +44,26 @@ try:
     from workspace_agent.agent_control import AgentControlStore
 except Exception:
     AgentControlStore = None
+
+try:
+    # Imported once here. Deliberately NOT in _WORKSPACE_RELOAD_TARGETS:
+    # reloading would replace the process-wide file-lock singleton.
+    from workspace_agent.file_locks import lock_owner, FileLockTimeout
+except Exception:
+    class FileLockTimeout(Exception):
+        pass
+
+    def lock_owner(owner):
+        return contextlib.nullcontext()
+
+try:
+    from workspace_agent.session_limits import BusyError, InflightLimiter, load_limits
+except Exception:
+    class BusyError(RuntimeError):
+        pass
+
+    InflightLimiter = None
+    load_limits = None
 
 try:
     from workspace_agent.roblox_export import export_tree as export_roblox_tree
@@ -141,6 +163,9 @@ HOST = "127.0.0.1"
 # Keep in sync with zeroscript-extension/manifest.json "version" - printed at
 # startup so a user's terminal output alone tells us which build they're on.
 BRIDGE_VERSION = "1.11.0"
+# Wire protocol between the bridge and its clients (extension / CLI). Clients
+# send protocol_version in register_client; a different number is rejected.
+PROTOCOL_VERSION = 2
 PORT = int(os.environ.get("ZS_BRIDGE_PORT", "17613"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
@@ -799,6 +824,60 @@ def restart_self():
 # ══════════════════════════════════════════════════════════════════════════
 #  HARDENED MCP CLIENT  (one per server in config.json)
 # ══════════════════════════════════════════════════════════════════════════
+# Tools KNOWN to be side-effect-free, keyed by server id (the key in
+# config.json "mcpServers"). MCPClient.call_tool runs these without taking the
+# per-server mutate_lock, so any number can be in flight at once (and alongside
+# one mutating call). EVERYTHING NOT LISTED HERE IS TREATED AS MUTATING and runs
+# one-at-a-time per server - so only add a name when it is certainly read-only.
+# Names are the server's own (un-prefixed) tool names. Sources:
+#  roblox  - list_roblox_studios / get_studio_state: the STUDIO_PROBE_TOOL /
+#            STUDIO_STATE_TOOL probes below ("side-effect-free");
+#            search_game_tree / inspect_instance / script_read / screen_capture:
+#            READ_NAME + VISION_TOOLS in zeroscript-extension/core/autopilot-policy.js
+#            and core/main.js (inspect/read/capture only).
+#  bpy     - zeroscript_blender/mcp_server.py TOOLS: status, scene inspection and
+#            GLB validation only read state (render/export/save/pack/open/execute
+#            write files or scene data -> mutating).
+#  discord - zeroscript_discord/mcp_server.py TOOLS: status/list/get tools
+#            (create/edit/delete/set/assign/remove -> mutating).
+#  dominus - docs/DOMINUS_MCP.md only names dominus_status; the live catalogue
+#            is authoritative there, so the rest stays mutating (conservative).
+READ_ONLY_MCP_TOOLS: dict[str, set[str]] = {
+    "roblox": {
+        "list_roblox_studios", "get_studio_state", "search_game_tree",
+        "inspect_instance", "script_read", "screen_capture",
+    },
+    "bpy": {"bpy_status", "bpy_inspect_scene", "bpy_validate_glb"},
+    "discord": {
+        "discord_status", "discord_list_guilds", "discord_get_guild",
+        "discord_list_members", "discord_list_channels", "discord_get_channel",
+        "discord_list_roles",
+    },
+    "dominus": {"dominus_status"},
+}
+
+# How long a caller waits for another thread that is mid-start/restart of the
+# same server before giving up (start() itself can take ~40s: 30s initialize +
+# ~12s tools/list retries).
+MCP_START_WAIT_SECONDS = 60
+
+
+class _McpProcessGone(RuntimeError):
+    """The MCP server process exited / was stopped / was restarted while a
+    request was pending (or before it could be sent)."""
+
+
+class _PendingCall:
+    """One in-flight JSON-RPC request, waited on by exactly one caller thread."""
+    __slots__ = ("proc", "event", "msg", "error")
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.event = threading.Event()
+        self.msg = None
+        self.error = None
+
+
 class MCPClient:
     def __init__(self, server_id, command, args, env=None):
         self.id = server_id
@@ -806,13 +885,27 @@ class MCPClient:
         self.args = list(args or [])
         self.env = env or {}
         self.proc = None
+        # Requests are MULTIPLEXED over the one stdio pipe: any number may be
+        # pending at once, each waiting on its own _PendingCall (matched by id
+        # in the reader thread). Locks, finest first:
+        #  - id_lock:     the request-id counter
+        #  - write_lock:  one message at a time onto stdin (never held while waiting)
+        #  - pend_lock:   the pending map (and the per-process "closed" flag)
+        #  - mutate_lock: serializes MUTATING tools per server (see
+        #                 READ_ONLY_MCP_TOOLS); read-only tools never take it
+        #  - start_lock:  process lifecycle (start/restart); reentrant
         self.req_id = 1
+        self.id_lock = threading.Lock()
         self.write_lock = threading.Lock()
-        self.call_lock = threading.Lock()   # serialize tool calls (single stdio pipe)
-        self.pending = {}                    # id -> queue.Queue (one slot)
+        self.mutate_lock = threading.Lock()
+        self.pending = {}                    # id -> _PendingCall
         self.pend_lock = threading.Lock()
         self.tools_cache = []
-        self.start_lock = threading.Lock()
+        self.start_lock = threading.RLock()
+        # Set once the initialize handshake + first tools/list attempts are done.
+        # Callers block (bounded) on start_lock while it is clear because a start
+        # is in progress, so a tool call is never sent before 'initialize'.
+        self._ready = threading.Event()
         self._reader_thread = None
         # Crash-loop forensics (read by server_watch). The auto-restart used to
         # hide a server that something else kills over and over: the terminal
@@ -854,6 +947,7 @@ class MCPClient:
         with self.start_lock:
             if self.is_alive():
                 return
+            self._ready.clear()
             cmd = [self._resolve(self.command)] + [self._resolve(a) for a in self.args]
             # A bare .py command (relative paths resolve against the bridge dir)
             # is run with the SAME interpreter the bridge itself uses, so it works
@@ -907,53 +1001,97 @@ class MCPClient:
                     raise
                 else:
                     self.start_error = None
-                with self.pend_lock:
-                    self.pending.clear()
                 self.saw_foreign_ws_host = False  # fresh process, fresh verdict
                 self._reader_thread = threading.Thread(target=self._reader, args=(self.proc,), daemon=True)
                 self._reader_thread.start()
                 threading.Thread(target=self._stderr_drain, args=(self.proc,), daemon=True).start()
 
-                # MCP handshake.
-                self._request("initialize", {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "arcscript-bridge", "version": "1.0"},
-                }, timeout=30)
-                self._notify("notifications/initialized")
-                # Some MCP servers (notably Roblox's StudioMCP) advertise 0 tools at
-                # the instant initialize returns, because they connect to their
-                # backend (the running Studio) a moment AFTER the stdio handshake.
-                # A single tools/list then caches an empty list forever. So if we
-                # get nothing, retry for a few seconds to let the backend attach.
-                # Short per-attempt timeout so the bridge never looks frozen if the
-                # server stays silent (e.g. Studio not open yet); ~12s total budget.
-                for _ in range(12):
-                    if self.refresh_tools(timeout=3):
-                        break
-                    if not self.is_alive():
-                        break
-                    time.sleep(1.0)
+                try:
+                    # MCP handshake.
+                    self._request("initialize", {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "arcscript-bridge", "version": "1.0"},
+                    }, timeout=30)
+                    self._notify("notifications/initialized")
+                    # Some MCP servers (notably Roblox's StudioMCP) advertise 0 tools at
+                    # the instant initialize returns, because they connect to their
+                    # backend (the running Studio) a moment AFTER the stdio handshake.
+                    # A single tools/list then caches an empty list forever. So if we
+                    # get nothing, retry for a few seconds to let the backend attach.
+                    # Short per-attempt timeout so the bridge never looks frozen if the
+                    # server stays silent (e.g. Studio not open yet); ~12s total budget.
+                    for _ in range(12):
+                        if self.refresh_tools(timeout=3):
+                            break
+                        if not self.is_alive():
+                            break
+                        time.sleep(1.0)
+                finally:
+                    self._ready.set()
             log(f"[{self.id}] MCP server up  ({len(self.tools_cache)} tools advertised)", "cy")
 
     def is_alive(self):
-        return self.proc is not None and self.proc.poll() is None
+        proc = self.proc
+        return (proc is not None and proc.poll() is None
+                and not getattr(proc, "_zs_closed", False))
 
-    def restart(self):
-        log(f"[{self.id}] restarting...", "yl")
-        self.stop()
-        time.sleep(0.4)
-        self.start()
+    def is_ready(self):
+        """Alive AND past the initialize handshake (safe to send tool calls)."""
+        return self.is_alive() and self._ready.is_set()
 
-    def stop(self):
+    def restart(self, expected_proc=None):
+        """Stop + start under the lifecycle lock. With expected_proc (the process
+        a caller saw die), it is a no-op if another thread already replaced it, so
+        N concurrent callers that all notice a crash cause ONE restart, not N."""
+        with self.start_lock:
+            if expected_proc is not None and self.proc is not expected_proc and self.is_alive():
+                return
+            log(f"[{self.id}] restarting...", "yl")
+            self.stop()
+            time.sleep(0.4)
+            self.start()
+
+    def _ensure_running(self, wait=MCP_START_WAIT_SECONDS):
+        """Make sure a started, initialized process exists. If another thread is
+        starting/restarting it we wait (bounded) for that; if it is dead we
+        restart it (once, however many callers notice)."""
+        if self.is_ready():
+            return
+        if not self.start_lock.acquire(timeout=max(0.0, wait)):
+            raise TimeoutError(
+                f"server '{self.id}' is still starting/restarting; timed out after {wait}s")
+        try:
+            if not self.is_alive():
+                self.restart(expected_proc=self.proc)
+        finally:
+            self.start_lock.release()
+
+    def _fail_pending(self, proc, reason):
+        """Wake every request pending on `proc` (None = all) with an error, and
+        mark the process closed so requests registered afterwards fail fast
+        instead of waiting out their timeout for a reply that can never come."""
         with self.pend_lock:
-            for q in self.pending.values():
+            if proc is not None:
                 try:
-                    q.put_nowait(None)
+                    proc._zs_closed = True
                 except Exception:
                     pass
-            self.pending.clear()
-        if self.proc:
+            for entry in list(self.pending.values()):
+                if proc is None or entry.proc is proc:
+                    if entry.msg is None and entry.error is None:
+                        entry.error = reason
+                    entry.event.set()
+
+    def stop(self):
+        # Deliberately does NOT take start_lock: shutdown must not wait behind a
+        # ~40s start. Pending requests are failed first so callers see a clear
+        # error immediately; the process pointer is swapped last.
+        proc = self.proc
+        self._ready.clear()
+        self._fail_pending(proc, f"server '{self.id}' was stopped or restarted "
+                                 f"while this request was pending")
+        if proc:
             # proc.terminate() (TerminateProcess on Windows) only kills THIS
             # pid. Our command is often a wrapper (e.g. launch_studio_mcp.py)
             # that Popen()s a real child (StudioMCP.exe) to own the stdio
@@ -963,14 +1101,15 @@ class MCPClient:
             try:
                 if sys.platform == "win32":
                     subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                         capture_output=True, timeout=8,
                     )
                 else:
-                    self.proc.terminate()
+                    proc.terminate()
             except Exception:
                 pass
-        self.proc = None
+        if self.proc is proc:
+            self.proc = None
 
     # ── io threads ────────────────────────────────────────────────────────
     def _reader(self, proc):
@@ -990,24 +1129,20 @@ class MCPClient:
             except Exception:
                 continue  # stray non-JSON log on stdout
             mid = msg.get("id")
-            if mid is None:
-                continue  # server notification, nothing waits on it
+            if mid is None or "method" in msg:
+                continue  # notification / server->client request: nothing waits on it
             with self.pend_lock:
-                q = self.pending.get(mid)
-            if q is not None:
-                try:
-                    q.put_nowait(msg)
-                except Exception:
-                    pass
+                entry = self.pending.get(mid)
+                if entry is not None and entry.proc is proc:
+                    entry.msg = msg
+                    entry.event.set()
+            # no entry -> the caller already timed out; drop the late reply
         code = proc.poll()
-        self.last_exit = code  # kept for the crash-loop banner in server_watch
+        if self.proc is proc or self.proc is None:
+            self.last_exit = code  # kept for the crash-loop banner in server_watch
         log(f"[{self.id}] stdout closed (process ended, exit code {code})", "rd")
-        with self.pend_lock:
-            for q in self.pending.values():
-                try:
-                    q.put_nowait(None)
-                except Exception:
-                    pass
+        self._fail_pending(proc, f"server '{self.id}' exited (exit code {code}) "
+                                 f"while this request was pending")
 
     def _stderr_drain(self, proc):
         # Surface the child's stderr instead of silently discarding it - this
@@ -1036,87 +1171,132 @@ class MCPClient:
 
     # ── jsonrpc ───────────────────────────────────────────────────────────
     def _next_id(self):
-        with self.write_lock:
+        with self.id_lock:
             rid = self.req_id
             self.req_id += 1
             return rid
 
+    def _send(self, proc, payload):
+        """Write one JSON line to `proc`'s stdin; raise _McpProcessGone if the pipe is dead."""
+        data = json.dumps(payload) + "\n"
+        try:
+            with self.write_lock:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+        except (OSError, ValueError) as e:  # BrokenPipeError, closed file
+            raise _McpProcessGone(
+                f"server '{self.id}' is not running (could not write request: {e})") from e
+
     def _notify(self, method, params=None):
-        payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-        with self.write_lock:
-            self.proc.stdin.write(json.dumps(payload) + "\n")
-            self.proc.stdin.flush()
+        proc = self.proc
+        if proc is None:
+            raise _McpProcessGone(f"server '{self.id}' is not running")
+        self._send(proc, {"jsonrpc": "2.0", "method": method, "params": params or {}})
 
     def _request(self, method, params, timeout):
-        if not self.is_alive():
-            raise RuntimeError(f"server '{self.id}' is not running")
+        """Send a request and wait for ITS response. Returns the response dict, or
+        None on timeout (only this request's pending entry is dropped). Raises
+        _McpProcessGone if the process is not running, dies or is restarted first."""
+        proc = self.proc
+        if proc is None or not self.is_alive():
+            raise _McpProcessGone(f"server '{self.id}' is not running")
         rid = self._next_id()
-        q = queue.Queue(maxsize=1)
+        entry = _PendingCall(proc)
         with self.pend_lock:
-            self.pending[rid] = q
+            if getattr(proc, "_zs_closed", False):
+                raise _McpProcessGone(f"server '{self.id}' is not running")
+            self.pending[rid] = entry
         try:
-            payload = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}
-            with self.write_lock:
-                self.proc.stdin.write(json.dumps(payload) + "\n")
-                self.proc.stdin.flush()
-            try:
-                return q.get(timeout=timeout)
-            except queue.Empty:
+            self._send(proc, {"jsonrpc": "2.0", "id": rid, "method": method,
+                              "params": params or {}})
+            if not entry.event.wait(timeout):
                 return None
+            if entry.msg is not None:
+                return entry.msg
+            raise _McpProcessGone(entry.error or f"server '{self.id}' stopped")
         finally:
             with self.pend_lock:
                 self.pending.pop(rid, None)
 
     # ── high-level ────────────────────────────────────────────────────────
     def refresh_tools(self, timeout=20):
-        msg = self._request("tools/list", {}, timeout=timeout)
+        try:
+            msg = self._request("tools/list", {}, timeout=timeout)
+        except _McpProcessGone:
+            return self.tools_cache
         if msg and "result" in msg:
             self.tools_cache = msg["result"].get("tools", [])
         return self.tools_cache
 
+    def is_read_only_tool(self, name):
+        name = str(name or "")
+        bare = name.split("/", 1)[1] if name.startswith(self.id + "/") else name
+        return bare in READ_ONLY_MCP_TOOLS.get(self.id, ())
+
     def call_tool(self, name, arguments, timeout):
-        """Returns {"text":..., "images":[...]}. Raises on error/timeout."""
-        with self.call_lock:
-            for attempt in (1, 2):
-                if not self.is_alive():
-                    self.restart()
+        """Returns {"text":..., "images":[...]}. Raises on error/timeout.
+
+        Read-only tools (READ_ONLY_MCP_TOOLS) run fully in parallel. Mutating
+        tools take mutate_lock, so changes to one server happen one at a time;
+        the wait for that lock counts against `timeout`."""
+        if self.is_read_only_tool(name):
+            return self._call_tool(name, arguments, timeout)
+        wait = -1 if timeout is None else max(0.0, float(timeout))
+        if not self.mutate_lock.acquire(timeout=wait):
+            raise TimeoutError(
+                f"{self.id} is busy with another change; timed out after {timeout}s")
+        try:
+            return self._call_tool(name, arguments, timeout)
+        finally:
+            self.mutate_lock.release()
+
+    def _call_tool(self, name, arguments, timeout):
+        for attempt in (1, 2):
+            proc = None
+            try:
+                self._ensure_running()
+                proc = self.proc
                 msg = self._request("tools/call",
                                     {"name": name, "arguments": arguments}, timeout)
-                if msg is None:
-                    if not self.is_alive():
-                        self.restart()
-                        msg = self._request("tools/call",
-                                            {"name": name, "arguments": arguments}, timeout)
-                    if msg is None:
-                        raise TimeoutError(
-                            f"No response from server '{self.id}' after {timeout}s.")
-                if msg.get("error"):
-                    err = msg["error"]
-                    err_text = err.get("message", json.dumps(err))
-                    if attempt == 1 and _looks_like_transient_studio_drop(err_text):
-                        log(f"[{self.id}] {name}: transient Studio drop, retrying once...", "yl")
-                        time.sleep(1.5)
-                        continue
-                    raise RuntimeError(err_text)
-                content = msg.get("result", {}).get("content", [])
-                text = "\n".join(it.get("text", "") for it in content if it.get("type") == "text")
-                images = [{"data": it["data"], "mimeType": it.get("mimeType", "image/jpeg")}
-                          for it in content if it.get("type") == "image" and it.get("data")]
-                if not text and not images and content:
-                    text = json.dumps(content)[:4000]
-                # Studio's own MCP proxy briefly loses its binding to the Studio
-                # app every few seconds on some machines (seen live: repeated
-                # "Bound studio ... disconnected for proxy ..." stderr, self-
-                # healing within ~1-4s). A tool call landing in that window
-                # fails with a "no Studio instance connected" style message
-                # even though Studio is genuinely open - confirmed live via
-                # start_stop_play. One short retry rides through it instead of
-                # surfacing a spurious error to the user.
-                if attempt == 1 and _looks_like_transient_studio_drop(text):
+            except _McpProcessGone as e:
+                # Died / restarted under us (possibly another caller's
+                # restart): retry once on a fresh process, else surface it.
+                if attempt == 1:
+                    log(f"[{self.id}] {name}: {e}; retrying once...", "yl")
+                    continue
+                raise
+            if msg is None:
+                if attempt == 1 and proc is not None and not self.is_alive():
+                    continue
+                raise TimeoutError(
+                    f"No response from server '{self.id}' after {timeout}s.")
+            if msg.get("error"):
+                err = msg["error"]
+                err_text = err.get("message", json.dumps(err))
+                if attempt == 1 and _looks_like_transient_studio_drop(err_text):
                     log(f"[{self.id}] {name}: transient Studio drop, retrying once...", "yl")
                     time.sleep(1.5)
                     continue
-                return {"text": text, "images": images}
+                raise RuntimeError(err_text)
+            content = msg.get("result", {}).get("content", [])
+            text = "\n".join(it.get("text", "") for it in content if it.get("type") == "text")
+            images = [{"data": it["data"], "mimeType": it.get("mimeType", "image/jpeg")}
+                      for it in content if it.get("type") == "image" and it.get("data")]
+            if not text and not images and content:
+                text = json.dumps(content)[:4000]
+            # Studio's own MCP proxy briefly loses its binding to the Studio
+            # app every few seconds on some machines (seen live: repeated
+            # "Bound studio ... disconnected for proxy ..." stderr, self-
+            # healing within ~1-4s). A tool call landing in that window
+            # fails with a "no Studio instance connected" style message
+            # even though Studio is genuinely open - confirmed live via
+            # start_stop_play. One short retry rides through it instead of
+            # surfacing a spurious error to the user.
+            if attempt == 1 and _looks_like_transient_studio_drop(text):
+                log(f"[{self.id}] {name}: transient Studio drop, retrying once...", "yl")
+                time.sleep(1.5)
+                continue
+            return {"text": text, "images": images}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1389,7 +1569,8 @@ class MCPManager:
                     "goal": {"type": "string", "minLength": 1, "maxLength": 12000},
                     "context": {"type": "string", "maxLength": 40000, "default": ""},
                     "plan": {"type": "array", "maxItems": 80, "items": {"type": "string", "maxLength": 2000}, "default": []},
-                    "acceptance_criteria": {"type": "array", "maxItems": 80, "items": {"type": "string", "maxLength": 2000}, "default": []}
+                    "acceptance_criteria": {"type": "array", "maxItems": 80, "items": {"type": "string", "maxLength": 2000}, "default": []},
+                    "target_session_id": {"type": "string", "maxLength": 200, "description": "Optional. Hand off to this specific armed CLI session. Armed CLI session ids are listed by zeroscript_agent_control_status (armed_cli_sessions). Omit to let the bridge pick the longest-armed CLI on this workspace."}
                 }, "required": ["goal"], "additionalProperties": False},
                 "server": "zeroscript-control"
             },
@@ -1424,11 +1605,18 @@ class MCPManager:
             if len(history) >= 10:
                 break
         self.workspace_history = history
+        # A session-scoped manager copy (see _scoped_manager) must not change
+        # the saved default root; it only contributes to the shared history.
+        scope_parent = getattr(self, "_scope_parent", None)
+        saved_root = selected_root
+        if scope_parent is not None:
+            scope_parent.workspace_history = history
+            saved_root = scope_parent.workspace_root if scope_parent.workspace_configured else ""
         if persist:
             try:
                 temp_path = self.workspace_settings_path + ".tmp"
                 with open(temp_path, "w", encoding="utf-8") as fp:
-                    json.dump({"root": selected_root, "recent_roots": history}, fp, ensure_ascii=False, indent=2)
+                    json.dump({"root": saved_root, "recent_roots": history}, fp, ensure_ascii=False, indent=2)
                 os.replace(temp_path, self.workspace_settings_path)
             except OSError as exc:
                 raise RuntimeError(f"The folder is valid, but workspace settings could not be saved: {exc}") from exc
@@ -1803,12 +1991,22 @@ class MCPManager:
         if name == "zeroscript_handoff_to_cli":
             if agent_control is None:
                 raise RuntimeError("ZeroScript agent-control module is unavailable.")
-            result = agent_control.handoff(arguments or {}, self._workspace_description())
+            origin = getattr(self, "_session_id", None)
+            if not origin:
+                raise RuntimeError("A session ID is required to hand off a task.")
+            result = agent_control.handoff(
+                args, self._workspace_description(),
+                origin_session_id=origin, target_session_id=args.get("target_session_id"))
             return {"text": json.dumps(result, ensure_ascii=False, indent=2), "images": []}
         if name == "zeroscript_agent_control_status":
             if agent_control is None:
                 raise RuntimeError("ZeroScript agent-control module is unavailable.")
-            return {"text": json.dumps(agent_control.status(), ensure_ascii=False, indent=2), "images": []}
+            state = agent_control.status()
+            state["armed_cli_sessions"] = [
+                {"session_id": s.get("session_id"), "workspace": s.get("workspace"), "armed_at": s.get("armed_at")}
+                for s in agent_control.armed_sessions()
+            ]
+            return {"text": json.dumps(state, ensure_ascii=False, indent=2), "images": []}
         if name == "roblox_export_tree":
             if export_roblox_tree is None:
                 raise RuntimeError("Roblox tree exporter could not be imported. Check workspace_agent/roblox_export.py.")
@@ -1935,13 +2133,137 @@ mgr = MCPManager()
 clients = set()
 client_roles = {}
 client_inflight = {}
-# A browser-to-CLI handoff is allowed only while a configured CLI is waiting.
-# Keys are WebSocket objects; handler cleanup removes stale arm records.
-client_takeover_armed = {}
 agent_control = AgentControlStore() if AgentControlStore is not None else None
-# Serializes tool admission with run ownership transitions. The tool itself runs
-# outside this lock; only the ownership check and in-flight counter are atomic.
+# Guards ledger transitions (arm/claim/handoff/...). Tools themselves run
+# outside this lock; only admission checks and the in-flight counter are atomic.
 agent_control_lock = asyncio.Lock()
+
+# ── Per-connection sessions ────────────────────────────────────────────────
+# One WebSocket may carry many sessions (the extension multiplexes every tab
+# over one socket, a CLI may run sub-agents). Each call_tool may name its own
+# session_id; otherwise the connection's default session is used.
+client_sessions = {}   # ws -> {"default": session_id, "seen": set(session_id)}
+session_owner = {}     # session_id -> ws that most recently used it
+session_roots = {}     # session_id -> workspace root chosen by that session
+tool_limiter = (
+    InflightLimiter(**load_limits(_read_config()))
+    if InflightLimiter is not None and load_limits is not None else None
+)
+
+
+def _clean_session_id(value):
+    if isinstance(value, (str, int)) and not isinstance(value, bool):
+        return str(value).strip()[:200]
+    return ""
+
+
+def _new_session_id(role, legacy=False):
+    return f"{role}{'-legacy' if legacy else ''}-{uuid.uuid4().hex[:8]}"
+
+
+def _load_snapshot():
+    """In-flight/queue counts and limits, for health/status payloads."""
+    snap = tool_limiter.snapshot() if tool_limiter is not None else {}
+    snap["connections"] = len(clients)
+    snap["sessions_known"] = len(session_owner)
+    return snap
+
+
+def _register_session_sync(session_id, role):
+    if agent_control is None:
+        return
+    try:
+        agent_control.register_session(session_id, role, session_roots.get(session_id))
+    except Exception as exc:
+        log(f"could not register session {session_id}: {exc}", "yl", terminal=False)
+
+
+async def _note_session(ws, session_id):
+    """Remember that this socket uses session_id; register it on first sight."""
+    info = client_sessions.get(ws)
+    if info is None or not session_id:
+        return
+    session_owner[session_id] = ws
+    if session_id in info["seen"]:
+        return
+    info["seen"].add(session_id)
+    await asyncio.to_thread(_register_session_sync, session_id, client_roles.get(ws, "browser"))
+
+
+def _release_sessions_sync(info, ws, role):
+    """Disconnect cleanup. Returns True if a queued handoff was cancelled."""
+    cancelled = False
+    for session_id in list(info["seen"]):
+        if session_owner.get(session_id) is not ws:
+            continue  # a reconnected socket took this session over
+        session_owner.pop(session_id, None)
+        session_roots.pop(session_id, None)
+        if agent_control is None:
+            continue
+        try:
+            if role == "browser":
+                for run in agent_control.status().get("runs", []):
+                    if run.get("origin_session") == session_id and run.get("state") == "queued":
+                        agent_control.request_stop(run.get("run_id"))
+                        cancelled = True
+            agent_control.unregister_session(session_id)
+        except Exception as exc:
+            log(f"could not release session {session_id}: {exc}", "yl", terminal=False)
+    return cancelled
+
+
+def _cleanup_persisted_sessions():
+    """Armed flags persist across restarts but their sockets are gone."""
+    if agent_control is None:
+        return
+    try:
+        for session in agent_control.status().get("sessions", []):
+            sid = session.get("session_id")
+            if session.get("armed"):
+                agent_control.disarm(sid)
+            agent_control.unregister_session(sid)
+    except Exception as exc:
+        log(f"could not clean persisted sessions: {exc}", "yl")
+
+def _path_key(path):
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    return os.path.normcase(os.path.abspath(path.strip()))
+
+
+def _resolve_session_root(session_id, explicit=None):
+    """Workspace root for a session: explicit > session choice > ledger > global default."""
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    root = session_roots.get(session_id)
+    if root:
+        return root
+    if agent_control is not None:
+        for session in agent_control.status().get("sessions", []):
+            if session.get("session_id") == session_id and session.get("workspace"):
+                return session["workspace"]
+    description = mgr._workspace_description()
+    return str(description.get("root") or "") if description.get("configured") is True else ""
+
+
+def _handoff_unavailable_reason(args, workspace_root, session_id):
+    """None when a handoff can be queued; otherwise why the browser keeps control."""
+    if agent_control is None:
+        return "ZeroScript agent-control module is unavailable."
+    target = (args or {}).get("target_session_id")
+    if isinstance(target, str) and target.strip():
+        return None  # the ledger validates that it is a registered CLI session
+    description = _scoped_manager(session_id, workspace_root)._workspace_description()
+    root = str(description.get("root") or "") if description.get("configured") is not False else ""
+    key = _path_key(root)
+    if any(_path_key(s.get("workspace")) == key for s in agent_control.armed_sessions()):
+        return None
+    return (
+        "No configured ZeroScript CLI session on this workspace is waiting for takeover. "
+        "Start the CLI, configure its model endpoint, and run /takeover first. "
+        "This handoff was not queued; the browser agent retains control."
+    )
+
 
 # ── Studio connectivity probe ──────────────────────────────────────────────
 # The MCP server process stays alive even when Roblox Studio is closed or its
@@ -1974,11 +2296,10 @@ def _probe_tool_text(tool):
     if entry is None:
         return None
     holder, real_name = entry
-    # Never queue behind a long-running tool call (the probe is best-effort).
-    if not holder.call_lock.acquire(blocking=False):
-        return None
+    # Probes are read-only, so they are multiplexed alongside any running tool
+    # call (no lock, no queueing behind long-running ones) with a short timeout.
     try:
-        if not holder.is_alive():
+        if not holder.is_ready():
             return None
         msg = holder._request("tools/call", {"name": real_name, "arguments": {}}, timeout=8)
         if not msg or msg.get("error"):
@@ -1987,8 +2308,6 @@ def _probe_tool_text(tool):
         return "\n".join(it.get("text", "") for it in content if it.get("type") == "text")
     except Exception:
         return None
-    finally:
-        holder.call_lock.release()
 
 
 def probe_studio():
@@ -2031,56 +2350,99 @@ def probe_studio():
     return {"app": True, "place": place}
 
 
-def safe_call(name, arguments, timeout, workspace_root=None):
-    """Execute a tool in an optional per-call workspace without mutating global state."""
+def _scoped_manager(session_id, workspace_root=None):
+    """Return a shallow copy of the global manager bound to a session's
+    workspace (call root > session root > global default) without mutating
+    the global manager. EVERY workspace-dependent tool reads self.workspace_root
+    and self.workspace, so dispatching through the copy scopes all of them."""
+    target = copy.copy(mgr)
+    target._scope_parent = mgr
+    target._session_id = session_id
+    root = workspace_root or session_roots.get(session_id)
+    if not root:
+        return target
+    if Workspace is None:
+        raise RuntimeError("Workspace tools could not be imported.")
     try:
-        target = mgr
-        if workspace_root and (name.startswith("workspace_") or name == "workspace_preview_image" or name == "roblox_export_tree"):
-            if Workspace is None:
-                raise RuntimeError("Workspace tools could not be imported.")
-            scoped_workspace = Workspace(workspace_root)
-            target = copy.copy(mgr)
-            target.workspace = scoped_workspace
-            target.workspace_root = str(scoped_workspace.root)
-            target.workspace_configured = True
-            target.workspace_source = "conversation"
-            target.workspace_error = None
-        if name == "workspace_info":
-            result = {"text": json.dumps(target._workspace_description(), ensure_ascii=False), "images": []}
-        elif name == "workspace_recent_roots":
-            result = {"text": json.dumps(target._call_workspace(name, arguments or {}), ensure_ascii=False), "images": []}
-        else:
-            result = target.call(name, arguments, timeout)
+        scoped_workspace = Workspace(root)
+    except Exception as exc:
+        if workspace_root:
+            raise
+        # The session's remembered folder vanished: keep the session scoped
+        # but unconfigured so it can pick another one with workspace_set_root.
+        target.workspace = None
+        target.workspace_root = str(root)
+        target.workspace_configured = False
+        target.workspace_source = "invalid"
+        target.workspace_error = str(exc)
+        return target
+    target.workspace = scoped_workspace
+    target.workspace_root = str(scoped_workspace.root)
+    target.workspace_configured = True
+    target.workspace_source = "conversation" if workspace_root else "session"
+    target.workspace_error = None
+    return target
+
+
+def safe_call(name, arguments, timeout, workspace_root=None, session_id=None):
+    """Execute a tool in the calling session's workspace without mutating global state."""
+    session_id = session_id or "bridge"
+    try:
+        target = _scoped_manager(session_id, workspace_root)
+        with lock_owner(session_id):
+            if name == "workspace_info":
+                result = {"text": json.dumps(target._workspace_description(), ensure_ascii=False), "images": []}
+            elif name == "workspace_recent_roots":
+                result = {"text": json.dumps(target._call_workspace(name, arguments or {}), ensure_ascii=False), "images": []}
+            else:
+                result = target.call(name, arguments, timeout)
+        if name in ("workspace_set_root", "workspace_open_recent") and target.workspace_configured:
+            # Selection belongs to this session only; the global default is untouched.
+            session_roots[session_id] = target.workspace_root
+            if agent_control is not None:
+                try:
+                    agent_control.set_session_workspace(session_id, target.workspace_root)
+                except Exception as exc:
+                    log(f"could not record workspace for {session_id}: {exc}", "yl", terminal=False)
         return {"ok": True, "text": result["text"], "images": result["images"]}
+    except FileLockTimeout as e:
+        return {"ok": False, "error": str(e), "kind": "file_locked"}
     except TimeoutError as e:
         return {"ok": False, "error": str(e), "kind": "timeout"}
     except Exception as e:
         return {"ok": False, "error": str(e), "kind": type(e).__name__}
 
 
-async def run_tool_task(ws, name, args, timeout, rid, role, workspace_root=None):
+async def _execute_tool(name, args, timeout, role, workspace_root, session_id):
+    """Run one admitted tool call (limiter slot already held)."""
+    if name == "zeroscript_handoff_to_cli" and role == "browser":
+        # Recheck CLI readiness while holding the ledger lock used by
+        # arm/disarm/claim, so a CLI that disarms between admission and the
+        # handoff actually queueing cannot leave an orphaned queued run.
+        async with agent_control_lock:
+            try:
+                reason = await asyncio.to_thread(_handoff_unavailable_reason, args, workspace_root, session_id)
+            except Exception as exc:
+                reason = str(exc)
+            if reason is None:
+                return await asyncio.to_thread(safe_call, name, args, timeout, workspace_root, session_id)
+            return {"ok": False, "kind": "control", "error": reason}
+    return await asyncio.to_thread(safe_call, name, args, timeout, workspace_root, session_id)
+
+
+async def run_tool_task(ws, name, args, timeout, rid, role, workspace_root=None, session_id=None):
     """Execute one tool off the socket read loop; always settle in-flight accounting."""
     t0 = time.monotonic()
+    session_id = session_id or "bridge"
     try:
-        if name == "zeroscript_handoff_to_cli" and role == "browser":
-            # Recheck the CLI readiness while holding the same lock used by
-            # disarm/claim. This closes the race where the CLI exits between
-            # request admission and the handoff tool actually queueing state.
-            async with agent_control_lock:
-                cli_ready = any(
-                    client_roles.get(client) == "cli" and bool(client_takeover_armed.get(client))
-                    for client in clients
-                )
-                if cli_ready:
-                    res = await asyncio.to_thread(safe_call, name, args, timeout, workspace_root)
-                else:
-                    res = {
-                        "ok": False,
-                        "kind": "control",
-                        "error": "No configured CLI is waiting for takeover. The handoff was not queued; the browser agent retains control.",
-                    }
-        else:
-            res = await asyncio.to_thread(safe_call, name, args, timeout)
+        try:
+            if tool_limiter is not None:
+                async with tool_limiter.slot(session_id):
+                    res = await _execute_tool(name, args, timeout, role, workspace_root, session_id)
+            else:
+                res = await _execute_tool(name, args, timeout, role, workspace_root, session_id)
+        except BusyError as exc:
+            res = {"ok": False, "kind": "busy", "error": str(exc)}
         elapsed = time.monotonic() - t0
         tag = "gr" if res.get("ok") else "rd"
         summary = (res.get("text") or res.get("error") or "")[:80].replace("\\n", " ")
@@ -2111,6 +2473,8 @@ def _connected_status_payload(studio, studio_proc):
         "tools": mgr.list_tools(),
         "workspace": mgr._workspace_description(),
         "agent_control": agent_control.status() if agent_control is not None else {},
+        "protocol_version": PROTOCOL_VERSION,
+        "load": _load_snapshot(),
         "port": PORT,
     })
 
@@ -2142,7 +2506,7 @@ async def broadcast_status():
 
 
 async def broadcast_agent_control():
-    """Push ownership changes so the browser agent can stop when CLI takes over."""
+    """Push ledger changes (runs and sessions) to every browser and CLI client."""
     if agent_control is None:
         return
     try:
@@ -2152,8 +2516,6 @@ async def broadcast_agent_control():
         log(f"agent-control broadcast failed: {exc}", "rd")
         return
     for client in list(clients):
-        if client_roles.get(client) != "browser":
-            continue
         try:
             await client.send(payload)
         except Exception:
@@ -2165,6 +2527,7 @@ async def handler(ws):
     clients.add(ws)
     client_roles[ws] = "browser"
     client_inflight[ws] = 0
+    client_sessions[ws] = {"default": _new_session_id("browser", legacy=True), "seen": set()}
     log(f"client connected  ({peer})  [{len(clients)} client(s)]", "gr")
     try:
         _st = await asyncio.to_thread(probe_studio)
@@ -2177,6 +2540,8 @@ async def handler(ws):
             "tools": mgr.list_tools(),
             "workspace": mgr._workspace_description(),
             "agent_control": agent_control.status() if agent_control is not None else {},
+            "protocol_version": PROTOCOL_VERSION,
+            "load": _load_snapshot(),
             "port": PORT,
         }))
         async for raw in ws:
@@ -2191,112 +2556,114 @@ async def handler(ws):
                 requested = msg.get("client")
                 if requested in ("browser", "cli"):
                     client_roles[ws] = requested
-                await ws.send(json.dumps({"type": "client_registered", "client": client_roles.get(ws, "browser")}))
+                reg_role = client_roles.get(ws, "browser")
+                version = msg.get("protocol_version")
+                if version is not None and (isinstance(version, bool) or version != PROTOCOL_VERSION):
+                    log(f"rejected {reg_role} client: protocol_version {version!r} != {PROTOCOL_VERSION}", "yl")
+                    await ws.send(json.dumps({
+                        "type": "client_registered", "id": rid, "ok": False,
+                        "error": "protocol_mismatch", "expected": PROTOCOL_VERSION,
+                        "message": f"Update your ZeroScript extension/CLI: bridge speaks protocol {PROTOCOL_VERSION}.",
+                    }))
+                    await ws.close(code=1002, reason="protocol_mismatch")
+                    return
+                reg_session = _clean_session_id(msg.get("session_id"))
+                if version is None:
+                    log(f"{reg_role} client registered without protocol_version (legacy); accepting", "yl")
+                    reg_session = reg_session or _new_session_id(reg_role, legacy=True)
+                else:
+                    reg_session = reg_session or _new_session_id(reg_role)
+                client_sessions[ws]["default"] = reg_session
+                await _note_session(ws, reg_session)
+                await ws.send(json.dumps({
+                    "type": "client_registered", "id": rid, "ok": True, "client": reg_role,
+                    "session_id": reg_session, "protocol_version": PROTOCOL_VERSION,
+                }))
 
             elif mtype == "agent_control_status":
                 try:
-                    state = await asyncio.to_thread(agent_control.status) if agent_control is not None else {}
+                    flt = _clean_session_id(msg.get("filter_session"))
+                    state = await asyncio.to_thread(agent_control.status, flt or None) if agent_control is not None else {}
                     await ws.send(json.dumps({"type": "agent_control_result", "id": rid, "ok": True, "control": state}))
                 except Exception as exc:
                     await ws.send(json.dumps({"type": "agent_control_result", "id": rid, "ok": False, "error": str(exc)}))
 
             elif mtype in ("agent_arm", "agent_disarm", "agent_claim", "agent_start", "agent_heartbeat", "agent_complete", "agent_stop", "agent_yield"):
-                if client_roles.get(ws, "browser") != "cli":
+                ctl_role = client_roles.get(ws, "browser")
+                # A browser may only cancel a run it originated (agent_stop);
+                # every other control action belongs to the registered CLI.
+                if ctl_role != "cli" and mtype != "agent_stop":
                     await ws.send(json.dumps({"type": "agent_control_result", "id": rid, "ok": False, "error": "This control action is available only to the registered CLI client."}))
                     continue
+                ctl_session = _clean_session_id(msg.get("session_id")) or client_sessions[ws]["default"]
+                await _note_session(ws, ctl_session)
+                payload = {}
                 try:
                     if agent_control is None:
                         raise RuntimeError("ZeroScript agent-control module is unavailable.")
                     async with agent_control_lock:
                         if mtype == "agent_arm":
-                            arm_session = str(msg.get("session_id") or "").strip()
-                            if not arm_session:
-                                raise RuntimeError("A session ID is required to arm CLI takeover.")
-                            current_control = await asyncio.to_thread(agent_control.status)
-                            if current_control.get("owner") == "cli" and current_control.get("state") in {"active", "stop_requested"}:
-                                raise RuntimeError("The CLI already owns an active run; finish or stop it before arming another takeover.")
-                            another_waiter = any(
-                                client is not ws
-                                and client_roles.get(client) == "cli"
-                                and bool(client_takeover_armed.get(client))
-                                for client in clients
-                            )
-                            if another_waiter:
-                                raise RuntimeError("Another CLI session is already armed and waiting for takeover.")
-                            client_takeover_armed[ws] = arm_session
-                            payload = {"ok": True, "control": current_control, "armed": True}
+                            session = await asyncio.to_thread(
+                                lambda: agent_control.arm(
+                                    ctl_session, _resolve_session_root(ctl_session, msg.get("workspace_root"))))
+                            payload = {"ok": True, "run": None, "armed": True, "session": session}
                         elif mtype == "agent_disarm":
-                            requested_session = str(msg.get("session_id") or "").strip()
-                            active_arm = client_takeover_armed.get(ws)
-                            if active_arm and requested_session and requested_session != active_arm:
-                                raise RuntimeError("The requested session does not match the armed CLI session.")
-                            current_control = await asyncio.to_thread(agent_control.status)
-                            another_waiter = any(
-                                client is not ws
-                                and client_roles.get(client) == "cli"
-                                and bool(client_takeover_armed.get(client))
-                                for client in clients
-                            )
-                            if active_arm and current_control.get("state") == "queued" and not another_waiter:
-                                # If the only waiter exits before claiming, cancel
-                                # the queued handoff so the browser is not left paused.
-                                current_control = await asyncio.to_thread(
-                                    agent_control.request_stop, current_control.get("run_id")
-                                )
-                            client_takeover_armed.pop(ws, None)
-                            payload = {"ok": True, "control": current_control, "armed": False}
+                            session = await asyncio.to_thread(agent_control.disarm, ctl_session)
+                            payload = {"ok": True, "run": None, "armed": False, "session": session}
                         elif mtype == "agent_claim":
-                            current_control = await asyncio.to_thread(agent_control.status)
-                            selected_workspace = mgr._workspace_description()
-                            expected_root = str(current_control.get("workspace") or "")
-                            selected_root = str(selected_workspace.get("root") or "") if selected_workspace.get("configured") is True else ""
-                            if expected_root and os.path.normcase(os.path.abspath(expected_root)) != os.path.normcase(os.path.abspath(selected_root)):
-                                raise RuntimeError("The selected workspace no longer matches the queued run. Restore the original project folder before claiming or resuming this task.")
-                            browser_busy = any(
-                                client_roles.get(client) == "browser" and count > 0
-                                for client, count in client_inflight.items()
-                            )
-                            result = await asyncio.to_thread(agent_control.claim, msg.get("session_id", ""), msg.get("run_id"), not browser_busy)
-                            payload = {"ok": bool(result.get("ok")), "control": result.get("control") or {}, "error": result.get("error"), "busy": bool(result.get("busy"))}
+                            claim_run_id = msg.get("run_id") or None
+                            claim_root = await asyncio.to_thread(_resolve_session_root, ctl_session, msg.get("workspace_root"))
+                            if claim_run_id:
+                                wanted = await asyncio.to_thread(agent_control.run, claim_run_id)
+                                run_root = str((wanted or {}).get("workspace") or "")
+                                if wanted and run_root and _path_key(run_root) != _path_key(claim_root):
+                                    raise RuntimeError(
+                                        "The selected workspace no longer matches the queued run "
+                                        f"(run: {run_root}; this session: {claim_root or 'none'}). "
+                                        "Restore the original project folder before claiming or resuming this task.")
+                            if claim_root:
+                                await asyncio.to_thread(agent_control.set_session_workspace, ctl_session, claim_root)
+                            result = await asyncio.to_thread(agent_control.claim, ctl_session, claim_run_id)
+                            payload = {"ok": bool(result.get("ok")), "run": result.get("run"), "error": result.get("error")}
                         elif mtype == "agent_start":
-                            browser_busy = any(
-                                client_roles.get(client) == "browser" and count > 0
-                                for client, count in client_inflight.items()
-                            )
-                            if browser_busy:
-                                raise RuntimeError("A browser tool call is still in flight. Wait for it to finish before starting a direct CLI task.")
-                            state = await asyncio.to_thread(
+                            description = await asyncio.to_thread(
+                                lambda: _scoped_manager(ctl_session, msg.get("workspace_root"))._workspace_description())
+                            run = await asyncio.to_thread(
                                 agent_control.start_run,
                                 {"goal": msg.get("goal", ""), "context": msg.get("context", ""),
                                  "plan": msg.get("plan") or [], "acceptance_criteria": msg.get("acceptance_criteria") or []},
-                                mgr._workspace_description(), msg.get("session_id", ""))
-                            payload = {"ok": True, "control": state}
+                                description, ctl_session)
+                            payload = {"ok": True, "run": run}
                         elif mtype == "agent_heartbeat":
-                            state = await asyncio.to_thread(agent_control.heartbeat, msg.get("run_id", ""), msg.get("session_id", ""), msg.get("progress"))
-                            payload = {"ok": True, "control": state}
+                            run = await asyncio.to_thread(agent_control.heartbeat, msg.get("run_id", ""), ctl_session, msg.get("progress"))
+                            payload = {"ok": True, "run": run}
                         elif mtype == "agent_complete":
-                            state = await asyncio.to_thread(agent_control.finish, msg.get("run_id", ""), msg.get("session_id", ""), msg.get("status", "completed"), msg.get("summary", ""))
-                            payload = {"ok": True, "control": state}
+                            run = await asyncio.to_thread(agent_control.finish, msg.get("run_id", ""), ctl_session, msg.get("status", "completed"), msg.get("summary", ""))
+                            payload = {"ok": True, "run": run}
                         elif mtype == "agent_stop":
-                            state = await asyncio.to_thread(agent_control.request_stop, msg.get("run_id"))
-                            payload = {"ok": True, "control": state}
-                        else:
-                            cli_busy = any(
-                                client_roles.get(client) == "cli" and count > 0
-                                for client, count in client_inflight.items()
-                            )
-                            if cli_busy:
-                                raise RuntimeError("A CLI tool call is still in flight. Wait for it to finish before returning control to the browser.")
-                            state = await asyncio.to_thread(agent_control.yield_to_browser, msg.get("run_id", ""), msg.get("session_id", ""), msg.get("summary", ""))
-                            payload = {"ok": True, "control": state}
+                            stop_id = msg.get("run_id")
+                            if ctl_role != "cli":
+                                target_run = await asyncio.to_thread(agent_control.run, stop_id)
+                                if target_run is None or target_run.get("origin_session") != ctl_session:
+                                    raise RuntimeError("Only the session that handed off this run (or the CLI) can stop it.")
+                            run = await asyncio.to_thread(agent_control.request_stop, stop_id)
+                            payload = {"ok": True, "run": run}
+                        else:  # agent_yield
+                            in_flight = tool_limiter.active(ctl_session) if tool_limiter is not None else 0
+                            if in_flight > 0:
+                                raise RuntimeError(
+                                    f"This CLI session still has {in_flight} tool call(s) in flight. "
+                                    "Wait for them to finish before returning control to the browser.")
+                            run = await asyncio.to_thread(agent_control.yield_to_browser, msg.get("run_id", ""), ctl_session, msg.get("summary", ""))
+                            payload = {"ok": True, "run": run}
                 except Exception as exc:
-                    payload = {"ok": False, "error": str(exc)}
-                if payload.get("ok") and mtype == "agent_claim":
-                    # Ownership is now persisted; this session no longer needs
-                    # to advertise itself as waiting for a future handoff.
-                    client_takeover_armed.pop(ws, None)
-                await ws.send(json.dumps({"type": "agent_control_result", "id": rid, **payload}))
-                if payload.get("ok") and mtype not in {"agent_heartbeat", "agent_arm"}:
+                    payload = {"ok": False, "run": None, "error": str(exc)}
+                try:
+                    control_now = await asyncio.to_thread(agent_control.status) if agent_control is not None else {}
+                except Exception:
+                    control_now = {}
+                await ws.send(json.dumps({"type": "agent_control_result", "id": rid, "control": control_now, **payload}))
+                if payload.get("ok") and mtype != "agent_heartbeat":
                     await broadcast_agent_control()
 
             elif mtype == "ping":
@@ -2310,6 +2677,7 @@ async def handler(ws):
                     "studio_proc": await asyncio.to_thread(_roblox_studio_app_running),
                     "workspace": mgr._workspace_description(),
             "agent_control": agent_control.status() if agent_control is not None else {},
+                    "load": _load_snapshot(),
                     "mcp_alive": mgr.any_alive(),
                 }))
 
@@ -2358,21 +2726,12 @@ async def handler(ws):
                     }))
                     continue
                 role = client_roles.get(ws, "browser")
+                session_id = _clean_session_id(msg.get("session_id")) or client_sessions[ws]["default"]
+                await _note_session(ws, session_id)
                 blocked_reason = None
                 async with agent_control_lock:
-                    if role == "browser" and name == "zeroscript_handoff_to_cli":
-                        cli_ready = any(
-                            client_roles.get(client) == "cli" and bool(client_takeover_armed.get(client))
-                            for client in clients
-                        )
-                        if not cli_ready:
-                            blocked_reason = (
-                                "No configured ZeroScript CLI is waiting for takeover. "
-                                "Start the CLI, configure its model endpoint, and run /takeover first. "
-                                "This handoff was not queued; the browser agent retains control."
-                            )
                     if (blocked_reason is None and role == "browser" and agent_control is not None
-                            and not agent_control.browser_tool_allowed(name)):
+                            and not agent_control.browser_tool_allowed(name, session_id)):
                         blocked_reason = (
                             "The independent CLI agent currently owns this task, or a handoff is already queued. "
                             "Browser-originated tool calls are paused until control is released."
@@ -2397,7 +2756,7 @@ async def handler(ws):
                 # The extension only ever has ONE call_tool in flight (its agent
                 # loop awaits each result before sending the next), so this never
                 # overlaps tool executions.
-                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid, role, msg.get("workspace_root")))
+                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid, role, msg.get("workspace_root"), session_id))
 
             elif mtype in ("add_server", "remove_server"):
                 # Adding/removing an addon MCP server rewrites config.json, which
@@ -2479,26 +2838,20 @@ async def handler(ws):
         log(f"handler error: {e}", "rd")
     finally:
         should_broadcast_control = False
-        # Serialize disconnect cleanup with the handoff task's readiness check
-        # and queue write. Otherwise a CLI could disconnect after the readiness
-        # check but just before the handoff was recorded, leaving an orphan queue.
+        # Serialize disconnect cleanup with arm/claim/handoff ledger transitions.
         async with agent_control_lock:
-            armed_session = client_takeover_armed.pop(ws, None)
             clients.discard(ws)
-            client_roles.pop(ws, None)
+            closing_role = client_roles.pop(ws, None) or "browser"
             client_inflight.pop(ws, None)
-            if armed_session and agent_control is not None:
-                try:
-                    current_control = await asyncio.to_thread(agent_control.status)
-                    another_waiter = any(
-                        client_roles.get(client) == "cli" and bool(client_takeover_armed.get(client))
-                        for client in clients
-                    )
-                    if current_control.get("state") == "queued" and not another_waiter:
-                        await asyncio.to_thread(agent_control.request_stop, current_control.get("run_id"))
-                        should_broadcast_control = True
-                except Exception as exc:
-                    log(f"could not clean up abandoned handoff: {exc}", "yl")
+            session_info = client_sessions.pop(ws, None)
+            if session_info is not None:
+                # Drop every session this socket carried (this also disarms a CLI
+                # session); a browser tab's still-queued handoff is cancelled so a
+                # CLI doesn't claim it.
+                if await asyncio.to_thread(_release_sessions_sync, session_info, ws, closing_role):
+                    should_broadcast_control = True
+                if session_info["seen"]:
+                    should_broadcast_control = True  # the sessions list changed
         if should_broadcast_control:
             await broadcast_agent_control()
         log(f"client disconnected  [{len(clients)} client(s)]", "yl")
@@ -2845,6 +3198,8 @@ async def main():
     await asyncio.to_thread(_kill_orphan_studio_mcp)
     killed_squatter = await asyncio.to_thread(check_studio_port)
     mgr.load_config()
+    # Persisted armed flags / sessions belong to sockets that no longer exist.
+    await asyncio.to_thread(_cleanup_persisted_sessions)
 
     # Shared "we already told the user the corrective step" flag. Two producers
     # can print the 'toggle Studio's MCP server' action banner: the early

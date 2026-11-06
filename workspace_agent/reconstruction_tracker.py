@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from workspace_agent.file_locks import file_locks
 from workspace_agent.unity_recovery import UnityRecoveryError, _directory, _safe_workspace_path
 
 TRACKER_PATH = "recovery/reconstruction/features.json"
@@ -82,24 +83,27 @@ def update_reconstruction_feature(
     implementation = [validate_path(item, "implementation_files") for item in (implementation_files or [])]
     tests = [validate_path(item, "test_files") for item in (test_files or [])]
 
-    data = _load(root)
-    prior = data["features"].get(feature_id, {})
-    feature = {
-        "feature_id": feature_id,
-        "name": name.strip(),
-        "status": status,
-        "notes": notes.strip(),
-        "source_evidence": source if source_evidence is not None else prior.get("source_evidence", []),
-        "asset_evidence": assets if asset_evidence is not None else prior.get("asset_evidence", []),
-        "implementation_files": implementation if implementation_files is not None else prior.get("implementation_files", []),
-        "test_files": tests if test_files is not None else prior.get("test_files", []),
-        "created_unix": prior.get("created_unix", int(time.time())),
-        "updated_unix": int(time.time()),
-    }
-    data["features"][feature_id] = feature
-    data["updated_unix"] = int(time.time())
-    path = _save(root, data)
-    return {"status": "saved", "tracker_path": path.relative_to(root).as_posix(), "feature": feature}
+    # The tracker is one shared JSON file: hold its lock across load -> save so
+    # concurrent agents cannot overwrite each other's feature updates.
+    with file_locks.hold([_safe_workspace_path(root, TRACKER_PATH)]):
+        data = _load(root)
+        prior = data["features"].get(feature_id, {})
+        feature = {
+            "feature_id": feature_id,
+            "name": name.strip(),
+            "status": status,
+            "notes": notes.strip(),
+            "source_evidence": source if source_evidence is not None else prior.get("source_evidence", []),
+            "asset_evidence": assets if asset_evidence is not None else prior.get("asset_evidence", []),
+            "implementation_files": implementation if implementation_files is not None else prior.get("implementation_files", []),
+            "test_files": tests if test_files is not None else prior.get("test_files", []),
+            "created_unix": prior.get("created_unix", int(time.time())),
+            "updated_unix": int(time.time()),
+        }
+        data["features"][feature_id] = feature
+        data["updated_unix"] = int(time.time())
+        path = _save(root, data)
+        return {"status": "saved", "tracker_path": path.relative_to(root).as_posix(), "feature": feature}
 
 
 def report_reconstruction_readiness(workspace_root: str, feature_id: str = "") -> dict[str, Any]:

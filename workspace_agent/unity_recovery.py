@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from workspace_agent.file_locks import file_locks
+
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv",
     "__pycache__", "Library", "Temp", "Logs", "obj", "bin",
@@ -162,6 +164,19 @@ def catalog_unity_assets(
     batch_size: int = 500,
 ) -> dict[str, Any]:
     """Build/update a resumable file-level catalog; this does not parse asset internals."""
+    output = _safe_workspace_path(workspace_root, output_path)
+    state_path = output.with_suffix(output.suffix + ".state.json")
+    # The catalog is a read-modify-write resumable file; serialise concurrent batches.
+    with file_locks.hold([output, state_path]):
+        return _catalog_unity_assets_locked(install_path, workspace_root, output_path, batch_size)
+
+
+def _catalog_unity_assets_locked(
+    install_path: str,
+    workspace_root: str,
+    output_path: str = "recovery/asset-catalog.json",
+    batch_size: int = 500,
+) -> dict[str, Any]:
     root = _directory(install_path or workspace_root, "Unity installation")
     batch_size = int(batch_size)
     if batch_size < 1 or batch_size > MAX_CATALOG_BATCH:

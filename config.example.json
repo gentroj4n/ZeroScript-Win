@@ -1,4 +1,7 @@
 {
+  "max_inflight": 16,
+  "max_inflight_per_session": 4,
+  "queue_timeout": 120,
   "mcpServers": {
     "roblox": {
       "command": "py",
