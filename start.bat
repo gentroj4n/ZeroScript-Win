@@ -5,9 +5,6 @@ chcp 65001 >nul
 title ArcScript Bridge
 cd /d "%~dp0"
 
-REM A temporary copy handles updates so Git can replace this file safely.
-if /i "%~1"=="--zs-bootstrap" goto :bootstrap_update
-
 if not exist "%~dp0logs" mkdir "%~dp0logs" >nul 2>nul
 set "LOGFILE=%~dp0logs\start.log"
 call :log "===== %DATE% %TIME%  start.bat launched ====="
@@ -15,19 +12,6 @@ REM Log the Windows build once per launch - most support requests arrive as a
 REM single terminal screenshot, so anything that identifies the machine's
 REM environment must be either ON SCREEN or in this log.
 for /f "tokens=*" %%v in ('ver') do call :log "%%v"
-
-REM --- Update from GitHub before starting -----------------------------------
-if /i not "%~1"=="--zs-updated" (
-    call :sync_github
-    if errorlevel 1 (
-        echo.
-        echo   Startup stopped because the GitHub update failed.
-        pause
-        exit /b 1
-    )
-    REM The temporary bootstrap has already launched the freshly synced copy.
-    exit /b 0
-)
 
 echo.
 echo   === ArcScript Bridge ===
@@ -242,57 +226,6 @@ echo   Press any key to close.
 pause >nul
 exit /b 0
 
-REM --- Subroutine: update from GitHub before startup ---------------------------
-:sync_github
-where git >nul 2>nul
-if errorlevel 1 (
-    echo   ERROR: Git is not installed.
-    exit /b 1
-)
-git rev-parse --is-inside-work-tree >nul 2>nul
-if errorlevel 1 (
-    echo   ERROR: This folder is not a Git checkout.
-    exit /b 1
-)
-set "ZS_ORIGIN="
-for /f "delims=" %%U in ('git remote get-url origin 2^>nul') do set "ZS_ORIGIN=%%U"
-echo(!ZS_ORIGIN!| findstr /i /c:"robby-gridpoint/ZeroScript-Win" >nul
-if errorlevel 1 (
-    echo   ERROR: Git origin is not robby-gridpoint/ZeroScript-Win.
-    exit /b 1
-)
-set "ZS_BOOTSTRAP=%TEMP%\zs-bootstrap-%RANDOM%-%RANDOM%.bat"
-copy /y "%~f0" "!ZS_BOOTSTRAP!" >nul
-if errorlevel 1 (
-    echo   ERROR: Could not prepare the update helper.
-    exit /b 1
-)
-REM The helper is a TEMP copy, so resetting the checkout cannot alter the
-REM batch file currently being interpreted by cmd.exe.
-call "!ZS_BOOTSTRAP!" --zs-bootstrap "%~dp0"
-set "ZS_UPDATE_RESULT=!errorlevel!"
-del /q "!ZS_BOOTSTRAP!" >nul 2>nul
-exit /b !ZS_UPDATE_RESULT!
-
-:bootstrap_update
-set "ZS_ROOT=%~2"
-if not defined ZS_ROOT exit /b 1
-cd /d "%ZS_ROOT%" || exit /b 1
-echo   UPDATE: Fetching GitHub main...
-git fetch origin +main:refs/remotes/origin/main
-if errorlevel 1 (
-    echo   ERROR: Could not fetch GitHub. Check internet/authentication.
-    exit /b 1
-)
-git reset --hard origin/main
-if errorlevel 1 (
-    echo   ERROR: Could not sync tracked files to GitHub main.
-    exit /b 1
-)
-echo   UPDATE: GitHub sync complete.
-REM Start the newly synced launcher; this TEMP helper remains unchanged.
-call "%ZS_ROOT%start.bat" --zs-updated
-exit /b 0
 
 REM --- Subroutine: verify %PY% is a real, usable Python ------------------------
 REM Returns 0 only if the interpreter runs, has a working pip, AND is Python 3.9
